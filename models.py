@@ -36,6 +36,24 @@ class Cama:
     area_ocupada: float = 0.0
 
     @property
+    def categoria(self) -> str:
+        """[PARCHE P7] Categoría única de la cama.
+
+        Todas las reglas de estabilidad (_es_flexible, _remate_de,
+        _remate_compatible) asumían implícitamente `categorias[0]`, o sea que la
+        cama tiene UNA sola categoría. Hoy eso se cumple porque
+        packing_2d.generar_camas agrupa por Categoria_Normalizada antes de
+        clusterizar. Si algún día se permiten camas multi-categoría, sin este
+        guard las reglas de estabilidad empezarían a mentir SIN fallar.
+        """
+        if len(self.categorias) != 1:
+            raise ValueError(
+                f"Cama con {len(self.categorias)} categorías ({self.categorias}). "
+                "Las reglas de estabilidad del Paso 4 asumen una sola categoría por cama."
+            )
+        return self.categorias[0]
+
+    @property
     def fill_ratio(self) -> float:
         """[PARCHE P5] Fracción de la base del pallet cubierta por esta cama.
 

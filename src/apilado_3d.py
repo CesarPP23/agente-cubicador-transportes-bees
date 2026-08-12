@@ -32,8 +32,7 @@ def _agrupar_camas(lista_camas: list[Cama]) -> tuple[dict[int, list[Cama]], dict
         if cama.nivel_categoria is not None:
             camas_por_nivel[cama.nivel_categoria].append(cama)
         else:
-            categoria = cama.categorias[0]
-            camas_remate.setdefault(categoria, []).append(cama)
+            camas_remate.setdefault(cama.categoria, []).append(cama)  # [P7]
     return camas_por_nivel, camas_remate
 
 
@@ -42,14 +41,13 @@ def _altura_desde_camas(camas: list[Cama]) -> float:
 
 
 def _es_flexible(cama: Cama) -> bool:
-    categoria = cama.categorias[0]
-    return categoria == "NABs" or categoria in config.CATEGORIAS_REMATE
+    return cama.categoria == "NABs" or cama.categoria in config.CATEGORIAS_REMATE  # [P7]
 
 
 def _remate_de(pallet: Pallet) -> str | None:
     for cama in pallet.camas:
-        if cama.categorias[0] in config.CATEGORIAS_REMATE:
-            return cama.categorias[0]
+        if cama.categoria in config.CATEGORIAS_REMATE:  # [P7]
+            return cama.categoria
     return None
 
 
@@ -187,7 +185,7 @@ def _consolidar_pallets(pallets_cd: list[Pallet], info_sku: dict[str, dict]) -> 
         sobrantes: list[Cama] = []
 
         for cama in flexibles:
-            categoria = cama.categorias[0]
+            categoria = cama.categoria  # [P7]
             candidatos = [
                 candidato
                 for candidato in pallets_cd
