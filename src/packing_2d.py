@@ -127,20 +127,66 @@ def _cama_desde_colocacion(placements: list[Placement], colocadas: dict[str, int
     )
 
 
+def _capacidad_real_cama(sku: str, info: dict) -> int:
+    """[PARCHE P2] Tope real de cajas de un SKU en una cama pura.
+
+    Es el mínimo entre el techo de densidad del Maestro (`Cajas_Cama_Efectivo`)
+    y lo que la geometría permite colocar de verdad. Se calcula UNA vez por SKU
+    haciendo una corrida de prueba del packer.
+    """
+    densidad_max = info[sku]["Cajas_Cama_Efectivo"]
+    if densidad_max <= 0:
+        return 0
+    prueba = [
+        {
+            "sku": sku,
+            "largo": info[sku]["Largo de caja"],
+            "ancho": info[sku]["Ancho de caja"],
+            "disponible": densidad_max,
+            "densidad_max": densidad_max,
+        }
+    ]
+    _, colocadas = _empacar_cama(prueba)
+    return colocadas.get(sku, 0)
+
+
 def _procesar_cluster(cluster_rows: list) -> list[Cama]:
-    """Prioriza camas puras (un solo SKU, hasta su tope de densidad) por cada SKU del
-    cluster; solo el remanente final de cada uno -- lo que no alcanza para llenar una
-    cama completa por sí solo -- se mezcla entre sí en la(s) cama(s) de cierre, para
-    aprovechar el perímetro de 120x100 en vez de dejarlas sueltas."""
+    """Prioriza camas puras (un solo SKU, hasta su tope real de densidad) por cada
+    SKU del cluster; solo el remanente final de cada uno -- lo que no alcanza para
+    llenar una cama completa por sí solo -- se mezcla entre sí en la(s) cama(s) de
+    cierre, para aprovechar el perímetro de 120x100 en vez de dejarlas sueltas.
+
+    [PARCHE P2] BUG ORIGINAL: el bucle era
+
+        while pendientes[sku] >= densidad_max:      # densidad_max = dato del Maestro
+            ...
+            if colocado < densidad_max:
+                break
+
+    `densidad_max` venía del Maestro, pero `_empacar_cama` está acotado por la
+    geometría. El propio doc de diseño dice que el Maestro NO coincide con la
+    geometría en el 80% de los SKUs de la demanda real, con lo cual
+    `colocado < densidad_max` era el caso NORMAL y el `break` disparaba casi
+    siempre: con 100 cajas pendientes y capacidad geométrica de 20, se armaba UNA
+    cama pura y las 80 restantes caían a la fase de mezcla, en vez de armar 5
+    camas puras. Toda la estrategia documentada de "priorizar camas puras" estaba
+    desactivada en la práctica.
+
+    FIX: calcular el tope REAL de la cama una sola vez (Maestro acotado por
+    geometría) y usar ese valor como condición del bucle. El `break` por
+    `colocado < densidad_max` desaparece; queda solo el guard anti-loop.
+    """
     info = {r["SKU"]: r for r in cluster_rows}
     pendientes = {r["SKU"]: r["Cajas_Remanente"] for r in cluster_rows}
     camas: list[Cama] = []
 
     for sku in pendientes:
+        capacidad_cama = _capacidad_real_cama(sku, info)
+        if capacidad_cama <= 0:
+            continue  # no cabe ni una caja; se resuelve (o se descarta) en la mezcla final
+
         densidad_max = info[sku]["Cajas_Cama_Efectivo"]
-        if densidad_max <= 0:
-            continue
-        while pendientes[sku] >= densidad_max:
+        while pendientes[sku] >= capacidad_cama:
             candidato = [
                 {
                     "sku": sku,
@@ -153,11 +199,9 @@ def _procesar_cluster(cluster_rows: list) -> list[Cama]:
             placements, colocadas = _empacar_cama(candidato)
             colocado = colocadas.get(sku, 0)
             if colocado <= 0:
-                break  # no cabe físicamente ni una unidad; se resuelve en la mezcla final
+                break  # guard anti-loop; no debería ocurrir si capacidad_cama > 0
             pendientes[sku] -= colocado
             camas.append(_cama_desde_colocacion(placements, colocadas, info))
-            if colocado < densidad_max:
-                break  # no llenó una cama pura completa; el resto pasa a la mezcla final
 
     while any(v > 0 for v in pendientes.values()):
         candidatos = [
