@@ -26,15 +26,38 @@ def _clusterizar_por_altura(rows: list, tolerancia: float = config.TOLERANCIA_AL
 
 
 def _elegir_orientacion(largo: float, ancho: float) -> tuple[float, float, int] | None:
+    """[PARCHE P1] Elige la orientación que maximiza la cantidad TOTAL de cajas
+    en la cama (columnas x filas), no solo las columnas a lo largo de 120 cm.
+
+    BUG ORIGINAL: el criterio era `columnas > mejor[2]`, o sea maximizaba solo
+    cuántas cajas entran a lo largo de los 120 cm, ignorando cuántas filas caben
+    en los 100 cm. Con una caja de 25x51 cm:
+        - orientación A (w=25, d=51) -> 4 columnas x 1 fila =  4 cajas
+        - orientación B (w=51, d=25) -> 2 columnas x 4 filas =  8 cajas
+    El código elegía A porque 4 > 2, perdiendo la mitad de la cama. Y como la
+    orientación se fija una sola vez por SKU, el error se propagaba a TODAS sus
+    camas, puras y mixtas -> más camas -> más pallets -> más transporte.
+
+    El criterio nuevo es idéntico al que ya usaba derivados._capacidad_geometrica
+    para el fallback del Maestro; antes convivían dos nociones distintas de
+    "capacidad geométrica" en el mismo repo, y esta era la incorrecta.
+
+    Desempate: menor profundidad `d`, porque deja shelves más bajos y por lo
+    tanto más reutilizables por otros SKUs en la fase de mezcla.
+    """
     mejor = None
+    mejor_capacidad = -1
     for w, d in ((largo, ancho), (ancho, largo)):
         if w > config.PALLET_LARGO or d > config.PALLET_ANCHO:
             continue
         columnas = int(config.PALLET_LARGO // w)
-        if columnas == 0:
+        filas = int(config.PALLET_ANCHO // d)
+        if columnas == 0 or filas == 0:
             continue
-        if mejor is None or columnas > mejor[2] or (columnas == mejor[2] and d < mejor[1]):
+        capacidad = columnas * filas
+        if capacidad > mejor_capacidad or (capacidad == mejor_capacidad and d < mejor[1]):
             mejor = (w, d, columnas)
+            mejor_capacidad = capacidad
     return mejor
 
 
