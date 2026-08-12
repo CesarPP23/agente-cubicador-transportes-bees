@@ -180,7 +180,12 @@ def armar_pallets(
     for pallet in pallets_semilla or []:
         semillas_por_cd.setdefault(pallet.cd, []).append(pallet)
 
-    for cd in set(camas_por_cd) | set(semillas_por_cd):
+    # [PARCHE P3] `sorted(...)`: iterar un set de strings hace que el orden dependa
+    # del hash de cada string, que con PYTHONHASHSEED aleatorio (default de Python 3)
+    # CAMBIA entre procesos. El plan por CD era el mismo, pero el orden de las filas
+    # del Excel de salida variaba entre corridas -> imposible diffear la corrida de
+    # hoy contra la de ayer. Para una herramienta que corre a diario eso es ruido puro.
+    for cd in sorted(set(camas_por_cd) | set(semillas_por_cd)):
         camas_por_nivel, camas_remate = _agrupar_camas(camas_por_cd.get(cd, []))
         contador = [0]
         pallets_abiertos: list[Pallet] = list(semillas_por_cd.get(cd, []))
