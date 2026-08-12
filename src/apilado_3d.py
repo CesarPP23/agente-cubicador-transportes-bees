@@ -173,6 +173,15 @@ def _consolidar_pallets(pallets_cd: list[Pallet], info_sku: dict[str, dict]) -> 
         if origen.altura_final >= config.ALTURA_TOTAL_MIN:
             continue  # ya se completó recibiendo camas de otro pallet chico
 
+        # [PARCHE P6] Altura de referencia congelada explícitamente. El guard
+        # "nunca mover hacia un pallet peor" debe comparar contra la altura del
+        # ORIGEN ANTES de empezar a vaciarlo, no contra un valor que muta. Antes
+        # funcionaba por accidente (origen.altura_final no se actualizaba dentro
+        # de este bucle, solo después); acá queda explícito para que un refactor
+        # futuro que agregue un `origen.altura_final = ...` en el medio no rompa
+        # la semántica sin que nada falle.
+        altura_referencia = origen.altura_final
+
         fijas = [c for c in origen.camas if not _es_flexible(c)]
         flexibles = sorted((c for c in origen.camas if _es_flexible(c)), key=lambda c: -c.altura_cama)
         sobrantes: list[Cama] = []
@@ -184,7 +193,7 @@ def _consolidar_pallets(pallets_cd: list[Pallet], info_sku: dict[str, dict]) -> 
                 for candidato in pallets_cd
                 if candidato is not origen
                 and id(candidato) not in eliminados
-                and candidato.altura_final >= origen.altura_final  # nunca mover hacia un pallet peor
+                and candidato.altura_final >= altura_referencia
                 and _remate_compatible(candidato, categoria)
                 and _cabe(candidato, cama, info_sku)  # [P4]
             ]
