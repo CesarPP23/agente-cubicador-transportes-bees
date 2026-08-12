@@ -118,12 +118,15 @@ def _cama_desde_colocacion(placements: list[Placement], colocadas: dict[str, int
     alto_cama = max(info[sku]["Alto de caja"] for sku in colocadas_positivas)
     categorias = sorted({info[sku]["Categoria_Normalizada"] for sku in colocadas_positivas})
     nivel = info[next(iter(colocadas_positivas))]["Nivel_Categoria"]
+    # [PARCHE P5] superficie realmente cubierta, para la regla de soporte del Paso 4
+    area_ocupada = sum(p.cantidad * p.w * p.d for p in placements)
     return Cama(
         categorias=categorias,
         altura_cama=alto_cama,
         placements=placements,
         cantidades=colocadas_positivas,
         nivel_categoria=nivel,
+        area_ocupada=area_ocupada,
     )
 
 

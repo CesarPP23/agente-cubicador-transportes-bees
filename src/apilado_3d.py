@@ -69,14 +69,31 @@ def _peso_desde_camas(camas: list[Cama], info_sku: dict[str, dict]) -> float:
     return sum(_peso_cama(c, info_sku) for c in camas)
 
 
+def _puede_soportar(pallet: Pallet) -> bool:
+    """[PARCHE P5] ¿La cama que hoy está arriba del pallet puede sostener otra?
+
+    Sin esta regla, una cama de 2 cajas sueltas podía quedar como base de 170 cm
+    de producto. El doc de diseño dice explícitamente que los remanentes de NABs
+    son mayoritariamente sub-cama y que BK31/BK34 tienen líneas de 1 a 60 cajas,
+    o sea que el caso es frecuente, no raro.
+
+    Es una restricción de seguridad de carga: al activarla el conteo de pallets
+    SUBE. Medir el impacto antes de fijar el umbral (config.FILL_RATIO_MIN_SOPORTE);
+    poner 0.0 restaura el comportamiento anterior.
+    """
+    if not pallet.camas:
+        return True
+    return pallet.camas[-1].fill_ratio >= config.FILL_RATIO_MIN_SOPORTE
+
+
 def _cabe(pallet: Pallet, cama: Cama, info_sku: dict[str, dict]) -> bool:
-    """Restricciones duras para apoyar `cama` sobre `pallet`: altura y peso."""
+    """Restricciones duras para apoyar `cama` sobre `pallet`: altura, peso y soporte."""
     if cama.altura_cama > config.ALTURA_TOTAL_MAX - pallet.altura_final + 1e-9:
         return False
     # [PARCHE P4] el peso pasa de ser un chequeo post-hoc (Paso 5) a una restricción real
     if pallet.peso_estimado + _peso_cama(cama, info_sku) > config.PESO_MAX_PALLET_KG + 1e-9:
         return False
-    return True
+    return _puede_soportar(pallet)  # [PARCHE P5]
 
 
 def _colocar(pallet: Pallet, cama: Cama, info_sku: dict[str, dict]) -> None:

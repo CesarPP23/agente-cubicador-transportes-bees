@@ -23,6 +23,13 @@ PESO_CAJA_MAX = 100
 
 TOLERANCIA_ALTURA_CAMA_MIXTA = 3
 
+# [PARCHE P5] Fracción mínima de la base 120x100 que una cama debe cubrir para
+# poder sostener otra cama encima. Sin esto, 3 cajas sueltas de Licores pueden
+# quedar como base de 170 cm de producto. Es una restricción de SEGURIDAD DE
+# CARGA, no de optimización: subirla genera más pallets.
+# Poner 0.0 desactiva la regla por completo (comportamiento anterior).
+FILL_RATIO_MIN_SOPORTE = 0.60
+
 UMBRAL_DATO_NO_CONFIABLE = 10000
 
 ORDEN_CATEGORIAS = ["Licores", "Lácteos", "Aseo", "Importados", "Merch", "NABs"]

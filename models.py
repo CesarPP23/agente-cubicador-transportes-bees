@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+import config
+
 
 @dataclass
 class LogEntry:
@@ -28,6 +30,22 @@ class Cama:
     placements: list[Placement] = field(default_factory=list)
     cantidades: dict[str, int] = field(default_factory=dict)
     nivel_categoria: int | None = None
+
+    # [PARCHE P5] cm² de la base 120x100 efectivamente cubiertos por las cajas.
+    # Lo puebla packing_2d._cama_desde_colocacion a partir de los placements.
+    area_ocupada: float = 0.0
+
+    @property
+    def fill_ratio(self) -> float:
+        """[PARCHE P5] Fracción de la base del pallet cubierta por esta cama.
+
+        Las camas sin placements (las que arma pallets_homogeneos.py, que no
+        pasan por el packing 2D) se asumen llenas: su densidad viene del Maestro
+        y no hay geometría con la cual medirlas.
+        """
+        if not self.placements:
+            return 1.0
+        return self.area_ocupada / (config.PALLET_LARGO * config.PALLET_ANCHO)
 
 
 @dataclass
