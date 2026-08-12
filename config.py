@@ -10,6 +10,14 @@ ALTURA_PRODUCTO_MIN = 175.08
 ALTURA_PRODUCTO_MAX = 180.08
 
 PESO_ALERTA_KG = 1350
+
+# [PARCHE P4] Tope duro de peso usado como RESTRICCIÓN en el apilado (Paso 4).
+# Antes el peso solo se calculaba en el Paso 5 y se etiquetaba: el motor podía
+# emitir pallets de 1.600 kg que la operación no puede ejecutar. Se deja como
+# constante separada de PESO_ALERTA_KG para poder divergirlas (ej. restringir a
+# 1.300 y alertar a 1.350) sin tocar código.
+PESO_MAX_PALLET_KG = 1350
+
 PESO_CAJA_MIN = 0.05
 PESO_CAJA_MAX = 100
 
