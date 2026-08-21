@@ -1,6 +1,6 @@
-"""[V5-P0] El benchmark tiene que contar pallets FÍSICOS reales, sin excluir
-los PH-BAT-* dedicados -un pallet dedicado a cajas BAT es un pallet físico
-más que Transporte mueve, no una excepción a esconder del conteo."""
+"""El benchmark tiene que contar pallets FÍSICOS reales, sin excluir los
+PV5-BAT-* dedicados -un pallet dedicado a cajas BAT es un pallet físico más
+que Transporte mueve, no una excepción a esconder del conteo."""
 from pathlib import Path
 
 from models import Pallet
@@ -15,8 +15,8 @@ def _pallet(id_, cd="BK31", altura=195.0, peso=500.0):
 
 
 def test_pallet_bat_dedicado_incrementa_el_total():
-    normales = [_pallet("PH-MIX-BK31-001"), _pallet("PH-MIX-BK31-002")]
-    con_bat_dedicado = normales + [_pallet("PH-BAT-BK31-001", altura=69.9)]
+    normales = [_pallet("PV5-BK31-001"), _pallet("PV5-BK31-002")]
+    con_bat_dedicado = normales + [_pallet("PV5-BAT-BK31-001", altura=69.9)]
 
     r_sin = calcular_kpis(normales)
     r_con = calcular_kpis(con_bat_dedicado)
@@ -28,14 +28,14 @@ def test_pallet_bat_dedicado_incrementa_el_total():
 
 
 def test_sin_bat_dedicado_el_conteo_no_cambia():
-    normales = [_pallet("PH-MIX-BK31-001"), _pallet("PH-MIX-BK31-002"), _pallet("PH-HOM-BK31-001")]
+    normales = [_pallet("PV5-BK31-001"), _pallet("PV5-BK31-002"), _pallet("PV5-BK31-003")]
     r = calcular_kpis(normales)
     assert r.pallets == len(normales)
     assert r.bat_dedicados == 0
 
 
 def test_calcular_kpis_guarda_pallets_por_cd():
-    pallets = [_pallet("PH-MIX-BK31-001", cd="BK31"), _pallet("PH-MIX-BK41-001", cd="BK41"), _pallet("PH-MIX-BK41-002", cd="BK41")]
+    pallets = [_pallet("PV5-BK31-001", cd="BK31"), _pallet("PV5-BK41-001", cd="BK41"), _pallet("PV5-BK41-002", cd="BK41")]
     r = calcular_kpis(pallets)
     assert r.pallets_por_cd == {"BK31": 1, "BK41": 2}
 
@@ -43,16 +43,14 @@ def test_calcular_kpis_guarda_pallets_por_cd():
 def test_benchmark_total_fisico_correcto_contra_dataset_real():
     """El número de `benchmark_df` tiene que ser exactamente
     `len(pallets armados)`, dedicados BAT incluidos -no un subconjunto
-    filtrado. El prefijo de dedicado depende del motor activo
-    (`config.PACKER_VERSION`): "PH-BAT-" en V4, "PV5-BAT-" en V5 -ambos
-    son lo mismo que ya reconoce `benchmark.calcular_kpis`."""
+    filtrado."""
     if not ARCHIVO_REAL.exists():
         import pytest
 
         pytest.skip(f"No está el dataset real en {ARCHIVO_REAL}")
     resultado = ejecutar_desde_archivo(ARCHIVO_REAL)
     armados = [p for p in resultado.pallets if p.tipo != "Requiere Revisión"]
-    bat_dedicados_reales = sum(1 for p in armados if p.id.startswith("PH-BAT-") or p.id.startswith("PV5-BAT-"))
+    bat_dedicados_reales = sum(1 for p in armados if p.id.startswith("PV5-BAT-"))
 
     row = resultado.benchmark_df.iloc[0]
     assert int(row["pallets"]) == len(armados)

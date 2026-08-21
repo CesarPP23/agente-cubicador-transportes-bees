@@ -1325,3 +1325,123 @@ solo evitar abrir pallets nuevos.
 - tests: ver corrida completa de la suite en este mismo commit del log.
 
 ---
+
+## Limpieza — solo queda SKU_BLOQUE
+
+Instrucción del usuario: quedarse con una sola versión (SKU_BLOQUE) y
+borrar todo lo demás. Primero un commit local de checkpoint (`4ea5b07`,
+solo local -no toca el repo de GitHub del dueño del proyecto) con TODO el
+trabajo de la sesión, para poder recuperar cualquier cosa si hiciera
+falta. Esta limpieza es el commit siguiente.
+
+### Investigación previa (para no borrar nada que se usa de verdad)
+Antes de borrar cualquier constante de `config.py` o archivo, se hizo grep
+de cada candidato contra `src/` completo. Encontró casos no obvios:
+- `soporte.clasificar_soporte_pallet` hace `if not pallet.camas: return` -
+  como los pallets de SKU_BLOQUE siempre tienen `camas=[]`, la función es
+  un no-op para todo el pipeline actual. Se dejó el archivo (bajo riesgo,
+  no rompe nada) pero es candidato a retiro en una limpieza futura.
+- `CATEGORIAS_REMATE`/`ORDEN_CATEGORIAS` parecían muertas (solo las usaban
+  propiedades de `Cama` que nunca se ejercitan) pero en realidad las usa
+  `config.nivel_de_categoria`, que SÍ llama `derivados.py` -se quedaron.
+- `solver_cajas.py` parecía huérfano (nada lo importa directo) pero
+  `reconciliacion_geometrica.py` sí lo usa (`from src.solver_cajas import
+  max_cajas`) -se quedó. `layout_solver.py` (V5-P3, reemplazado por
+  `packing_columnar.py` en P5) SÍ estaba huérfano de verdad -se borró.
+
+### Borrado
+- **Motores completos**: `pallets_homogeneos.py`, `packing_2d.py`,
+  `apilado_3d.py` (V4/camas), `pipeline_v5.py` (V5 multi-start puro, se
+  rescató `_palletv5_a_pallet` movida a `pipeline_sku_bloque.py`),
+  `multistart.py`, `residual_search.py`, `pipeline_auto.py`,
+  `pipeline_auto_consolidado.py`, `consolidacion_sku.py`,
+  `pipeline_sku_consolidado.py`, `layout_solver.py`.
+- **`legacy/`** completo (copias congeladas de los módulos V4 ya borrados).
+- **`bat.py`**: cirugía, no borrado completo -se sacaron
+  `asignar_hosts_bat`, `_redistribuir_para_bat`, `_buscar_host`,
+  `_liberar_host`, `_consolidar_dedicados`, `_colocar_bat` (~345 de 531
+  líneas, la lógica V4 de host dinámico) y el import de `apilado_3d`. Se
+  mantuvo `separar_bat`, `consolidar_bat_por_cd`, `_peso_caja_bat` y toda
+  la sección "BAT integrado".
+- **`pipeline.py`**: de dispatcher de 5 ramas a una función que llama
+  directo a `pipeline_sku_bloque`. Se sacó `ejecutar_core_v4` completo.
+- **`config.py`**: `PACKER_VERSION`, `MULTISTART_SEEDS/MAX`,
+  `PH_PREBUILD`, `PURE_FIRST`, `SOBRESALIENTE_PLANIFICACION`,
+  `TOLERANCIA_ALTURA_PORTANTE/TERMINAL/MEZCLA`, `FILL_RATIO_MIN_SOPORTE`,
+  `RESERVA_ALTURA_REMATE`, `ESTRATEGIA_CAMAS`, `CATEGORIAS_SIN_NADA_ENCIMA`,
+  `MAX_SEPARACION_NIVELES` -todas sin ninguna referencia viva confirmada
+  por grep. `benchmark.py._hash_config` se actualizó para no referenciar
+  las que se fueron.
+- **`run_tests.py`** (runner manual redundante con `pytest`, ya
+  referenciaba módulos borrados) y docs V3 superadas
+  (`DOCUMENTACION_TECNICA_V3.md`, `DOCUMENTACION_LOGICA_V3.md`,
+  `Repo_Completo_Parcheado_v2.md`).
+- **Tests**: se borraron los correspondientes a todo lo de arriba.
+  `test_invariantes.py` y `tests/test_pipeline_real_data.py` no se
+  borraron -se **reescribieron**: sacando los tests atados a
+  `packing_2d._elegir_orientacion` (borrado) y a `pallet.camas`/
+  `Cama.categoria_remate` (siempre vacío ahora), quedándose con los que
+  sí son invariantes reales (determinismo, IDs únicos, tope de altura,
+  demanda nunca excedida). `test_benchmark.py`/`test_pipeline_real_data.py`
+  también se corrigieron: comparaban contra el prefijo `PH-BAT-` (solo
+  existía en V4), que con SKU_BLOQUE nunca aparece -los tests pasaban
+  igual pero de forma VACÍA (0 dedicados siempre, sin importar el
+  resultado real), sin verificar nada de verdad. Corregido a `PV5-BAT-`.
+
+### Bug real encontrado por la limpieza (no por casualidad -por correr la
+suite completa después de cada cambio)
+`test_demanda_planificada_coincide_con_demanda_redondeada` (que sobrevivió
+la reescritura de `test_pipeline_real_data.py`) falló: faltaban 24 cajas
+del SKU 22454 en SJ97 y 1 caja del SKU 15934 en BK65 -pérdida de demanda
+silenciosa, sin ningún aviso en `sin_colocar`.
+
+Causa: `_dedicar_por_sku` (packing_bloques.py) arma pallets 100%
+dedicados asumiendo que la capacidad declarada por Maestro ("Cajas por
+PH") siempre entra completa en un pallet fresco. Para SJ97/22454
+(demanda 384, capacidad declarada 192 -> 2 pallets "dedicados" de 192
+cada uno en teoría), el packer 3D real (MaxRects) solo logró colocar 180
+en uno de los dos pallets -la fragmentación real de la huella (28.5x17cm)
+no logra el empaque perfecto que asume el número del Maestro. El código
+original hacía `break` en el loop de colocación y agregaba el pallet
+IGUAL, sin registrar las 12 cajas que quedaban sin colocar en ESE pallet
+-silenciosas, sin pasar por `sin_colocar`.
+
+Corregido: si un pallet "dedicado" no logra completar la capacidad
+declarada, el faltante se suma al `bloque` de ese SKU (`bloques[sku] +=
+restante`) en vez de perderse -la fase de bloques lo intenta colocar en
+otro lado, con el mismo mecanismo de "último recurso: partir uno" que ya
+existía. Efecto colateral positivo: el total sobre el dataset real bajó
+de 60 a **53 pallets** (esas cajas ahora se ubican de verdad en vez de
+"desaparecer", lo que dejaba menos margen real del que el packer creía
+tener).
+
+### Resultado
+```
+Antes de la limpieza:  src/ ~5.030 líneas, 30 módulos, legacy/ 644 líneas
+Después:                src/ ~2.775 líneas, 19 módulos, legacy/ borrado
+                        (-45% en src/, -100% en legacy/)
+tests/: ~2.510 -> ~1.540 líneas (17 archivos, antes ~23)
+```
+Dataset real (`Cubicaje18.07.2026.xlsx`): **53 pallets**, 0 violaciones
+geométricas, demanda exacta -mejor que el 60 de antes de la limpieza,
+gracias al bug de demanda encontrado en el camino.
+
+### Lo que queda para una limpieza futura (Tier 2, no se tocó)
+- `soporte.py` es un no-op para SKU_BLOQUE (`pallet.camas` siempre vacío)
+  -candidato a retiro, junto con `Cama`/`PalletLinea.categoria_remate`/
+  `visualizacion.dibujar_cama`/`dibujar_pallet` (la vista 2D por cama,
+  inalcanzable ahora que no hay pallets con camas reales).
+- Reescribir `exportar.py`/`benchmark.py` para trabajar nativo sobre
+  `PalletV5` en vez de adaptar a `Pallet`/`Cama` -eliminaría la
+  indirección del adaptador, pero es tocar código probado, no una
+  limpieza de "borrar lo que no se usa".
+
+### Invariantes
+- Demanda exacta, 0 violaciones geométricas: verificado (arriba).
+- `config.PACKER_VERSION="SKU_BLOQUE"` sigue activo -sin cambios de
+  comportamiento salvo el bug corregido.
+- tests: 102 passed (suite completa, sin skips -el checkpoint anterior
+  tenía 158 pasando + 1 skip; los borrados de esta limpieza explican la
+  diferencia de cantidad, no una regresión).
+
+---

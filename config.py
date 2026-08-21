@@ -1,32 +1,5 @@
 import unicodedata
 
-# [V5-P1, V-AUTO] Flag de arquitectura: "V4" (camas, el motor probado en
-# producción), "V5" (columnar/torres, ver Parches/v5/PATCH_LOG.md) o "AUTO"
-# (corre AMBOS y se queda con el mejor resultado CD por CD -nunca peor que
-# el mejor de los dos, ver src/pipeline_auto.py; el costo es correr el
-# pipeline dos veces). pipeline.ejecutar_pipeline despacha según esto.
-# Ninguno de los tres reemplaza formalmente a V4 en producción hasta
-# decisión explícita -mientras tanto, cambiar este flag es el único punto
-# de rollback, nunca hace falta tocar código.
-PACKER_VERSION = "SKU_BLOQUE"  # [nueva lógica, instrucción del usuario] bloques enteros por SKU primero
-
-# [V5-P7] Multi-start: cantidad de semillas iniciales por CD y tope.
-MULTISTART_SEEDS = 20
-MULTISTART_MAX = 50
-
-# [V5-P6] V5 no preconstruye pallets homogéneos ni extrae camas puras antes
-# de mirar el resto de la demanda -un resultado homogéneo puede seguir
-# apareciendo, pero como consecuencia del optimizador, no como decisión previa.
-PH_PREBUILD = False
-PURE_FIRST = False
-
-# [V5 sección 5.3] El sobresaliente de negocio (SOBRESALIENTE_MAX_CM, abajo)
-# es válido para AUDITORÍA/VALIDACIÓN de datos por defecto. Ponerlo en True
-# lo activaría también para planificación real (parte de la base 2D del
-# packer usaría el área extendida 125x105) -decisión de negocio todavía sin
-# confirmar, por eso queda en False.
-SOBRESALIENTE_PLANIFICACION = False
-
 PALLET_LARGO = 120
 PALLET_ANCHO = 100
 
@@ -137,32 +110,6 @@ PESO_CAJA_MAX = 100
 # Poner True restaura el comportamiento anterior (peso unitario x unidades).
 PESO_UMA_ES_POR_UNIDAD = False
 
-# --- Camas: portante vs terminal -- V3 -------------------------------------
-# [V3 / sección 14] Una tolerancia única (±8cm) para decidir qué remanentes
-# se combinan en una misma cama de mezcla no distingue entre una cama que va
-# a SOSTENER otra encima (portante -necesita quedar razonablemente nivelada)
-# y una que va a ser la última del pallet (terminal -nada se apoya encima,
-# puede tolerar más diferencia de altura sin ningún riesgo).
-# TOLERANCIA_ALTURA_PORTANTE hereda el valor ya calibrado contra
-# Cubicaje18.07.2026.xlsx (ver historial: 3->91% parciales, 8->76%, retorno
-# decreciente después). TOLERANCIA_ALTURA_TERMINAL queda "por calibrar": se
-# puso más ancha que portante porque no hay riesgo de estabilidad al mezclar
-# remanentes bajo la cama de cierre, pero el valor concreto no se barrió
-# todavía -ajustar con la próxima medición contra pallets reales.
-TOLERANCIA_ALTURA_PORTANTE = 8
-TOLERANCIA_ALTURA_TERMINAL = 20
-
-# [PARCHE P5 / V3 sección 10] Fracción mínima de la base 120x100 que una cama
-# debe cubrir para poder sostener otra encima. DESACTIVADA (0.0): no debe
-# interpretarse como "seguridad validada" -es el valor con el que se corrió
-# la última validación contra pallets físicos reales (dio la densidad más
-# parecida a la real), no uno que se haya confirmado formalmente como seguro.
-FILL_RATIO_MIN_SOPORTE = 0.0
-
-# Alias retrocompatible: código/tests viejos todavía puede referenciar el
-# nombre V2. Mismo valor que TOLERANCIA_ALTURA_PORTANTE.
-TOLERANCIA_ALTURA_MEZCLA = TOLERANCIA_ALTURA_PORTANTE
-
 # --- Rotación -- V3 ---------------------------------------------------------
 # [V3 / sección 7] "Cajas acostadas" (probar Largo x Alto / Ancho x Alto como
 # base) sale del flujo productivo. Se investigó y CONFIRMÓ como hipótesis
@@ -210,40 +157,13 @@ CAJA_CONSOLIDACION_CIGARROS_ANCHO = CAJA_BAT_ANCHO
 CAJA_CONSOLIDACION_CIGARROS_ALTO = CAJA_BAT_ALTO
 CAJA_CONSOLIDACION_CIGARROS_MAX_UNIDADES = CAJA_BAT_CAPACIDAD_UNIDADES
 
-# [V3 / sección 9.3, 17.1] La reserva global de altura (RESERVA_ALTURA_REMATE
-# = 55cm en TODOS los pallets base de un CD con remate pendiente) se ELIMINA
-# para BAT: no reproducía la operación real y sobre-reservaba margen en
-# pallets que nunca terminaban recibiendo una caja BAT. Se reemplaza por
-# selección de host DINÁMICA después de armar todos los pallets normales
-# (bat.asignar_hosts_bat), que busca, para cada caja BAT, el pallet cuya
-# altura + 55cm quede más cerca de ALTURA_TARGET (198.3cm) -sin reservar nada
-# de antemano.
-RESERVA_ALTURA_REMATE = 0
-
-# --- Heurística de armado de camas -- V3 (sección 13.3) --------------------
-# Estrategia con la que packing_2d arma camas puras vs. mixtas. Hoy solo está
-# implementada PURE_FIRST (comportamiento heredado de V2: camas puras primero,
-# remanente a mezcla). GLOBAL_MIX / HYBRID_LOOKAHEAD quedan documentadas como
-# alternativas a comparar contra el benchmark real, pero no implementadas
-# todavía -comparar heurísticas completas es un proyecto aparte.
-ESTRATEGIA_CAMAS = "PURE_FIRST"
-
 UMBRAL_DATO_NO_CONFIABLE = 10000
 
+# Usados por config.nivel_de_categoria (Nivel_Categoria del plan de picking).
 ORDEN_CATEGORIAS = ["Licores", "Lácteos", "Aseo", "Importados", "Merch", "NABs"]
 CATEGORIAS_REMATE = ["Comestibles", "Cigarros"]
-CATEGORIAS_SIN_NADA_ENCIMA = ["NABs", "Comestibles", "Cigarros"]
 
 CATEGORIAS_CONOCIDAS = ORDEN_CATEGORIAS + CATEGORIAS_REMATE
-
-# [V3 / sección 8, 16] "Mantener temporalmente" -la migración a matrices
-# explícitas de compatibilidad (COMPATIBILIDAD_APILADO / COMPATIBILIDAD_CAMA,
-# una para vertical y otra para mezcla en cama, que no tienen por qué ser
-# equivalentes) queda para una iteración posterior, no entra en este pase.
-# Máxima separación de niveles permitida dentro de una misma cama mixta,
-# SOLO entre los niveles base 1-5 (Licores..Merch) -NABs y remate quedan
-# siempre aislados de la mezcla, ver packing_2d._separar_nabs_y_remate.
-MAX_SEPARACION_NIVELES = 2
 
 # Nivel de estabilidad: 1 (base, más pesado) .. 6 (NABs) .. 7 (remate).
 NIVEL_REMATE = len(ORDEN_CATEGORIAS) + 1  # 7

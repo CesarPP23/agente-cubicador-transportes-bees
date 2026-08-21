@@ -9,7 +9,7 @@ remanentes"
 
 Cada SKU es un BLOQUE indivisible mientras sea posible:
 1. Si la demanda total de un SKU en un CD supera lo que entra en UN pallet
-   (`Cajas por PH`, el mismo dato que usa `pallets_homogeneos.py`), se
+   (`Cajas por PH`, la capacidad operacional declarada por Maestro_SKUs), se
    extraen pallets 100% dedicados hasta dejar como mucho un resto < 1
    pallet. Ese resto (o la demanda entera, si ya cabía en 1 pallet) es el
    "bloque" del SKU -nunca se parte a propósito.
@@ -167,9 +167,18 @@ def _dedicar_por_sku(
                 pc.colocar(cand, cantidad_colocable, idx_libre)
                 restante -= cantidad_colocable
             dedicados.append(pallet)
+            if restante > 0:
+                # La capacidad declarada ("Cajas por PH") no se logró
+                # completar en la práctica -el packer 3D real (MaxRects)
+                # puede fragmentar distinto de lo que asume el número
+                # teórico del Maestro. El faltante NO se pierde: se suma al
+                # bloque de este SKU para que la fase de bloques lo intente
+                # colocar en otro lado (bug real encontrado por
+                # test_demanda_planificada_coincide_con_demanda_redondeada).
+                bloques[sku] = bloques.get(sku, 0) + restante
 
         if resto > 0:
-            bloques[sku] = int(resto)
+            bloques[sku] = bloques.get(sku, 0) + int(resto)
 
     return dedicados, bloques, por_sku
 

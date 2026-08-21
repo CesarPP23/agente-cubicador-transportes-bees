@@ -15,21 +15,6 @@ def _derivados(envios, maestro, uma):
     return calcular_derivados(df), log
 
 
-def test_pallets_homogeneos_cumplen_su_propia_regla_de_altura():
-    """La versión del dataset corregida el 12-ago sí tiene SKUs con demanda y
-    dato de Maestro suficientes para armar pallets homogéneos completos -- no
-    es una regresión de código (la versión anterior del dataset no llegaba al
-    umbral). El dataset real sigue actualizándose, así que en vez de fijar una
-    lista exacta de SKUs (que quedaría desactualizada con cada corrección),
-    se verifica la propiedad que debe cumplirse siempre: [PARCHE P9] ningún
-    pallet homogéneo se arma si su altura base supera ALTURA_TOTAL_MAX."""
-    resultado = ejecutar_desde_archivo(ARCHIVO_REAL)
-    df = resultado.plan_picking_df
-    homogeneos = df[df["Tipo_Pallet"] == "Homogéneo"]
-    alturas = homogeneos.drop_duplicates("ID_Pallet")["Altura_Final_Pallet_cm"]
-    assert (alturas <= config.ALTURA_TOTAL_MAX).all()
-
-
 def test_alturas_nunca_exceden_el_tope_duro():
     """[Sección 3.3 / v2] El techo real no es ALTURA_TOTAL_MAX (205, el máximo
     NORMAL): un pallet que todavía no llegó al mínimo tolerado (185) puede
@@ -44,19 +29,15 @@ def test_alturas_nunca_exceden_el_tope_duro():
 
 
 def test_bat_nunca_abre_un_pallet_dedicado_si_hay_alternativa():
-    """[V3 / bat.asignar_hosts_bat] Prioridad de negocio explícita: una caja
-    BAT nunca es un pallet físico aparte -por encima de mantener remates
-    puros por pallet. Comestibles y Cigarros pueden convivir en capas
-    (camas) distintas del mismo pallet cuando es la única forma de evitar un
-    `PH-BAT-*` dedicado (ver los 4 niveles de fallback en `asignar_hosts_bat`
-    y `test_remate_exclusivo`, que sigue exigiendo que NINGUNA cama
-    individual mezcle ambas). Este test no afirma "cero PH-BAT jamás" -en
-    datasets donde un CD agota literalmente todo el margen físico de sus
-    pallets, un dedicado sigue siendo la única salida honesta- pero si
-    aparece uno, tiene que ser porque de verdad no había otra opción, no
-    porque el motor no lo intentó."""
+    """Prioridad de negocio explícita: una caja BAT nunca es un pallet
+    físico aparte si hay lugar en uno ya armado -BAT entra como pseudo-SKU
+    en el mismo armado que el resto de la demanda (ver bat.py, sección "BAT
+    integrado"). Este test no afirma "cero dedicados jamás" -en datasets
+    donde un CD agota literalmente todo el margen físico de sus pallets, un
+    dedicado sigue siendo la única salida honesta- pero si aparece uno,
+    tiene que ser porque de verdad no había otra opción."""
     resultado = ejecutar_desde_archivo(ARCHIVO_REAL)
-    dedicados = [p for p in resultado.pallets if p.id.startswith("PH-BAT-")]
+    dedicados = [p for p in resultado.pallets if p.id.startswith("PV5-BAT-")]
     assert len(dedicados) < 30, (
         f"{len(dedicados)} pallets BAT dedicados: la consolidación en pallets "
         "ya armados no está funcionando como se espera."

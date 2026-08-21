@@ -9,7 +9,7 @@ Reutiliza VAL/DEM/GEO/DER/SPLIT/PESO/EXP tal cual el resto de los motores
 import pandas as pd
 
 import config
-from models import Pallet, ResultadoPipeline
+from models import Pallet, PalletLinea, ResultadoPipeline
 from src import (
     bat,
     benchmark,
@@ -28,7 +28,56 @@ from src.pipeline import (
     _construir_pallets_geometria_insuficiente,
     _construir_pallets_sin_clasificar,
 )
-from src.pipeline_v5 import _palletv5_a_pallet
+
+
+def _palletv5_a_pallet(pv5, info_sku: dict) -> Pallet:
+    """Adapta un PalletV5 (torres) a un Pallet (mismo modelo que usan
+    soporte.py/exportar.py/benchmark.py) para no duplicar esa
+    infraestructura. `camas` queda vacío a propósito -soporte.py no rompe
+    con eso (ver docstring de `clasificar_soporte_pallet`).
+
+    Las torres con sku `bat.BAT_SKU_MARCADOR` no son un SKU real -son la
+    caja física de consolidación de Cigarros/vapes- así que no aportan una
+    `PalletLinea` directamente. Pero el CONTENIDO real de esa caja sí son
+    SKUs reales de Cigarros (`CajaBAT.cantidades_cajas`), y tienen que
+    aparecer en el picking igual que cualquier otro SKU -sin este paso, un
+    pallet 100% BAT (o cualquier pallet con Cigarros) desaparecería del
+    `Plan_Picking`: nadie sabría qué SKUs de Cigarros picking real
+    contiene. Se agregan acá con el mismo criterio (cantidades reales
+    fraccionarias, no la caja física entera)."""
+    cantidades: dict[str, float] = {}
+    for torre in pv5.torres:
+        if torre.sku == bat.BAT_SKU_MARCADOR:
+            continue
+        cantidades[torre.sku] = cantidades.get(torre.sku, 0) + torre.cantidad
+    for caja in pv5.cajas_bat:
+        for sku, qty in caja.cantidades_cajas.items():
+            cantidades[sku] = cantidades.get(sku, 0) + qty
+
+    lineas = []
+    for sku, qty in cantidades.items():
+        meta = info_sku.get(sku, {})
+        lineas.append(
+            PalletLinea(
+                sku=sku,
+                descripcion=meta.get("descripcion", ""),
+                categoria=meta.get("categoria", ""),
+                nivel_categoria=meta.get("nivel_categoria"),
+                cajas_demanda_oficial=qty,
+                cajas_extra_consolidacion=0,
+                peso_no_validable=bool(meta.get("peso_no_validable", False)),
+            )
+        )
+
+    pallet = Pallet(
+        id=pv5.id, cd=pv5.cd, tipo="Columnar",
+        altura_final=pv5.altura_final, peso_estimado=pv5.peso_estimado,
+        estado=config.estado_pallet_por_altura(pv5.altura_final),
+    )
+    pallet.lineas = lineas
+    pallet.cajas_bat = list(pv5.cajas_bat)
+    pallet.es_host_bat = bool(pv5.metadata.get("es_host_bat", False)) or bool(pv5.cajas_bat)
+    return pallet
 
 
 def ejecutar_core_sku_bloque(envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataFrame) -> ResultadoPipeline:

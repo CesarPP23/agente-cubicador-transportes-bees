@@ -74,10 +74,8 @@ def _hash_config() -> str:
     comentarios."""
     claves = [
         config.ALTURA_TARGET, config.ALTURA_MAX_OBSERVADA, config.ALTURA_HARD_VALIDADA,
-        config.PESO_ALERTA_KG, config.PESO_HARD_KG, config.FILL_RATIO_MIN_SOPORTE,
-        config.MAX_SEPARACION_NIVELES, config.TOLERANCIA_ALTURA_PORTANTE, config.TOLERANCIA_ALTURA_TERMINAL,
+        config.PESO_ALERTA_KG, config.PESO_HARD_KG,
         config.CAJA_BAT_LARGO, config.CAJA_BAT_ANCHO, config.CAJA_BAT_ALTO, config.CAJA_BAT_CAPACIDAD_UNIDADES,
-        config.ESTRATEGIA_CAMAS,
     ]
     return hashlib.sha256(str(claves).encode()).hexdigest()[:12]
 
@@ -104,9 +102,7 @@ def calcular_kpis(
     alturas = [p.altura_final for p in pallets]
     pesos = [p.peso_estimado for p in pallets]
     parciales = sum(1 for a in alturas if a < config.ALTURA_TOLERADO_MIN)
-    # "PH-BAT-" (core V4/camas) o "PV5-BAT-" (core V5/columnar, P9) -mismo
-    # concepto, prefijo de ID distinto según qué core armó el pallet.
-    bat_dedicados = sum(1 for p in pallets if p.id.startswith("PH-BAT-") or p.id.startswith("PV5-BAT-"))
+    bat_dedicados = sum(1 for p in pallets if p.id.startswith("PV5-BAT-"))
 
     pallets_por_cd: dict[str, int] = {}
     for p in pallets:
