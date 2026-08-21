@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .streamlit/secrets.toml
+.DS_Store
 
 # Solo Cubicaje18.07.2026.xlsx se usa en el código (tests/test_pipeline_real_data.py).
 # Cubicaje21.07.2026.xlsx no interviene en ningún proceso del core, se excluye.

@@ -81,10 +81,17 @@ def test_cajas_por_cama_cero_se_trata_como_nulo(dataset_factory):
 
 
 def test_peso_fuera_de_rango_se_marca_no_validable_sin_excluir(dataset_factory):
+    """[Sección 2 / v2] "Peso bruto por unidad" de UMA es el peso de la CAJA, no
+    de la unidad -- V6 ya no lo multiplica por "Unidades por caja"
+    (config.PESO_UMA_ES_POR_UNIDAD=False). El fixture antes ponía
+    unidades_por_caja=1000 para inflar 1.0 kg hasta 1000 kg (fuera de rango con
+    la fórmula vieja); con la fórmula corregida esa combinación da 1.0 kg, que
+    es válido. El caso fuera de rango ahora se arma con un peso de caja directo
+    por encima de config.PESO_CAJA_MAX."""
     envios, maestro, uma = dataset_factory(
         envios_overrides=[{"sku": 1}],
-        maestro_overrides=[{"sku": 1, "unidades_por_caja": 1000}],
-        uma_overrides=[{"sku": 1, "peso_unidad": 1.0}],
+        maestro_overrides=[{"sku": 1}],
+        uma_overrides=[{"sku": 1, "peso_unidad": 500.0}],
     )
     df, log = validar_y_limpiar(envios, maestro, uma)
     assert len(df) == 1

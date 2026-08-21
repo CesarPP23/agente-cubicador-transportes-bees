@@ -1,8 +1,10 @@
+import config
 from src.apilado_3d import armar_pallets
 from src.derivados import calcular_derivados
 from src.packing_2d import generar_camas
 from src.pallets_homogeneos import armar_pallets_homogeneos
 from src.pipeline import _construir_info_sku
+from src.reconciliacion_geometrica import reconciliar
 from src.validacion import validar_y_limpiar
 
 
@@ -23,13 +25,17 @@ def test_pallet_homogeneo_se_completa_con_remate_disponible(dataset_factory):
     )
 
     df, _ = validar_y_limpiar(envios, maestro, uma)
+    df, _auditoria = reconciliar(df)
     df = calcular_derivados(df)
     info_sku = _construir_info_sku(df)
 
     remanente, pallets_hom = armar_pallets_homogeneos(df)
     assert len(pallets_hom) == 1
     altura_base = pallets_hom[0].altura_final
-    assert altura_base < 185
+    # [Sección 7 / v2] el literal 185 era de la ventana vieja; lo que este test
+    # realmente verifica es que el homogéneo, tal cual sale del Paso 2, deja
+    # margen para que el remate se agregue encima sin pasar el máximo normal.
+    assert altura_base < config.ALTURA_TOTAL_MAX
 
     camas_por_cd = generar_camas(remanente)
     pallets = armar_pallets(camas_por_cd, info_sku, pallets_semilla=pallets_hom)
