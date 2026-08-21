@@ -26,7 +26,7 @@ import pandas as pd
 
 import config
 from models import PalletV5
-from src.packing_columnar import _PalletEnConstruccion
+from src.packing_columnar import _altura_presupuesto, _CuboidLibre, _PalletEnConstruccion
 from src.torres import TorreCandidate, generar_torres_candidatas
 
 
@@ -93,6 +93,32 @@ def _colocar_bloque_completo(
     return True
 
 
+def _mejor_orientacion_grilla(candidatas: list[TorreCandidate]) -> TorreCandidate:
+    """[fix] Para un pallet 100% DEDICADO a un solo SKU, conviene fijar UNA
+    sola orientación para el pallet entero (grilla columnas x filas x
+    altura) en vez de dejar que el best-fit incremental de MaxRects vaya
+    mezclando orientaciones caja a caja -eso fragmenta el espacio libre de
+    formas que después ninguna orientación puede volver a aprovechar bien
+    (medido: SJ97/22454 quedaba en 180 cajas con la exploración mezclada,
+    contra 189 de la grilla pura en la MEJOR de las dos orientaciones).
+
+    [sobresaliente] La grilla se calcula sobre la base EXTENDIDA
+    (config.PALLET_LARGO_EFECTIVO/ANCHO_EFECTIVO, +2.5cm por lado -el
+    estándar logístico ya confirmado, ver config.SOBRESALIENTE_MAX_CM), NO
+    la base estricta 120x100. Es seguro acá porque un pallet dedicado tiene
+    UNA sola orientación para TODAS sus cajas -el sobresaliente queda parejo
+    de un solo lado, no el perfil irregular que preocupaba mezclar
+    sobresalientes de SKUs distintos en direcciones distintas (esa
+    preocupación sigue aplicando a los pallets mixtos, que NO usan esta
+    función y siguen con la base estricta)."""
+    def _capacidad_grilla(c: TorreCandidate) -> int:
+        cols = int(config.PALLET_LARGO_EFECTIVO // c.largo)
+        filas = int(config.PALLET_ANCHO_EFECTIVO // c.ancho)
+        return cols * filas * c.max_cajas_verticales
+
+    return max(candidatas, key=_capacidad_grilla)
+
+
 def _altura_potencial(sku: str, cantidad: int, por_sku: dict[str, list[TorreCandidate]]) -> float:
     """Proxy determinístico para ordenar bloques -altura si se apilara en
     UNA sola columna (la más alta posible, sin repartir en huella). No hace
@@ -150,17 +176,29 @@ def _dedicar_por_sku(
         pallets_completos = demanda // capacidad
         resto = demanda - pallets_completos * capacidad
 
+        # [fix] UNA sola orientación fija para todo el pallet dedicado -ver
+        # docstring de `_mejor_orientacion_grilla`. `permitir_parcial=True`
+        # ya alcanza para llenar toda la grilla en un solo `mejor_ajuste`
+        # (cantidad_colocable = lo que entra en el cuboide -acá es el
+        # pallet entero vacío, entra la grilla completa de una).
+        mejor_candidata = _mejor_orientacion_grilla(por_sku[sku])
+
         for _ in range(int(pallets_completos)):
             contador[0] += 1
             pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
-            pc = _PalletEnConstruccion(pallet=pallet)
+            # [sobresaliente] Base EXTENDIDA (125x105) para este pallet
+            # dedicado -ver docstring de `_mejor_orientacion_grilla`.
+            libre_inicial = _CuboidLibre(
+                0.0, 0.0, 0.0, config.PALLET_LARGO_EFECTIVO, config.PALLET_ANCHO_EFECTIVO, _altura_presupuesto()
+            )
+            pc = _PalletEnConstruccion(pallet=pallet, libres=[libre_inicial])
             restante = capacidad
             guard = 0
             while restante > 0:
                 guard += 1
                 if guard > 1000:
                     break
-                mejor = _mejor_ajuste_para_sku(pc, por_sku[sku], restante, permitir_parcial=True)
+                mejor = _mejor_ajuste_para_sku(pc, [mejor_candidata], restante, permitir_parcial=True)
                 if mejor is None:
                     break
                 cand, idx_libre, _sobra, cantidad_colocable = mejor
@@ -168,13 +206,13 @@ def _dedicar_por_sku(
                 restante -= cantidad_colocable
             dedicados.append(pallet)
             if restante > 0:
-                # La capacidad declarada ("Cajas por PH") no se logró
-                # completar en la práctica -el packer 3D real (MaxRects)
-                # puede fragmentar distinto de lo que asume el número
-                # teórico del Maestro. El faltante NO se pierde: se suma al
-                # bloque de este SKU para que la fase de bloques lo intente
-                # colocar en otro lado (bug real encontrado por
-                # test_demanda_planificada_coincide_con_demanda_redondeada).
+                # La grilla de la mejor orientación fija no alcanzó a cubrir
+                # toda la capacidad declarada ("Cajas por PH") -puede pasar
+                # cuando el número del Maestro asume un margen de
+                # sobresaliente que el packing real todavía no aplica (ver
+                # config.SOBRESALIENTE_MAX_CM). El faltante NO se pierde: se
+                # suma al bloque de este SKU para que la fase de bloques lo
+                # intente colocar en otro lado.
                 bloques[sku] = bloques.get(sku, 0) + restante
 
         if resto > 0:

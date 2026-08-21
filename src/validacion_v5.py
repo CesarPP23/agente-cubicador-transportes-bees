@@ -38,14 +38,20 @@ def validar_pallet_v5(pallet: PalletV5) -> list[str]:
     torres = pallet.torres
 
     for t in torres:
+        # [sobresaliente] El tope real es la base EXTENDIDA
+        # (PALLET_LARGO_EFECTIVO/ANCHO_EFECTIVO, +2.5cm por lado -estándar
+        # logístico ya confirmado), no la base estricta 120x100 -pallets
+        # dedicados a un solo SKU (ver packing_bloques._dedicar_por_sku)
+        # pueden usar ese margen a propósito.
         if (
             t.x < -TOLERANCIA_CM or t.y < -TOLERANCIA_CM
-            or t.x + t.largo > config.PALLET_LARGO + TOLERANCIA_CM
-            or t.y + t.ancho > config.PALLET_ANCHO + TOLERANCIA_CM
+            or t.x + t.largo > config.PALLET_LARGO_EFECTIVO + TOLERANCIA_CM
+            or t.y + t.ancho > config.PALLET_ANCHO_EFECTIVO + TOLERANCIA_CM
         ):
             violaciones.append(
                 f"{pallet.id}: torre {t.sku}@({t.x:.1f},{t.y:.1f}) "
-                f"{t.largo:.1f}x{t.ancho:.1f} se sale de la base {config.PALLET_LARGO}x{config.PALLET_ANCHO}"
+                f"{t.largo:.1f}x{t.ancho:.1f} se sale de la base extendida "
+                f"{config.PALLET_LARGO_EFECTIVO}x{config.PALLET_ANCHO_EFECTIVO}"
             )
 
     for i in range(len(torres)):

@@ -1445,3 +1445,74 @@ gracias al bug de demanda encontrado en el camino.
   diferencia de cantidad, no una regresión).
 
 ---
+
+## Pallets dedicados: orientación fija + sobresaliente real
+
+Instrucción del usuario, corrigiendo el modelo: "Cajas por PH" del Maestro
+es lo MÁXIMO físicamente comprobado (armado real) para ese SKU -no un
+número que el packer 3D deba re-derivar ni recortar. Las dimensiones UMA
+son para cubicar el resto (otras SKUs) después de que ese máximo ya se usó,
+no para "corregir" el máximo declarado.
+
+### Diagnóstico
+Reportado por el usuario: el dataset de ayer subió de 60 a 62 pallets
+después de la limpieza. Investigado: NO fue un borrado -fue el fix del bug
+de demanda perdida (sección anterior), que ahora reparte honestamente 43
+cajas que antes desaparecían en silencio. Al investigar el caso concreto
+(SJ97/22454, capacidad declarada 192) aparecieron DOS problemas reales:
+
+1. **Bug real de orientación**: el pallet "dedicado" quedaba en 180 cajas
+   cuando la MEJOR orientación pura (grilla columnas x filas x altura) daba
+   189 -el best-fit incremental de MaxRects iba mezclando ambas
+   orientaciones caja a caja, fragmentando el espacio de una forma que
+   después ninguna orientación podía volver a aprovechar. 9 de las 12 cajas
+   de brecha eran nuestro propio bug, no un límite físico.
+2. **Brecha real de 3-6 cajas** (189 vs 192 declarado): el sobresaliente de
+   2.5cm/lado (`config.SOBRESALIENTE_MAX_CM`, ya confirmado como estándar
+   logístico) existía en `config.py` desde antes pero SOLO se usaba para
+   VALIDAR si el dato del Maestro era creíble -nunca se aplicaba al packing
+   real (`SOBRESALIENTE_PLANIFICACION` quedó sin cablear, una decisión de
+   negocio marcada explícitamente como "todavía no confirmada"). Esta
+   sesión la confirma para el caso dedicado.
+
+### Cambios
+- `src/packing_bloques.py`: `_mejor_orientacion_grilla(candidatas)` (nuevo)
+  -para un pallet dedicado, calcula la grilla (columnas x filas x altura)
+  de CADA orientación sobre la base EXTENDIDA
+  (`config.PALLET_LARGO_EFECTIVO`/`ANCHO_EFECTIVO`, 125x105) y devuelve la
+  mejor -UNA sola, fija para todo el pallet, no descubierta a los tropezones
+  por MaxRects. `_dedicar_por_sku` ahora siembra cada pallet dedicado con un
+  único `_CuboidLibre` de 125x105 (en vez del 120x100 default de
+  `_PalletEnConstruccion`) y coloca solo con esa orientación fija.
+  Es seguro EXTENDER la base acá (y no en el packer general/mixto) porque
+  un pallet dedicado tiene una sola orientación para TODAS sus cajas -el
+  sobresaliente queda parejo de un solo lado, no el perfil irregular que
+  preocupaba mezclar sobresalientes de SKUs distintos en direcciones
+  distintas (esa preocupación, documentada desde antes en config.py, sigue
+  aplicando íntegra a los pallets MIXTOS -no se tocó nada de esa parte).
+- `src/validacion_v5.py`: el chequeo de overflow pasa de la base estricta
+  (120x100) a la extendida (125x105) -el tope geométrico real ahora
+  coincide con el estándar logístico ya aceptado, no con un límite interno
+  más chico que el que la operación real usa.
+- `tests/test_validacion_v5.py`: test nuevo confirmando que una torre
+  dentro del margen de sobresaliente (entre 120 y 125) NO es violación.
+
+### Resultado
+```
+                          Antes (grilla mezclada, sin sobresaliente)   Después
+KR Cola Negra SJ97:       180+180+24 (3 pallets, 24 sueltas)           192+192 (2 pallets, EXACTO)
+Dataset grande:           53 pallets                                   53 pallets (misma cantidad, mejor concentración)
+Dataset 18.08 (ayer):     62 pallets                                   60 pallets
+```
+Demanda exacta y 0 violaciones geométricas en ambos datasets, verificado
+después del cambio.
+
+### Invariantes
+- Demanda exacta: verificado (ambos datasets).
+- 0 violaciones geométricas (con el nuevo tope 125x105): verificado.
+- Los pallets MIXTOS (con más de un SKU) siguen usando la base estricta
+  120x100 -el sobresaliente solo se activó para el caso dedicado, tal como
+  se acordó explícitamente.
+- tests: 103 passed (suite completa).
+
+---
