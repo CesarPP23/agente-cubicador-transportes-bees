@@ -1,53 +1,135 @@
-"""[SKU_BLOQUE] Nueva lógica: cada SKU es un bloque indivisible mientras
-sea posible -se coloca ENTERO junto con otros bloques enteros hasta llenar
-la altura; solo se parte uno como último recurso."""
+"""[SKU_BLOQUE, camas] El pallet se arma CAMA POR CAMA (piso por piso), no
+por columnas verticales de un solo SKU -corrección explícita del usuario:
+"nunca pero nunca se empieza haciendo columnas, siempre primero se van
+llenando las filas de abajo hacia arriba". Dentro de una cama, otros SKUs
+solo se agregan si su altura es compatible (hueco chico, cama estable)."""
 import pandas as pd
 
-from src.packing_bloques import armar_pallets_bloques
+from src.packing_bloques import TOLERANCIA_HUECO_CAMA_CM, armar_pallets_bloques
 from src.validacion_v5 import validar_geometria_v5
 
 
-def _fila(sku, largo, ancho, alto, cantidad, cajas_por_ph, peso=1.0, cd="BK31"):
-    return {
+def _fila(sku, largo, ancho, alto, cantidad, cajas_cama=None, cd="BK31"):
+    fila = {
         "SKU": sku, "CD": cd, "Cajas_Remanente": cantidad,
         "Largo_Efectivo": largo, "Ancho_Efectivo": ancho, "Alto_Efectivo": alto,
-        "Peso_Caja": peso, "Fuente_Geometria": "UMA_VALIDADA", "Cajas por PH": cajas_por_ph,
+        "Peso_Caja": 1.0, "Fuente_Geometria": "UMA_VALIDADA",
     }
+    if cajas_cama is not None:
+        fila["Cajas_Cama_Efectivo"] = cajas_cama
+    return fila
+
+
+def _torres_por_z(pallets):
+    """Agrupa todas las torres de todos los pallets por (id_pallet, z
+    redondeado) -cada grupo es UNA cama."""
+    grupos: dict[tuple, list] = {}
+    for p in pallets:
+        for t in p.torres:
+            grupos.setdefault((p.id, round(t.z, 3)), []).append(t)
+    return grupos
 
 
 def test_ejemplo_del_usuario_100_cajas_capacidad_150_un_solo_pallet():
-    """Caso exacto descripto: 100 cajas de una SKU cuya capacidad de
-    pallet es 150 -las 100 quedan en UN SOLO PALLET (pueden ser varias
-    torres/columnas side-by-side dentro de ese mismo pallet si el
-    footprint es chico -eso no es "repartir", sigue siendo un pallet)."""
-    df = pd.DataFrame([_fila("KR_NEGRA", 30, 20, 20.0, 100, cajas_por_ph=150)])
+    """100 cajas de una SKU cuya capacidad de cama es 150 -las 100 quedan
+    en UN SOLO PALLET, en la MISMA cama (mismo z), no repartidas."""
+    df = pd.DataFrame([_fila("KR_NEGRA", 30, 20, 20.0, 100, cajas_cama=150)])
     pallets = armar_pallets_bloques(df, "BK31")
     pallets_con_kr = {p.id for p in pallets if any(t.sku == "KR_NEGRA" for t in p.torres)}
-    assert len(pallets_con_kr) == 1  # un solo PALLET, no repartido en varios
+    assert len(pallets_con_kr) == 1
     total = sum(t.cantidad for p in pallets for t in p.torres if t.sku == "KR_NEGRA")
     assert total == 100
 
 
-def test_otros_skus_consolidados_llenan_la_altura_restante():
-    """Con el bloque ancla chico, otros SKUs enteros deberían compartir el
-    MISMO pallet en vez de abrir uno nuevo, si entran completos."""
+def test_arma_fila_por_fila_no_columnas():
+    """El SKU ancla, dentro de UNA cama, tiene que quedar todo al mismo z
+    (una fila horizontal), nunca apilado en una sola columna de piso a
+    techo -eso era el bug del modelo anterior (torres)."""
+    df = pd.DataFrame([_fila("A", 20, 20, 25.0, 8, cajas_cama=8)])
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_a = [t for p in pallets for t in p.torres if t.sku == "A"]
+    zs = {round(t.z, 3) for t in torres_a}
+    assert zs == {0.0}, f"todas las torres de A deberían estar en la MISMA cama (z=0), no repartidas en columnas: {zs}"
+
+
+def test_otro_sku_de_altura_compatible_comparte_la_cama():
+    """Un SKU chico de altura parecida a la del ancla debe compartir la
+    MISMA cama (mismo z) en vez de esperar a otro pallet. El ancla necesita
+    MÁS demanda pendiente que el secundario para ser elegida como ancla de
+    la primera cama (criterio de selección: mayor demanda pendiente)."""
     df = pd.DataFrame(
         [
-            _fila("A", 30, 20, 20.0, 3, cajas_por_ph=150),  # bloque chico, deja mucha altura libre
-            _fila("B", 30, 20, 20.0, 4, cajas_por_ph=150),  # bloque entero que puede sumarse
-            _fila("C", 30, 20, 20.0, 5, cajas_por_ph=150),
+            _fila("ANCLA", 100, 90, 20.0, 5, cajas_cama=1),  # más demanda -> ancla de la 1ra cama
+            _fila("CHICO", 15, 8, 18.0, 3, cajas_cama=50),  # altura parecida (18 vs 20), debería compartir cama
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
-    # Los 3 SKUs son chicos -deberían caber juntos en pocos pallets, no uno cada uno.
-    assert len(pallets) < 3
+    grupos = _torres_por_z(pallets)
+    camas_con_ambos = [g for g in grupos.values() if {t.sku for t in g} == {"ANCLA", "CHICO"}]
+    assert camas_con_ambos, "ANCLA y CHICO deberían terminar en la misma cama (misma z)"
+
+
+def test_sku_muy_mas_bajo_no_comparte_cama_aunque_fisicamente_entre():
+    """[bug real encontrado] Un SKU MUCHO más bajo que el ancla puede
+    entrar físicamente en la profundidad de la cama (ej. una cama de 100cm
+    fácilmente aloja una caja de 20cm) pero dejaría un hueco de 80cm por
+    encima -exactamente lo que se quiere evitar. La tolerancia tiene que
+    ser simétrica: no solo "no más alto", también "no mucho más bajo"."""
+    df = pd.DataFrame(
+        [
+            _fila("ALTO", 100, 90, 100.0, 5, cajas_cama=1),  # más demanda -> ancla
+            _fila("BAJITO", 15, 8, 20.0, 3, cajas_cama=50),  # 100 - 20 = 80cm >> tolerancia
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    grupos = _torres_por_z(pallets)
+    for g in grupos.values():
+        skus = {t.sku for t in g}
+        assert skus != {"ALTO", "BAJITO"}, "ALTO y BAJITO no deberían compartir cama -el hueco sería enorme"
+
+
+def test_sku_de_altura_incompatible_no_comparte_cama():
+    """Un SKU mucho más alto que el ancla NO puede sumarse a esa cama -se
+    saldría del hueco tolerado. Tiene que esperar su propia cama."""
+    df = pd.DataFrame(
+        [
+            _fila("BAJO", 100, 90, 15.0, 5, cajas_cama=1),  # más demanda -> ancla
+            _fila("ALTO", 15, 8, 40.0, 3, cajas_cama=50),  # 40 - 15 = 25cm > tolerancia
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    grupos = _torres_por_z(pallets)
+    for g in grupos.values():
+        skus = {t.sku for t in g}
+        assert skus != {"BAJO", "ALTO"}, "BAJO y ALTO no deberían compartir cama -su diferencia de altura excede la tolerancia"
+
+
+def test_ninguna_cama_tiene_huecos_mas_grandes_que_la_tolerancia():
+    """Invariante central del pedido: dentro de una MISMA cama, ningún SKU
+    puede quedar tan bajo que deje un hueco de aire grande -la diferencia
+    entre la altura de la cama y la de cualquier torre que la comparte debe
+    quedar dentro de TOLERANCIA_HUECO_CAMA_CM."""
+    df = pd.DataFrame(
+        [
+            _fila("A", 40, 30, 25.0, 6, cajas_cama=10),
+            _fila("B", 25, 20, 20.0, 8, cajas_cama=30),
+            _fila("C", 15, 15, 22.0, 20, cajas_cama=60),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    grupos = _torres_por_z(pallets)
+    for (pallet_id, z), torres in grupos.items():
+        alturas = [t.altura for t in torres]
+        assert max(alturas) - min(alturas) <= TOLERANCIA_HUECO_CAMA_CM + 1e-6, (
+            f"{pallet_id} cama z={z}: hueco de {max(alturas) - min(alturas):.1f}cm supera la tolerancia"
+        )
 
 
 def test_no_pierde_demanda():
     df = pd.DataFrame(
         [
-            _fila("A", 30, 20, 25.0, 37, cajas_por_ph=20),
-            _fila("B", 25, 25, 20.0, 12, cajas_por_ph=50),
+            _fila("A", 30, 20, 25.0, 37, cajas_cama=8),
+            _fila("B", 25, 25, 20.0, 12, cajas_cama=10),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
@@ -59,56 +141,40 @@ def test_no_pierde_demanda():
     assert despachado.get("B", 0) == 12
 
 
-def test_demanda_mayor_a_un_pallet_saca_dedicados_y_deja_bloque_resto():
-    """Demanda de 370 cajas, capacidad 150 -> 2 pallets 100% dedicados
-    (300 cajas) + 1 bloque resto de 70 cajas."""
-    df = pd.DataFrame([_fila("GRANDE", 30, 20, 20.0, 370, cajas_por_ph=150)])
+def test_demanda_grande_ocupa_varias_camas_del_mismo_pallet():
+    """Demanda mucho mayor a lo que entra en una cama -tiene que apilar
+    VARIAS camas del mismo SKU (una arriba de la otra), no perder nada."""
+    df = pd.DataFrame([_fila("GRANDE", 30, 20, 20.0, 370, cajas_cama=150)])
     pallets = armar_pallets_bloques(df, "BK31")
     despachado = sum(t.cantidad for p in pallets for t in p.torres if t.sku == "GRANDE")
     assert despachado == 370
-
-    # cantidades por torre: debería haber torres de 150 (dedicados) y una de 70 (resto)
-    cantidades = sorted(t.cantidad for p in pallets for t in p.torres if t.sku == "GRANDE")
-    assert 70 in cantidades or sum(cantidades) == 370  # el resto no queda perdido ni fragmentado de más
-
-
-def test_bloque_se_parte_solo_como_ultimo_recurso():
-    """Si NINGÚN otro bloque entero cabe con el ancla, pero sí queda
-    margen, se parte alguno para no desperdiciar altura -pero solo cuando
-    ya no hay más bloques enteros posibles."""
-    df = pd.DataFrame(
-        [
-            _fila("ANCLA", 120, 100, 180.0, 1, cajas_por_ph=1),  # ocupa casi toda la altura y la huella
-            _fila("CHICO", 20, 20, 20.0, 50, cajas_por_ph=200),  # bloque grande, no entra entero en lo que sobra
-        ]
-    )
-    pallets = armar_pallets_bloques(df, "BK31")
-    despachado_chico = sum(t.cantidad for p in pallets for t in p.torres if t.sku == "CHICO")
-    assert despachado_chico == 50  # nada se pierde, sea en 1 o varias torres
 
 
 def test_no_viola_geometria():
     df = pd.DataFrame(
         [
-            _fila("A", 30, 20, 25.0, 37, cajas_por_ph=20),
-            _fila("B", 25, 25, 20.0, 12, cajas_por_ph=50),
-            _fila("C", 40, 30, 15.0, 200, cajas_por_ph=60),
+            _fila("A", 30, 20, 25.0, 37, cajas_cama=8),
+            _fila("B", 25, 25, 20.0, 12, cajas_cama=10),
+            _fila("C", 40, 30, 15.0, 200, cajas_cama=12),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
     assert validar_geometria_v5(pallets) == []
 
 
-def test_sin_cajas_por_ph_el_sku_es_un_bloque_unico():
+def test_sin_cajas_cama_efectivo_igual_arma_algo():
+    """Sin la columna Cajas_Cama_Efectivo (no debería pasar en el pipeline
+    real, pero por si acaso) el packer no debe perder demanda -usa toda la
+    huella disponible como tope."""
     df = pd.DataFrame(
         [
             {
-                "SKU": "SIN_PH", "CD": "BK31", "Cajas_Remanente": 8,
+                "SKU": "SIN_CAMA", "CD": "BK31", "Cajas_Remanente": 8,
                 "Largo_Efectivo": 20, "Ancho_Efectivo": 20, "Alto_Efectivo": 20.0,
                 "Peso_Caja": 1.0, "Fuente_Geometria": "UMA_VALIDADA",
             }
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
-    despachado = sum(t.cantidad for p in pallets for t in p.torres if t.sku == "SIN_PH")
+    despachado = sum(t.cantidad for p in pallets for t in p.torres if t.sku == "SIN_CAMA")
     assert despachado == 8

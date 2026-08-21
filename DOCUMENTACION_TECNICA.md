@@ -1,24 +1,23 @@
 # Documentación técnica — Agente Cubicador
 
 **Repo:** `agente-cubicador-transportes-bees`
-**Estado documentado:** post V3 + parches V4/V4b/V4c (mezcla libre por geometría, confirmado contra fotos de los 42 pallets reales)
+**Estado documentado:** commit `506285c` (2026-08-21) — único motor activo: **SKU_BLOQUE**. `src/` ~2.775 líneas, 19 módulos (bajó de ~5.030 líneas / 30 módulos tras la limpieza que retiró V4/V5-multistart/AUTO, ver sección 9).
 **Alcance:** arquitectura de código, contratos entre módulos, estructuras de datos y cómo operar el proyecto.
 
-> Este documento reemplaza `DOCUMENTACION_TECNICA_V3.md`. La lógica de negocio (invariantes, prioridades, benchmark) está en `DOCUMENTACION_LOGICA.md`.
+> Este documento reemplaza toda versión anterior de `DOCUMENTACION_TECNICA*.md`. La lógica de negocio (invariantes, prioridades, benchmark) está en `DOCUMENTACION_LOGICA.md`. El historial completo de cómo se llegó a este estado vive en `Parches/v5/PATCH_LOG.md`.
 
 ---
 
 ## 1. Qué hace el sistema
 
-A partir de tres hojas de un Excel (`Envios_Julio`, `Maestro_SKUs`, `UMA`), calcula cómo armar pallets físicos (120×100cm) por centro de distribución (CD): qué cajas van en cada pallet, en qué cantidad, y con qué altura/peso resultante — minimizando la cantidad de pallets que hay que armar y mover, dentro de una ventana de altura de ~190-215cm.
+A partir de tres hojas de un Excel (`Envios_Julio`, `Maestro_SKUs`, `UMA`), calcula cómo armar pallets físicos (base 120×100cm) por centro de distribución (CD): qué SKUs van en cada pallet, en qué cantidad y posición, y con qué altura/peso resultante — priorizando que cada SKU quede en el menor número de pallets posible (idealmente uno) antes que minimizar el conteo total de pallets a cualquier costo (ver `DOCUMENTACION_LOGICA.md` sección 9).
 
-Input: `envios, maestro, uma` (DataFrames) → `pipeline.ejecutar_pipeline(...)` → `ResultadoPipeline` (plan de picking, log de validación, resumen por CD, auditoría geométrica, benchmark).
+Input: `envios, maestro, uma` (DataFrames) → `src.pipeline.ejecutar_pipeline(...)` → `ResultadoPipeline` (plan de picking, log de validación, resumen por CD, auditoría geométrica, benchmark, lista de `PalletV5` para inspección/export detallado).
 
 ## 2. Entorno
 
 - Python 3.11 (via `uv`, venv en `env/`)
-- Dependencias: `pandas`, `openpyxl`, `streamlit` (para `app.py`)
-- Tests: `pytest -q` desde la raíz del repo
+- Dependencias (`requirements.txt`): `pandas>=2.0`, `openpyxl>=3.1`, `streamlit>=1.35`, `matplotlib>=3.8`, `pytest>=8.0`
 - Dataset real de referencia: `Cubicaje18.07.2026.xlsx` (raíz del repo)
 
 ```bash
@@ -27,36 +26,42 @@ python -m pytest -q
 streamlit run app.py
 ```
 
-## 3. Flujo del pipeline (`src/pipeline.py::ejecutar_pipeline`)
+Nota de compatibilidad: el código usa sintaxis de tipos `X | None` (PEP 604, válida desde Python 3.10) y no depende de nada exclusivo de 3.11 en el código propio — el requisito de 3.11 es por el venv del proyecto, no por una dependencia dura del lenguaje.
+
+## 3. Flujo del pipeline
+
+Un solo camino desde la limpieza de sección 9 — `pipeline.ejecutar_pipeline` ya no despacha por flag, llama directo a `pipeline_sku_bloque.ejecutar_core_sku_bloque`:
 
 ```
-VAL  validacion.validar_y_limpiar(envios, maestro, uma)      -> df_validado, log_df
-DEM  demanda.normalizar_demanda(df_validado)                  -> df_demanda
-GEO  reconciliacion_geometrica.reconciliar(df_demanda)         -> df_geo, auditoria_geometrica_df
-DER  derivados.calcular_derivados(df_geo)                      -> df_derivado
-     _construir_info_sku(df_derivado)                          -> info_sku (dict por SKU)
-SPLIT bat.separar_bat(df_derivado)                             -> df_no_bat, df_bat
-     clasificación: df_clasificado / df_no_clasificado / df_geometria_insuficiente
-HOM  pallets_homogeneos.armar_pallets_homogeneos(df_clasificado) -> remanente_df, pallets_hom
-P2D  packing_2d.generar_camas(remanente_df)                    -> camas_por_cd
-P3D  apilado_3d.armar_pallets(camas_por_cd, info_sku, pallets_hom) -> pallets_apilado
-BATPOOL bat.consolidar_bat_por_cd(df_bat)                       -> cajas_bat_por_cd
-HOST bat.asignar_hosts_bat(pallets_apilado, cajas_bat_por_cd, info_sku)  (in-place)
-SOP  soporte.clasificar_soporte_pallet(pallet)  por cada pallet  (in-place)
-PESO validacion_peso.validar_pesos(todos_pallets, info_sku)     (in-place)
-BENCH benchmark.calcular_kpis(...) / benchmark_df(...)
-EXP  exportar.construir_plan_picking_df / construir_resumen_cd_df
+VAL     validacion.validar_y_limpiar(envios, maestro, uma)         -> df_validado, log_df
+DEM     demanda.normalizar_demanda(df_validado)                     -> df_demanda
+GEO     reconciliacion_geometrica.reconciliar(df_demanda)           -> df_geo, auditoria_geometrica_df
+DER     derivados.calcular_derivados(df_geo)                        -> df_derivado
+        _construir_info_sku(df_derivado)                            -> info_sku (dict por SKU)
+SPLIT   bat.separar_bat(df_derivado)                                -> df_no_bat, df_bat
+        clasificación: df_clasificado / df_no_clasificado / df_geometria_insuficiente
+BATPOOL bat.consolidar_bat_por_cd(df_bat)                           -> cajas_bat_por_cd
+        bat.construir_filas_bat_pseudo_sku(cajas_bat_por_cd, info_sku) -> df_bat_pseudo
+        df_armado = concat(df_clasificado, df_bat_pseudo)
+BLOQUE  por cada CD: packing_bloques.armar_pallets_bloques(grupo, cd, contador) -> list[PalletV5]
+        bat.renombrar_pallets_bat_puros / bat.asignar_cajas_bat_a_torres        (in-place)
+        estabilidad.calcular_estabilidad(p)  guardado en p.metadata["estabilidad"]
+ADAPT   _palletv5_a_pallet(pv5, info_sku)  por cada PalletV5          -> Pallet (modelo legado, para reusar soporte/export/benchmark)
+SOP     soporte.clasificar_soporte_pallet(pallet)  por cada pallet    (no-op actual, ver sección 8)
+PESO    validacion_peso.validar_pesos(todos_pallets, info_sku)       (in-place, solo reporte)
+BENCH   benchmark.calcular_kpis(...) / benchmark_df(...)
+EXP     exportar.construir_plan_picking_df / construir_resumen_cd_df
 ```
 
-`GEO` corre sobre **toda** la demanda (BAT incluido) antes del `SPLIT`: no porque BAT necesite geometría (usa una caja fija), sino para que `info_sku` (peso, categoría, nivel) quede completo para todos los SKUs — si se reconciliara después del split, `bat._colocar_bat` fallaría buscando metadata de Cigarros que nunca se calculó.
+`GEO` corre sobre **toda** la demanda (BAT incluido) antes del `SPLIT`: no porque BAT necesite geometría (usa una caja fija), sino para que `info_sku` (peso, categoría, nivel) quede completo para todos los SKUs — si se reconciliara después del split, la asignación de BAT fallaría buscando metadata de Cigarros que nunca se calculó.
 
-`pallets_comparables` (para el benchmark) excluye los pallets `PH-BAT-*` (dedicados, sin más contenido que cajas BAT) — no cuentan contra el benchmark real de 42, igual que las filas `PALLET=0` del dato real (ver `DOCUMENTACION_LOGICA.md`).
+`BLOQUE` corre por CD; además de los CDs con demanda clasificada normal, hay un segundo loop que cubre CDs que solo tienen demanda BAT (sin ningún otro SKU clasificado) para no perder esa demanda en silencio.
 
 ## 4. Módulos
 
 ### 4.1 `config.py`
 
-Todas las constantes del sistema. Sin lógica de negocio compleja, solo cálculos derivados triviales. Grupos:
+Todas las constantes del sistema, sin lógica de negocio compleja. Grupos:
 
 | Grupo | Constantes clave |
 |---|---|
@@ -64,211 +69,211 @@ Todas las constantes del sistema. Sin lógica de negocio compleja, solo cálculo
 | Sobresaliente | `SOBRESALIENTE_MAX_CM=2.5`, `PALLET_LARGO_EFECTIVO=125`, `PALLET_ANCHO_EFECTIVO=105` |
 | Rotación acostada | `CATEGORIAS_ROTACION_LIBRE=["Comestibles","Cigarros"]` |
 | Altura | `ALTURA_TARGET=198.3`, `ALTURA_NOMINAL_MIN=190.0`, `ALTURA_MAX_OBSERVADA=215.0`, `ALTURA_HARD_VALIDADA=None` |
-| Peso | `PESO_ALERTA_KG=1400`, `PESO_HARD_KG=1430`, `PESO_ES_RESTRICCION_DURA=False` |
-| Soporte | `TOLERANCIA_ALTURA_PORTANTE=8`, `TOLERANCIA_ALTURA_TERMINAL=20`, `FILL_RATIO_MIN_SOPORTE=0.0` |
-| BAT | `CATEGORIAS_BAT=["Cigarros"]`, `CAJA_BAT_LARGO=45.0`, `CAJA_BAT_ANCHO=24.0`, `CAJA_BAT_ALTO=55.0`, `CAJA_BAT_CAPACIDAD_UNIDADES=500` |
-| Categorías | `ORDEN_CATEGORIAS`, `CATEGORIAS_REMATE`, `nivel_de_categoria()`, `normalizar_categoria()` — **ya no gatean el armado**, ver §4.7/§4.8; siguen siendo metadata de reporte |
+| Peso | `PESO_ALERTA_KG=1400`, `PESO_HARD_KG=1430`, `PESO_PARAMETROS_VALIDADOS=False` |
+| BAT | `CATEGORIAS_BAT=["Cigarros"]`, `CAJA_BAT_LARGO=52.5`, `CAJA_BAT_ANCHO=34.0`, `CAJA_BAT_ALTO=49.0`, `CAJA_BAT_CAPACIDAD_UNIDADES=1000` |
+| Categorías | `ORDEN_CATEGORIAS`, `CATEGORIAS_REMATE`, `nivel_de_categoria()`, `normalizar_categoria()` — metadata de reporte, ya no gatean el armado |
 
 Funciones: `estado_altura(altura)` (zona de reporte), `estado_pallet_por_altura(altura)` (traduce zona → `ESTADO_*`), `normalizar_categoria(valor)`, `nivel_de_categoria(categoria)`.
 
-**Constantes retiradas de la decisión de armado pero mantenidas por compatibilidad**: `MAX_SEPARACION_NIVELES` (ya no se usa — ver §4.7), `RESERVA_ALTURA_REMATE=0` (BAT usa host dinámico, nunca reserva), aliases V2 (`ALTURA_TOTAL_MIN`, `PESO_TOPE_ELASTICO_KG`, etc.) que varios módulos/tests todavía referencian.
+Aliases retrocompatibles todavía referenciados por código/tests: `ALTURA_TOTAL_MIN`, `ALTURA_TOTAL_MIN_TOLERADO`, `ALTURA_TOTAL_MAX`, `ALTURA_TOPE_DURO` (los cuatro apuntan a `ALTURA_NOMINAL_MIN`/`ALTURA_TOLERADO_MIN`/`ALTURA_MAX_OBSERVADA`×2), `PESO_TOPE_ELASTICO_KG` (= `PESO_HARD_KG`).
+
+**Retirado en la limpieza de sección 9** (sin ninguna referencia viva confirmada por grep): `PACKER_VERSION`, `MULTISTART_SEEDS/MAX`, `PH_PREBUILD`, `PURE_FIRST`, `SOBRESALIENTE_PLANIFICACION`, `TOLERANCIA_ALTURA_PORTANTE/TERMINAL/MEZCLA`, `FILL_RATIO_MIN_SOPORTE`, `RESERVA_ALTURA_REMATE`, `ESTRATEGIA_CAMAS`, `CATEGORIAS_SIN_NADA_ENCIMA`, `MAX_SEPARACION_NIVELES`.
 
 ### 4.2 `models.py`
 
-Dataclasses centrales:
+Dos generaciones de dataclasses conviven en el archivo — la segunda es la que de verdad produce el armado hoy:
 
-- **`GeometriaSKU`**: resultado de reconciliar un SKU. Campos nuevos vs. V3: `acostada: bool` (True si la mejor orientación acuesta la caja).
-- **`CajaBAT`**: caja física de consolidación de Cigarros (45×24×55cm, hasta 500 unidades).
-- **`Placement`**: una posición concreta de N cajas de un SKU dentro de una cama (`x,y,w,d,h`).
-- **`Cama`**: unidad de apilado vertical. `categorias: list[str]` (puede tener varias — mezcla libre), `nivel_categoria`, `tipo_soporte` (PORTANTE/TERMINAL), `support_ratio_min`, `geometria_inferida`. Properties: `nivel_efectivo`, `categoria_remate`, `es_flexible`, `fill_ratio`, `desnivel`.
-  - `categoria_remate` sigue reventando (`ValueError`) si una **misma cama** mezcla Comestibles y Cigarros — invariante físico duro (una capa no puede ser dos cosas a la vez). A nivel **pallet** ya no son excluyentes (ver §4.8).
-- **`Pallet`**: `camas`, `lineas`, `altura_final`, `peso_estimado`, `estado`, `altura_pre_bat`, `cajas_bat`, `es_host_bat`, `altura_target_delta`, `support_ratio_min`.
-- **`ResultadoPipeline`**: output final del pipeline.
+**Modelo legado (`Cama`/`Pallet`)** — sigue existiendo porque `soporte.py`, `exportar.construir_plan_picking_df`, `benchmark.py` y la vista 2D de `app.py`/`visualizacion.py` están escritos contra él. `_palletv5_a_pallet` (en `pipeline_sku_bloque.py`) adapta cada `PalletV5` a un `Pallet` con `camas=[]` siempre — ver sección 8 para qué implica eso.
 
-### 4.3 `src/solver_cajas.py` — solver de patrones mixtos (P1)
+- `GeometriaSKU`: resultado de reconciliar un SKU (`fuente_geometria`, `acostada`, etc.)
+- `CajaBAT`: caja física fija de consolidación de Cigarros
+- `Placement` / `Cama`: modelo por capas horizontales — `Cama` conserva properties (`nivel_efectivo`, `categoria_remate`, `es_flexible`, `fill_ratio`) que ya no se ejercitan en el pipeline actual (nunca se crea una `Cama` con contenido real)
+- `PalletLinea` / `Pallet`: unidad de salida del plan de picking — `camas` queda vacío, `lineas` sí se llena (viene de las torres del `PalletV5` adaptado)
 
-Movido tal cual desde `Parches/v4_cubicaje_mixto/solver.py`. `max_cajas(W, H, largo, ancho, con_pinwheel=True) -> (n, metodo)`: máximo de rectángulos idénticos (con rotación 90°) dentro de una región `W×H`, probando tres familias de patrones, de menor a mayor poder:
+**Modelo columnar (`Torre`/`PalletV5`)** — el que arma `packing_bloques.py` de verdad:
 
-1. **Grillas uniformes** (`_grid`): filas × columnas en cada orientación.
-2. **Guillotina recursiva** (`crear_solver`): cortes rectos de lado a lado, recursivo, con posiciones candidatas canónicas — encuentra patrones **mixtos** (bloques con distinta orientación conviviendo en la misma cama).
-3. **Pinwheel/five-block**: descomposición NO guillotinable (molinete) — patrones que ninguna secuencia de cortes rectos puede producir.
+- `OrientacionCaja` (frozen): una orientación válida de una caja.
+- `PlacementCaja`: una caja física concreta (x, y, z, orientación) dentro de una torre.
+- `Torre`: cajas del mismo SKU apiladas verticalmente en una posición XY fija. `altura` (`cantidad × alto_caja`) y `area_base` son properties derivadas, nunca campos que se puedan desincronizar. `z` es la base del segmento dentro de la pila de producto (0 = piso del pallet) — permite que una torre empiece donde termina otra en el mismo (x,y), habilitando apilado real tipo Tetris/Lego en vez de una sola torre de piso a techo por posición XY.
+- `PalletV5`: `torres`, `cajas_bat`, `altura_final`, `peso_estimado`, `ocupacion_xy`, `volumen_utilizado`, `estado`, `metadata` (dict libre — ahí vive `estabilidad`, `sin_colocar`, `es_host_bat`).
+- `ResultadoPipeline`: además de los campos del modelo legado, trae `pallets_v5: list[PalletV5]` — la fuente de verdad para inspección/export detallado (Torres, Pallets_3D_Data, Estabilidad).
 
-Puro, sin dependencias del resto del repo (usa `functools.lru_cache` internamente por instancia de solver). Validado contra 300 casos aleatorios (nunca supera el límite de área) y casos puntuales documentados en `Parches/v4_cubicaje_mixto/PARCHES_V4.md`.
+### 4.3 `src/validacion.py` — Paso 0
 
-### 4.4 `src/reconciliacion_geometrica.py` — geometría efectiva por SKU
+`cargar_hojas(ruta_o_buffer)` lee las 3 hojas del Excel. `validar_y_limpiar(envios, maestro, uma)` aplica las reglas V1-V9 (normalización de SKU, duplicados CD+SKU sumados, exclusión de Cajas Teóricas ≤0, SKU sin Maestro/UMA excluido, "Cajas por PH"/"Camas por PH" fuera de rango marcados no-confiables, "Cajas por cama" nulo/0 marcado para fallback geométrico, dimensión imposible para el pallet excluida, alto de caja sobre el máximo excluido, peso fuera de rango sano marcado `Peso_No_Validable`, categoría no reconocida excluida del apilado automático) y devuelve `(df, log_df)` con cada exclusión trazada.
 
-Responsabilidad: para cada SKU, decidir `Largo_Efectivo/Ancho_Efectivo/Alto_Efectivo` (la geometría que el resto del motor usa) reconciliando dos fuentes que pueden contradecirse:
+### 4.4 `src/demanda.py`
 
-- **Maestro** (`Cajas por cama`): capacidad OPERACIONAL declarada por el negocio.
-- **UMA** (`Largo/Ancho/Alto de caja`): dimensiones medidas.
+`normalizar_demanda(df)`: calcula demanda en unidades y la política de redondeo por categoría (ver `DOCUMENTACION_LOGICA.md` sección 7). Agrega `Demanda_Unidades_Oficial`, `Cajas_Completas`, `Unidades_Fraccionarias`, `Politica_Redondeo`, `Unidades_Exceso_Redondeo`.
 
-```python
-capacidad_xy_max(largo, ancho) -> (capacidad, orientacion)
-```
-Capacidad máxima contra el pallet estricto (120×100), probando grilla + mixto + molinete (vía `solver_cajas.max_cajas`). `orientacion` es `'A'`, `'B'` o `'MIXTA'` — ningún consumidor actual usa ese segundo valor para otra cosa que no sea descartarlo. Cacheado (`lru_cache`, clave `(largo, ancho, pallet_largo, pallet_ancho)` redondeados) — sin esto, `derivados.calcular_derivados` (que llama por FILA de demanda, no por SKU único) sería inviablemente lento (~70ms/dimensión con molinete).
+### 4.5 `src/reconciliacion_geometrica.py`
 
-```python
-capacidad_xy_max_con_sobresaliente(largo, ancho) -> (capacidad, orientacion)
-```
-Igual pero contra el área EFECTIVA (`PALLET_LARGO_EFECTIVO/ANCHO_EFECTIVO`, 125×105 con 2.5cm de sobresaliente por lado). **Solo** para juzgar si un dato del Maestro es geométricamente creíble (P3, ver abajo) — nunca para la geometría real de packing.
+Responsabilidad: decidir `Largo_Efectivo/Ancho_Efectivo/Alto_Efectivo` por SKU reconciliando Maestro (`Cajas por cama`, capacidad declarada) contra UMA (dimensiones medidas). Ver `DOCUMENTACION_LOGICA.md` sección 5 para la tabla de estados.
 
-```python
-mejor_orientacion_3d(largo, ancho, alto, permitir_acostada, cajas_objetivo=None, con_sobresaliente=False)
-    -> (largo_ef, ancho_ef, alto_ef, capacidad, acostada)
-```
-**(V4c)** Evalúa hasta 3 caras como huella: parada (`largo×ancho`, alto vertical) y, si `permitir_acostada` (categoría en `CATEGORIAS_ROTACION_LIBRE`), las 2 acostadas (`largo×alto` con ancho vertical; `ancho×alto` con largo vertical).
+- `capacidad_orientacion_unica(pallet_largo, pallet_ancho, caja_largo, caja_ancho)`: grilla uniforme simple, una orientación.
+- `capacidad_xy_max(largo, ancho)` / `capacidad_xy_max_con_sobresaliente(largo, ancho)`: mejor capacidad entre grillas uniformes, patrones mixtos por cortes rectos recursivos y molinete/pinwheel (`src.solver_cajas.max_cajas`) — `lru_cache` porque el solver mixto tarda ~70ms por dimensión y se llama por fila de demanda, no por SKU único.
+- `mejor_orientacion_3d(largo, ancho, alto, permitir_acostada, cajas_objetivo, con_sobresaliente)`: evalúa hasta 3 caras como huella (parada + 2 acostadas si la categoría lo permite) y elige según si hay un techo del Maestro que cumplir.
+- `inferir_footprint_desde_cajas_cama(...)`: busca un footprint que reproduzca exacto un `Cajas por cama` declarado — solo se usaría si ni la geometría medida ni el sobresaliente alcanzan a explicar al Maestro; ningún SKU del dataset real llega a ese punto actualmente (ver `DOCUMENTACION_LOGICA.md` 5.1).
+- `reconciliar_sku(row)` / `reconciliar(df)`: punto de entrada, una vez por SKU (no por fila CD+SKU). Devuelve `(df con columnas nuevas, df de auditoría)`.
 
-Criterio de selección — **no** es "más capacidad a cualquier costo": el Maestro sigue siendo el techo operacional, así que acostar una caja que YA alcanza ese techo parada solo suma altura de cama sin sumar cajas.
+### 4.6 `src/derivados.py`
 
-- Con `cajas_objetivo` (Maestro declaró algo): entre las orientaciones que **alcanzan** el objetivo, se elige la de **menor altura de cama**. Si ninguna alcanza, se elige la de **mayor capacidad** (para la rama de inconsistencia/degradado).
-- Sin `cajas_objetivo`: se elige la de mayor capacidad sin más (esa capacidad se usa tal cual).
+`calcular_peso_caja(peso_bruto_por_unidad, unidades_por_caja)`: función compartida con `validacion.py` para que ambos calculen el mismo `Peso_Caja` (evita que diverjan en silencio). Respeta `config.PESO_UMA_ES_POR_UNIDAD` (hoy `False` — la columna "Peso bruto por unidad" de UMA es, en la práctica, el peso de la CAJA, no de la unidad suelta).
 
-```python
-inferir_footprint_desde_cajas_cama(cajas_cama, largo_uma, ancho_uma) -> (largo, ancho, info)
-```
-Busca `(largo, ancho)` que reproduzcan EXACTO `cajas_cama` en una sola orientación de grilla uniforme, priorizando la solución de menor `score = peso_delta * |cambio| + peso_vacio * espacio_no_usado + peso_aspecto * cambio_aspect_ratio`. Es geometría **inferida**, no medida — se usa solo cuando la medida real (aun acostada) no alcanza el techo del Maestro pero tampoco lo excede de forma imposible.
+`calcular_derivados(df)`: agrega `Peso_Caja`, `Cajas_Teoricas_Redondeadas`, `Cajas_Extra_Redondeo`, `Cajas_Cama_Efectivo` (Maestro reconciliado si es válido, si no cae a la capacidad geométrica efectiva), `Nivel_Categoria`, `Es_Categoria_Remate`. Asume que `df` ya pasó por `reconciliacion_geometrica.reconciliar`.
 
-```python
-reconciliar_sku(row) -> GeometriaSKU
-```
-Lógica completa (`row` debe traer SKU, Largo/Ancho/Alto de caja, Cajas por cama, Categoria_Normalizada):
+### 4.7 `src/torres.py`
 
-1. Sin `Alto de caja` o sin `Largo/Ancho` → `DATO_INSUFICIENTE`, `requiere_revision=True`.
-2. Calcula `mejor_orientacion_3d(..., cajas_objetivo=cajas_maestro)` → `capacidad_uma`.
-3. Sin `Cajas por cama` del Maestro → `UMA_VALIDADA` (UMA es la única fuente).
-4. `capacidad_uma >= cajas_maestro` → `UMA_VALIDADA` (exacto) o `UMA_SOBRECAPACIDAD` (UMA da más, pero el Maestro sigue siendo el techo — no se sube la densidad solo porque la geometría de para más).
-5. `capacidad_uma < cajas_maestro`: se re-evalúa `mejor_orientacion_3d(..., con_sobresaliente=True)`. Si ni con sobresaliente se alcanza `cajas_maestro` → **`MAESTRO_IMPOSIBLE_DEGRADADO`** (P3): se degrada `cajas_cama_maestro` al techo geométrico real en vez de inventar una geometría ficticia (caso real: SKU 22183 declaraba 84 cajas/cama, el máximo con sobresaliente es 15).
-6. Si sí se alcanza con sobresaliente (plausible, solo no exacto en estricto) → `INFERIDA_MAESTRO` vía `inferir_footprint_desde_cajas_cama`.
+`TorreCandidate` (frozen): combinación (SKU, orientación) posible, sin posición ni cantidad decidida. `generar_torres_candidatas(df_cd, altura_max_producto, permitir_rotacion_xy=True)`: una candidata por SKU y orientación XY válida — `max_cajas_verticales = floor(altura_max_producto / alto_caja)` es solo el techo físico, el packer decide cuánto usar de verdad. `crear_torre(candidata, x, y, cantidad, z=0.0)`: instancia una `Torre` concreta. `dividir_torre(torre, cantidad_primera)`: parte una torre en dos preservando demanda total (usado por la fase de "partir un bloque como último recurso"). `torre_a_dict`: serialización plana para debug.
 
-```python
-reconciliar(df) -> (df_con_columnas, auditoria_df)
-```
-Reconcilia UNA VEZ POR SKU (`drop_duplicates`) y mapea el resultado a todas las filas. Agrega a `df`: `Largo_Efectivo, Ancho_Efectivo, Alto_Efectivo, Fuente_Geometria, Geometria_Inferida, Requiere_Revision_Geometria, Geometria_Acostada, Cajas_Cama_Maestro_Reconciliado`. Esta última es crítica: `derivados.py` la usa (no la columna cruda del Maestro) para que el degradado de P3 realmente proteja el plan, no solo la auditoría.
+### 4.8 `src/packing_columnar.py` — mecanismo de colocación 3D (MaxRects)
 
-Estados posibles de `Fuente_Geometria`: `UMA_VALIDADA | UMA_SOBRECAPACIDAD | INFERIDA_MAESTRO | MAESTRO_IMPOSIBLE_DEGRADADO | DATO_INSUFICIENTE`.
+Provee el motor geométrico de bajo nivel que usa `packing_bloques.py` — no arma pallets de punta a punta por sí solo en el pipeline actual (esa responsabilidad es de `packing_bloques.armar_pallets_bloques`), pero toda la colocación real pasa por acá.
 
-### 4.5 `src/derivados.py`
+- `_CuboidLibre(x, y, z, w, h, d)`: un cuboide de espacio libre dentro del pallet.
+- `_actualizar_libres_maxrects(...)`: después de colocar una caja, parte cada cuboide libre solapado en hasta 5 franjas maximales (4 en XY + 1 hacia arriba en Z — nunca hacia abajo, porque siempre se coloca a ras del piso del cuboide elegido) y poda los que quedan contenidos en otro.
+- `_PalletEnConstruccion`: envuelve un `PalletV5` con su lista de cuboides libres. `mejor_ajuste(candidata, cantidad, permitir_parcial)`: Best-Volume-Fit — busca el cuboide con menos volumen sobrante entre los que reciben al menos 1 caja; `permitir_parcial=True` (default) puede devolver menos cajas de las pedidas si el mejor cuboide no tiene profundidad Z completa (así otra SKU puede ocupar el resto de esa columna de aire); `permitir_parcial=False` (usado cuando hace falta todo-o-nada) ignora cualquier cuboide que no reciba la cantidad completa. `colocar(...)` materializa la torre y actualiza libres/altura/peso/ocupación.
+- `_area_union_xy(torres)`: huella realmente ocupada en XY (sweep por coordenadas comprimidas) — evita contar el mismo piso más de una vez cuando varias torres comparten (x,y) apiladas a distinto Z.
+- `_reconstruir_en_construccion(pallet)`: recalcula los cuboides libres de un pallet ya armado a partir de sus torres — usado por `packing_bloques.py` para poder seguir agregando bloques a un pallet ya existente (los pallets dedicados, por ejemplo, no reusan este camino porque siembran su propio `_CuboidLibre` inicial extendido).
+- `armar_pallets_columnar(...)`: función de armado genérico de un CD completo (best-fit sobre todos los pallets activos, con soporte para `orden_skus` y `concentrar_sku`) — **no es la que llama el pipeline actual** (`packing_bloques.armar_pallets_bloques` no la invoca; construye sus propios `_PalletEnConstruccion` directamente). Se mantiene porque expone las piezas (`_CuboidLibre`, `_altura_presupuesto`, `_PalletEnConstruccion`) que `packing_bloques.py` importa y reutiliza.
 
-`calcular_derivados(df)` — asume que `df` YA pasó por `reconciliar()`. Calcula:
-- `Peso_Caja` (vía `calcular_peso_caja`, compartida con `validacion.py`).
-- `Cajas_Teoricas_Redondeadas` / `Cajas_Extra_Redondeo`.
-- `Cajas_Cama_Efectivo`: `Cajas_Cama_Maestro_Reconciliado` si es válido (no la columna cruda del Maestro — así el guard de P3 protege el plan real), si no, fallback geométrico vía `capacidad_xy_max(Largo_Efectivo, Ancho_Efectivo)`.
-- `Nivel_Categoria`, `Es_Categoria_Remate` (metadata de reporte).
+### 4.9 `src/packing_bloques.py` — armado por bloques de SKU (el core actual)
 
-### 4.6 `src/demanda.py`
+Ver `DOCUMENTACION_LOGICA.md` sección 9 para la regla de negocio completa. Piezas:
 
-`normalizar_demanda(df)` — demanda a nivel de UNIDADES, no solo cajas. Agrega `Demanda_Unidades_Oficial, Unidades_por_Caja, Cajas_Completas, Unidades_Fraccionarias, Politica_Redondeo` (`UNIDADES_EXACTAS` para BAT, `CAJA_COMPLETA` para el resto), `Unidades_Exceso_Redondeo` (cuantifica lo que el redondeo hacia arriba infla, en vez de perderlo en silencio).
+- `_mejor_ajuste_para_sku(pc, candidatas, cantidad, permitir_parcial)`: prueba todas las orientaciones de un SKU contra un pallet en construcción, se queda con la de menos sobra.
+- `_colocar_bloque_completo(pc, sku, cantidad, por_sku)`: coloca TODO `cantidad` en `pc`, en tantas torres como haga falta — atómico, con snapshot/rollback exacto de `torres`, `libres`, `altura_final`, `peso_estimado`, `ocupacion_xy`, `volumen_utilizado` si no logra completar el bloque.
+- `_mejor_orientacion_grilla(candidatas)`: para un pallet 100% dedicado, calcula la grilla (columnas × filas × altura) de cada orientación sobre la base extendida y devuelve la de mayor capacidad — una sola orientación fija para todo el pallet (ver `DOCUMENTACION_LOGICA.md` 10.2 para el bug que motivó esto).
+- `_altura_potencial(sku, cantidad, por_sku)`: proxy de ordenamiento — altura si el bloque se apilara en una sola columna, no necesita ser exacta, solo consistente.
+- `_dedicar_por_sku(df_cd, cd, contador)`: fase 1 — extrae pallets 100% dedicados donde la demanda supera la capacidad de un pallet (`Cajas por PH`), usando `_mejor_orientacion_grilla` y sembrando el pallet con un `_CuboidLibre` extendido (125×105). Si un pallet dedicado no logra completar la capacidad declarada, el faltante se devuelve como parte del bloque restante del SKU (no se pierde). Devuelve `(dedicados, bloques_pendientes, por_sku)`.
+- `armar_pallets_bloques(df_cd, cd, contador=None)`: punto de entrada. Fase 2 — mientras haya bloques pendientes: elige el más grande como ancla de un pallet nuevo, lo coloca entero, agrega otros bloques enteros de mayor a menor hasta que ninguno más quepa, y como último recurso parte uno solo para cerrar la altura. Si algún bloque termina sin poder colocarse en absoluto (no debería pasar — la geometría inviable ya la filtra `validacion.py` antes), queda registrado en `metadata["sin_colocar"]` del último pallet, nunca se descarta en silencio.
 
-### 4.7 `src/packing_2d.py` — Paso 2/3: camas puras y mezcla
+`df_cd` debe traer demanda pendiente (`Cajas_Remanente` o `Cajas_Teoricas_Redondeadas`), geometría efectiva reconciliada (`Largo/Ancho/Alto_Efectivo`) y `Cajas por PH` — sin esta última columna, un SKU nunca se "dedica" de antemano y pasa entero como bloque único (ver `tests/test_packing_bloques.py::test_sin_cajas_por_ph_el_sku_es_un_bloque_unico`).
 
-**(V4b)** Ya NO segrega por nivel de categoría ni aísla NABs/remate — confirmado contra las fotos de los 42 pallets reales, que mezclan categorías libremente en la misma cama según convenga geométricamente.
+### 4.10 `src/bat.py`
 
-```python
-generar_camas(df_remanente) -> dict[cd, list[Cama]]
-```
-Por CD: `_extraer_camas_puras(rows)` (camas de un solo SKU hasta su tope real de densidad, sobre TODO el grupo del CD) → el remanente se agrupa por `_clusterizar_por_altura` (tolerancia `TOLERANCIA_ALTURA_PORTANTE`) → `_mezclar_remanentes` arma camas de cierre combinando SKUs de cualquier categoría cuya altura sea similar.
+Ver `DOCUMENTACION_LOGICA.md` sección 8. `separar_bat(df)`: separa demanda BAT usando `Categoria_Normalizada` (categoría logística explícita, `config.CATEGORIAS_BAT`). `consolidar_bat_por_cd(df_bat)`: arma `CajaBAT` de tamaño fijo por CD usando demanda real en unidades (no cajas redondeadas, que inflarían ~3.8x). `construir_filas_bat_pseudo_sku(cajas_bat_por_cd, info_sku)`: una fila de pseudo-demanda por CD (SKU `__BAT__`) con las mismas columnas que espera `packing_bloques`/`generar_torres_candidatas`. `renombrar_pallets_bat_puros(pallets_cd, cd)`: renombra a `PV5-BAT-{cd}-NNN` cualquier pallet cuyas torres sean todas BAT. `asignar_cajas_bat_a_torres(pallets_cd, cajas_bat)`: mapea las torres BAT colocadas de vuelta a objetos `CajaBAT` concretos (fungibles, orden estable).
 
-`_empacar_cama(candidatos)`: shelf-packing 2D real — para cada SKU (ordenado por profundidad `d` descendente), intenta primero un shelf existente con suficiente ancho libre, si no abre uno nuevo. `_elegir_orientacion(largo, ancho)` prueba las 2 rotaciones XY (la caja siempre "de pie" desde la perspectiva de este módulo — la posible rotación acostada ya la resolvió `reconciliacion_geometrica` antes, cambiando qué dimensión ES el largo/ancho/alto efectivo).
+Nota histórica: el módulo tenía ~530 líneas con una sección V4 completa de selección de "host" dinámico post-armado (`asignar_hosts_bat`, `_buscar_host_natural/forzado`, `_liberar_host`, etc.) — se retiró entera en la limpieza de sección 9 porque el mecanismo "BAT integrado" (competir por espacio en el mismo armado, en vez de una pasada aparte) la volvió obsoleta y estrictamente mejor (`bat_dedicados` pasó de hasta 9 a 0 en el dataset real).
 
-`_capacidad_real_cama(sku, info)`: tope real de un SKU en cama pura — `Cajas_Cama_Efectivo` verificado empacándolo de verdad contra la geometría efectiva.
+### 4.11 `src/soporte.py` — no-op en el pipeline actual
 
-Funciones retiradas (existían en V3, ya no se llaman desde `generar_camas`): `_separar_nabs_y_remate`, `_separar_por_nivel` (usaban `config.MAX_SEPARACION_NIVELES`).
+`support_ratio(...)` / `support_ratio_cama(...)`: calculan soporte geométrico real (intersección de área entre una caja y las que tiene debajo) a partir de `Placement`s de `Cama`. `clasificar_soporte_pallet(pallet)`: hace `if not pallet.camas: return` — como todo `Pallet` que produce el pipeline actual llega con `camas=[]` (el modelo columnar no genera `Cama`), **esta función es un no-op para el 100% de los pallets reales hoy**. Se mantuvo en la limpieza de sección 9 por bajo riesgo (no rompe nada), marcada como candidata a retiro en una limpieza futura junto con `Cama`/`PalletLinea.categoria_remate` y la vista 2D por cama de `visualizacion.py` (inalcanzable ahora que no hay pallets con camas reales).
 
-### 4.8 `src/apilado_3d.py` — Paso 4: armado de pallets
+### 4.12 `src/estabilidad.py`
 
-**(V4b)** Un solo pase de bin-packing sobre TODAS las camas del CD — ya no hay pases separados por nivel de categoría ni remate exclusivo.
-
-```python
-calcular_altura_pallet(pallet) -> float
-```
-Única función de altura de todo el sistema: `ALTURA_PALLET_VACIO + sum(c.altura_cama for c in pallet.camas)`. Una caja BAT es una `Cama` más en `pallet.camas` — no se suma aparte.
-
-```python
-_cabe(pallet, cama, info_sku) -> bool
-```
-Restricciones duras: **altura** (siempre, `cama.altura_cama <= _limite_altura(pallet) - pallet.altura_final`) y **peso** (solo si `config.PESO_ES_RESTRICCION_DURA`, default `False`). `_limite_altura` devuelve el tope operacional único `ALTURA_MAX_OBSERVADA` (215cm) — no hay distinción "techo normal vs. tope duro" ni reserva de altura para remate.
-
-```python
-_asignar_camas(camas, cd, contador, pallets_abiertos, info_sku)
-```
-Bin-packing best-fit: para cada cama (ordenada por `-altura_cama` y luego `-peso`, así las más pesadas se procesan primero y tienden a terminar más abajo — preferencia SUAVE "peso abajo", no una regla dura), busca entre TODOS los pallets ya abiertos del CD (incluidos los homogéneos) el que tenga menos espacio libre y aun así la reciba (`max` por `altura_final`); solo abre un pallet nuevo si ninguno sirve.
-
-```python
-_consolidar_pallets(pallets_cd, info_sku)
-```
-Red de seguridad: vacía, cuando es posible, los pallets bajo `ALTURA_TOLERADO_MIN` moviendo sus camas a otros pallets del CD con espacio — cualquier cama es movible ahora (`_es_flexible` siempre `True`), no solo NABs/remate como en V3. Nunca mueve hacia un pallet que termine peor que el origen (`altura_referencia` congelada).
-
-```python
-armar_pallets(camas_por_cd, info_sku, pallets_semilla=None) -> list[Pallet]
-```
-Orquesta lo anterior por CD (orden determinístico, `sorted(...)` — ver `PARCHE P3`), semillas = pallets homogéneos ya armados (Paso 2).
-
-Funciones retiradas: `_agrupar_camas` (bucketeaba por nivel), `_asignar_remate` (pase separado de remate), `_remate_compatible`/`_remate_de` como GATE (siguen definidas, pero ya no se usan en el flujo principal — `bat.py` sí las usaba, ver §4.10).
-
-### 4.9 `src/pallets_homogeneos.py` — Paso 2
-
-Arma pallets de un solo SKU (`Homogéneo`) cuando `Cajas por PH` (Maestro) cabe un número entero de veces en la demanda. Usa `Alto_Efectivo` (reconciliado, puede venir acostado — **no** la columna cruda `Alto de caja`) para calcular `altura_final = ALTURA_PALLET_VACIO + Camas_por_PH * Alto_Efectivo`. Si esa altura supera `ALTURA_MAX_OBSERVADA`, el PH no se arma y toda la demanda del SKU pasa al remanente (Paso 3/4 la resuelve con geometría real).
-
-### 4.10 `src/bat.py` — Cigarros/vapes
-
-Cigarros/vapes NUNCA se despachan por caja completa (96% de sus líneas de demanda son fraccionarias). Se consolidan en una caja física FIJA (45×24×55cm, hasta 500 unidades) separada del cubicaje normal, que se coloca como remate encima de un pallet "host" ya armado — DESPUÉS de que todos los pallets normales están completos.
-
-```python
-separar_bat(df) -> (df_no_bat, df_bat)
-consolidar_bat_por_cd(df_bat) -> dict[cd, list[CajaBAT]]
-```
-Arma cajas BAT de tamaño fijo usando la demanda REAL en unidades (`Demanda_Unidades_Oficial`, no `Cajas_Teoricas_Redondeadas` — evita la inflación ~3.8x del redondeo por línea). `n_cajas = ceil(unidades_totales_cd / 500)`. Nunca mezcla CDs.
-
-```python
-asignar_hosts_bat(pallets, cajas_bat_por_cd, info_sku, altura_target=ALTURA_TARGET) -> None
-```
-Para cada caja BAT del CD, en orden, cuatro niveles de fallback cada vez más permisivos (**V4b**: ya no hay chequeo de remate — Comestibles dejó de ser una categoría especial):
-
-1. **`_buscar_host`**: un pallet que YA tiene margen (altura/peso/soporte), sin mover nada. Elige el que deje la altura resultante más cerca de `altura_target`.
-2. **`_liberar_host`**: si ninguno tiene margen, se libera moviendo las camas superiores de un pallet candidato a otro del mismo CD que sí tenga lugar (simula el plan completo antes de ejecutarlo — si alguna cama no tiene destino real, descarta ese origen entero).
-3. **`_buscar_host`** otra vez, esta vez sobre pallets que YA son host BAT (apila una segunda capa BAT sobre un host existente en vez de abrir uno nuevo).
-4. **`_redistribuir_para_bat`**: si NINGÚN pallet Mixto del CD tiene margen ni moviendo camas de a una, se junta el contenido de TODOS los pallets Mixto y se reparte en uno MÁS de los que había — criterio "least-full-that-fits" (la cama va al pallet con MENOS altura acumulada, al revés del criterio "most-full-that-fits" del armado normal), para que el margen quede parejo. Repetible, acotado a como mucho una redistribución por caja BAT pendiente del CD.
-
-Solo si ni el último nivel encuentra margen físico real se abre un pallet dedicado (`_consolidar_dedicados`, `PH-BAT-{cd}-NNN`): varias cajas BAT por capa (según cuántas entran físicamente en 120×100cm vía `capacidad_xy_max`), varias capas hasta el techo — nunca un pallet dedicado por CADA caja BAT.
-
-Todos los chequeos de peso en este módulo respetan `config.PESO_ES_RESTRICCION_DURA` (soft por default).
-
-`_colocar_bat(pallet, cajas, info_sku, altura_target)`: agrega una `Cama` con `categorias=["Cigarros"]` al final de `pallet.camas` (BAT siempre al final — un `append` simple ya lo deja arriba de todo). Puede recibir varias `CajaBAT` a la vez (consolidadas en una sola cama, físicamente una al lado de la otra en la misma capa).
-
-### 4.11 `src/soporte.py`
-
-`clasificar_soporte_pallet(pallet)`: post-procesa un pallet YA armado — marca la última cama `TERMINAL`, el resto `PORTANTE`, y calcula `support_ratio_min` (intersección geométrica real entre los `Placement` de la cama superior y la inferior, vía `support_ratio`). Puramente informativo/KPI — no bloquea el armado (`FILL_RATIO_MIN_SOPORTE=0.0`).
-
-### 4.12 `src/validacion.py`
-
-`cargar_hojas(ruta) -> (envios, maestro, uma)`. `validar_y_limpiar(envios, maestro, uma) -> (df, log_df)` — reglas V1-V9 (duplicados, cajas ≤0, SKU sin Maestro/UMA, dato no confiable, cajas por cama nulo, dimensión imposible para el pallet, alto excede máximo, peso fuera de rango, categoría no clasificada). Cada regla que excluye o modifica algo queda en `log_df`.
-
-> **Limitación conocida**: la regla V4 (`_cabe_en_pallet`, dimensión imposible) solo prueba `largo×ancho` — no considera que una caja de Comestibles/Cigarros que no entra parada SÍ podría entrar acostada (la rotación se resuelve después, en `reconciliacion_geometrica`). No afecta el dataset actual (0 SKUs excluidos por esto), pero es un caso límite a tener en cuenta si aparece un SKU así.
+Ver `DOCUMENTACION_LOGICA.md` sección 11. `calcular_estabilidad(pallet: PalletV5) -> EstabilidadPallet`: centro de masa XY y su desviación, peso por cuadrante, torres esbeltas, fracción de peso superior (centro de masa vertical, `t.z + t.altura/2` — no `t.altura/2`, para que dos torres del mismo peso/altura apiladas una sobre otra aporten distinto). Puramente informativo, nunca bloquea.
 
 ### 4.13 `src/validacion_peso.py`
 
-`validar_pesos(pallets, info_sku)`: calcula `peso_estimado` real de cada pallet desde sus líneas y marca `ESTADO_ALERTA_PESO` (>1400kg) / `ESTADO_PESO_NO_VALIDABLE` (algún SKU con peso fuera de rango sano) — **reporta, no bloquea** (el bloqueo real, si se activa, vive en `_cabe`/`bat.py` vía `PESO_ES_RESTRICCION_DURA`).
+`validar_pesos(pallets, info_sku)`: recalcula `peso_estimado` sumando `cajas_totales × peso_caja` por línea, marca `⚠ PESO NO VALIDABLE` si algún SKU tiene peso fuera de rango sano, y `⚠ ALERTA DE PESO` si el total supera `PESO_ALERTA_KG` — nunca bloquea ni modifica el armado.
 
-### 4.14 `src/benchmark.py`
+### 4.14 `src/validacion_v5.py` — auditoría geométrica dura
 
-`PALLETS_REALES=42, ALTURA_MEDIA_REAL=198.3, ALTURA_MIN_REAL=170.0, ALTURA_MAX_REAL=215.0` (ver `DOCUMENTACION_LOGICA.md` para la procedencia y advertencias sobre este número). `calcular_kpis(pallets, ...) -> BenchmarkResultado` (hashea dataset/commit/config para reproducibilidad). `comparar_contra_real`, `auditar_pallet`, `benchmark_df`.
+Ver `DOCUMENTACION_LOGICA.md` sección 12. `_se_superponen(a, b)`: AABB overlap en 3D (X, Y, Z) — tocarse en un borde (mismo `x+largo == x` del otro, o mismo `z+altura == z` del otro) no cuenta como violación. `validar_pallet_v5(pallet)`: overflow contra la base extendida (125×105 — el tope real desde que los pallets dedicados usan sobresaliente), overlap entre cualquier par de torres, altura sobre `ALTURA_TOPE_DURO`. `validar_geometria_v5(pallets)`: agrega violaciones de una lista completa, orden estable.
 
-### 4.15 `src/exportar.py`
+### 4.15 `src/benchmark.py`
 
-`construir_plan_picking_df(pallets, info_sku)`: una fila por (pallet, línea), con columnas de geometría/BAT/soporte. `construir_resumen_cd_df(pallets)`: una fila por CD. `exportar_workbook(resultado)`: hojas `Plan_Picking, Log_Validacion, Resumen_por_CD, Auditoria_Geometrica, Benchmark`.
+Ver `DOCUMENTACION_LOGICA.md` secciones 2 y 12. `BenchmarkResultado` (dataclass): pallets, alturas, parciales, `pallets_bajo_190/170`, `bat_dedicados` (cuenta prefijo `PV5-BAT-`), `pallets_por_cd`. `calcular_kpis(pallets, ...)`: recibe la lista COMPLETA de pallets armados, sin filtrar nada — un pallet BAT dedicado cuenta como pallet físico igual que cualquier otro. `comparar_contra_real(resultado)`: delta contra `PALLETS_REALES=42`/`ALTURA_MEDIA_REAL=198.3`. `GateV5Resultado` / `evaluar_gate_v5(resultado, violaciones_geometria)`: los 4 criterios obligatorios del gate (rango `[42,45]`, demanda exacta, altura máxima ≤215, cero violaciones geométricas) — acumula TODAS las razones de rechazo en una corrida, no se detiene en la primera. `benchmark_df(resultados)`: hoja de salida real-vs-modelo.
 
-## 5. Datos de entrada corregidos
+Nota: `auditar_pallet(pallet)` todavía lee `pallet.camas`/`pallet.support_ratio_min` (modelo legado) — con `camas` siempre vacío hoy, los campos `n_camas`/`categorias`/`geometria_inferida_en_alguna_cama` de esa función quedan vacíos/en 0 para cualquier pallet real. No se usa en el flujo del pipeline (`ejecutar_core_sku_bloque` no la llama), solo queda disponible para inspección manual.
 
-Las dimensiones UMA (`Largo/Ancho/Alto de caja`) de 202 SKUs en `Cubicaje18.07.2026.xlsx` fueron actualizadas desde `confirmacio_geometrica (1).xlsx` (medición física confirmada por el equipo del hub) — solo los SKUs presentes en ese archivo, el resto de la hoja UMA quedó intacto. Efecto: `MAESTRO_IMPOSIBLE_DEGRADADO` bajó de decenas de casos a solo 3.
+### 4.16 `src/exportar.py`
 
-## 6. Testing
+`construir_plan_picking_df(pallets, info_sku)`: una fila por (pallet, SKU) — la hoja principal del Excel de salida. `construir_resumen_cd_df(pallets)`: agregados por CD. `construir_torres_df(pallets_v5)` / `construir_pallets_3d_data_df(pallets_v5)` / `construir_estabilidad_df(pallets_v5)`: detalle por torre, por caja física (x,y,z reales — respaldo tabular exacto de la vista 3D) y por pallet respectivamente. `exportar_workbook(resultado, ruta_o_buffer=None)`: arma el Excel completo — las hojas `Torres`/`Pallets_3D_Data`/`Estabilidad_V5` solo se agregan si `resultado.pallets_v5` viene poblado (siempre lo está en el pipeline actual, ver sección 3).
 
-```bash
-python -m pytest -q
+Nota: `Altura_Pre_BAT_cm` (lee `pallet.altura_pre_bat`) y `Delta_Target_198_3` (lee `pallet.altura_target_delta`) en `construir_plan_picking_df` nunca se pueblan en el pipeline actual (esos campos los llenaba la lógica V4 de host BAT dinámico, retirada) — quedan siempre `None`/vacíos en el Excel exportado hoy. Candidatos a retiro junto con el resto de la limpieza Tier 2 mencionada en `DOCUMENTACION_LOGICA.md` sección 15.
+
+### 4.17 `src/solver_cajas.py`
+
+Solver de cubicaje 2D puro, sin dependencias del resto del repo (`functools.lru_cache` interno). `max_cajas(W, H, largo, ancho, con_pinwheel=True) -> (n, metodo)`: máximo de rectángulos idénticos (con rotación 90°) en una región W×H, probando de menor a mayor poder: grillas uniformes → guillotina recursiva (patrones mixtos, distinta orientación conviviendo) → pinwheel/five-block (no guillotinable). Usado por `reconciliacion_geometrica.capacidad_xy_max`. Validado contra 300 casos aleatorios y casos puntuales documentados en `Parches/v4_cubicaje_mixto/PARCHES_V4.md`.
+
+### 4.18 `src/template.py` / `app.py` / `visualizacion.py`
+
+`template.py`: genera la plantilla Excel de ejemplo descargable desde la UI. `app.py`: interfaz Streamlit — carga de archivos (combinado o 3 separados), métricas resumen, tabs (Plan de Picking / Log de Validación / Resumen por CD / Inspector de Pallets), descarga del Excel final. El "Inspector de Pallets" usa `resultado.pallets_v5` para mostrar la vista 3D real por torre (`visualizacion.dibujar_pallet_v5_3d`, 4 vistas: isométrica/frente/lateral/superior) — el `else` que cae a la vista 2D por cama (`dibujar_pallet`/`dibujar_cama`) es código muerto en la práctica, porque `pallets_v5` siempre viene poblado con el motor actual.
+
+## 5. Estructuras de datos — resumen de contratos
+
+| Objeto | Quién lo produce | Quién lo consume |
+|---|---|---|
+| `GeometriaSKU` | `reconciliacion_geometrica.reconciliar_sku` | `reconciliacion_geometrica.reconciliar` (arma columnas del df) |
+| `TorreCandidate` | `torres.generar_torres_candidatas` | `packing_columnar`/`packing_bloques` (mejor ajuste) |
+| `Torre` / `PlacementCaja` | `torres.crear_torre` (vía `_PalletEnConstruccion.colocar`) | `estabilidad`, `exportar` (Torres/Pallets_3D_Data), `visualizacion` |
+| `PalletV5` | `packing_bloques.armar_pallets_bloques` | `bat.*`, `estabilidad.calcular_estabilidad`, `_palletv5_a_pallet`, `exportar.*`, `app.py` (Inspector) |
+| `Pallet` / `PalletLinea` (modelo legado, `camas=[]`) | `pipeline_sku_bloque._palletv5_a_pallet` | `soporte` (no-op), `validacion_peso`, `benchmark.calcular_kpis`, `exportar.construir_plan_picking_df/construir_resumen_cd_df` |
+| `CajaBAT` | `bat.consolidar_bat_por_cd` | `bat.asignar_cajas_bat_a_torres`, `pallet.cajas_bat` |
+| `EstabilidadPallet` | `estabilidad.calcular_estabilidad` | `pallet.metadata["estabilidad"]`, `exportar.construir_estabilidad_df` |
+| `BenchmarkResultado` / `GateV5Resultado` | `benchmark.calcular_kpis` / `evaluar_gate_v5` | `benchmark.benchmark_df`, inspección manual |
+
+## 6. Notas de implementación
+
+- **Peso de caja, fuente única**: `derivados.calcular_peso_caja` es la única fórmula, compartida entre `validacion.py` (V6) y `derivados.py` — evita que diverjan como pasó antes con dos fórmulas independientes.
+- **Determinismo**: la corrida no tiene aleatoriedad en ningún punto (no hay multi-start/semillas en el pipeline actual, a diferencia de V5) — mismo input siempre produce el mismo Excel byte a byte.
+- **`Cajas_Extra_Consolidacion` siempre 0**: el modelo actual no genera cajas "de más" para consolidar — cada línea despacha exactamente su demanda oficial (o queda en `sin_colocar`).
+- **Nunca se descarta demanda en silencio**: tanto `packing_bloques.armar_pallets_bloques` como `packing_columnar.armar_pallets_columnar` registran cualquier resto sin colocar en `metadata["sin_colocar"]` del último pallet (o crean un pallet vacío para el aviso si no hay ninguno) en vez de perderlo.
+- **Sobresaliente asimétrico**: 125×105cm solo aplica a pallets 100% dedicados a un SKU (`packing_bloques._dedicar_por_sku`); los pallets mixtos siguen con la base estricta 120×100. `validacion_v5.py` valida overflow contra la base extendida para ambos casos porque es el tope real más amplio — un pallet mixto que por construcción nunca la usa simplemente no la toca.
+- **`soporte.py` es no-op hoy**: no eliminarlo asumiendo que "no hace nada" es intencional bajo el modelo columnar — está documentado como tal (sección 4.11), pero si se reintroduce un modelo con `Cama` real habría que revisar que siga funcionando.
+
+## 7. Tests
+
+103 tests en 17 archivos (`tests/`), sin `pytest.mark.skip` activo en el estado actual del dataset:
+
+| Archivo | Qué cubre |
+|---|---|
+| `conftest.py` | Fixture `dataset_factory` — construye `(envios, maestro, uma)` sintéticos con overrides |
+| `test_validacion.py` (10) | Reglas V1-V9 del Paso 0 |
+| `test_derivados.py` (4) | `Peso_Caja`, `Nivel_Categoria`, `Cajas_Cama_Efectivo` |
+| `test_reconciliacion_v5_p2.py` (4) | Estados de `Fuente_Geometria`, sobresaliente en reconciliación |
+| `test_torres.py` (10) | `TorreCandidate`, `crear_torre`, `dividir_torre`, límites |
+| `test_packing_columnar.py` (7) | Mecanismo MaxRects 2D genérico |
+| `test_packing_3d.py` (8) | Apilado real en Z, `_area_union_xy`, conservación de demanda |
+| `test_packing_bloques.py` (7) | La regla de bloques indivisibles — incluye el ejemplo textual del usuario (100 cajas, capacidad 150, un solo pallet) |
+| `test_bat_v5.py` (9) | Consolidación BAT integrada, límites de la caja física, fungibilidad |
+| `test_estabilidad.py` (7) | Centro de masa, torres esbeltas, peso superior |
+| `test_validacion_v5.py` (9) | Overlap 3D, overflow (base estricta y extendida), altura |
+| `test_gate_v5.py` (6) | Los 4 criterios del gate, acumulación de razones |
+| `test_benchmark.py` (4) | KPIs, conteo de BAT dedicados |
+| `test_exportar_v5.py` (4) | Conteo exacto de filas por hoja nueva, hojas ausentes si `pallets_v5` es `None` |
+| `test_visualizacion_v5.py` (3) | Vista 3D no revienta con/sin torres BAT |
+| `test_invariantes.py` (6) | Propiedades que deben cumplirse SIEMPRE (determinismo, IDs únicos, tope de altura, demanda nunca excedida) — sobreviven a refactors del algoritmo de armado |
+| `test_pipeline_real_data.py` (5) | Corrida completa contra `Cubicaje18.07.2026.xlsx` — demanda exacta, sin violaciones |
+
+Correr todo: `pytest -q` desde la raíz (requiere el venv de `env/`, Python 3.11 — con Python 3.10 del sistema, `pandas`/`openpyxl` funcionan pero `pytest` internamente falla por sintaxis de tipos exclusiva de 3.11 en su propio código, no en el del repo).
+
+## 8. Cómo correr una demanda real sin la UI
+
+```python
+import pandas as pd
+from src.pipeline import ejecutar_pipeline
+
+envios = pd.read_excel("Cubicaje18.07.2026.xlsx", sheet_name="Envios_Julio")
+maestro = pd.read_excel("Cubicaje18.07.2026.xlsx", sheet_name="Maestro_SKUs")
+uma = pd.read_excel("Cubicaje18.07.2026.xlsx", sheet_name="UMA")
+
+resultado = ejecutar_pipeline(envios, maestro, uma)
+print(len(resultado.pallets), "pallets")
 ```
-46 tests (`tests/test_*.py`), 1 se salta si `Cubicaje18.07.2026.xlsx` no está presente. `tests/conftest.py::dataset_factory` genera DataFrames sintéticos tipo Excel para tests unitarios sin depender del dataset real. `tests/test_pipeline_real_data.py` corre contra el dataset real y valida invariantes de extremo a extremo (altura nunca excede el tope, demanda nunca se despacha de más, BAT no abre pallets dedicados salvo necesidad genuina, etc.).
 
-## 7. Módulos NO conectados al pipeline productivo
+O `src.pipeline.ejecutar_desde_archivo(ruta_o_buffer)` si se tiene un único Excel con las 3 hojas. `src.exportar.exportar_workbook(resultado)` arma el `.xlsx` final.
 
-- `Parches/v4_cubicaje_mixto/layout.py`: reconstruye el patrón concreto (posiciones, no solo el conteo) del solver mixto — útil para mostrarle a un operario cómo armar una cama, no se llama desde el pipeline.
-- `Parches/v4_cubicaje_mixto/exacto.py`: búsqueda EXHAUSTIVA (branch & bound) del máximo real de cajas — lenta (segundos por SKU), solo para auditar casos puntuales.
+## 9. Historial de arquitectura (resumen)
+
+Detalle completo en `Parches/v5/PATCH_LOG.md`. El repo pasó por: motor V4 por camas horizontales → motor V5 columnar con multi-start/residual-search/packing 3D real → AUTO (V4+V5, mejor por CD) → SKU_CONSOLIDADO/SKU_BLOQUE (pivote a "SKU nunca repartido" como prioridad de negocio) → **limpieza** (`1c5f68e`, borra todo motor salvo SKU_BLOQUE: V4 completo, V5 multi-start puro, AUTO, AUTO_CONSOLIDADO, SKU_CONSOLIDADO, `legacy/` — `src/` -45% líneas) → **fix de orientación + sobresaliente real** (`506285c`, commit actual, sección 10.2 de `DOCUMENTACION_LOGICA.md`).
+
+Antes de borrar cualquier módulo o constante en la limpieza se hizo `grep` de cada candidato contra `src/` completo — casos no obvios que se salvaron: `soporte.py` (no-op pero de bajo riesgo, no se tocó), `CATEGORIAS_REMATE`/`ORDEN_CATEGORIAS` (parecían muertas pero las usa `config.nivel_de_categoria`, llamado desde `derivados.py`), `solver_cajas.py` (lo importa `reconciliacion_geometrica.py`). `layout_solver.py` (V5-P3) sí estaba huérfano de verdad y se borró.
+
+## 10. Dónde tocar para...
+
+| Quiero cambiar... | Tocar |
+|---|---|
+| La ventana de altura permitida | `config.py` (`ALTURA_*`) |
+| El umbral de peso de alerta | `config.py` (`PESO_ALERTA_KG`/`PESO_HARD_KG`) — sigue sin bloquear el armado |
+| Cuándo un SKU se "dedica" a pallets completos | `packing_bloques._dedicar_por_sku` |
+| El orden en que se eligen bloques ancla/complementarios | `packing_bloques._altura_potencial` y los `sorted(...)` de `armar_pallets_bloques` |
+| Cuántos bloques se pueden partir por pallet | `packing_bloques.armar_pallets_bloques` (hoy hay un `break` explícito tras el primer split) |
+| El tamaño/capacidad de la caja BAT | `config.py` (`CAJA_BAT_*`) |
+| Cómo se integra BAT al armado | `src/bat.py` (sección "BAT integrado") + `pipeline_sku_bloque.py` |
+| El sobresaliente permitido | `config.py` (`SOBRESALIENTE_MAX_CM`) + `packing_bloques._mejor_orientacion_grilla`/`_dedicar_por_sku` (dedicados) / `reconciliacion_geometrica.py` (validación de datos) |
+| Los criterios del gate de benchmark | `benchmark.py` (`GATE_V5_PALLETS_MIN/MAX`, `evaluar_gate_v5`) |
+| Qué cuenta como violación geométrica | `src/validacion_v5.py` |
+| Las columnas del Excel de salida | `src/exportar.py` |

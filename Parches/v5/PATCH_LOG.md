@@ -1516,3 +1516,103 @@ después del cambio.
 - tests: 103 passed (suite completa).
 
 ---
+
+## Rediseño: armado por CAMAS (no por torres verticales)
+
+Corrección arquitectónica del usuario, con capturas reales del Inspector
+de Pallets mostrando un hueco enorme de aire entre una torre baja y una
+alta compartiendo huella: **el modelo de torres (una SKU apilada de piso a
+techo en una posición XY, otra SKU en otra posición con su propia altura
+independiente) está mal** -el pallet se arma **cama por cama** (piso por
+piso): se llena una capa horizontal completa (empezando por el SKU con
+más demanda, agregando otros de altura compatible) antes de subir a la
+siguiente. Nunca columnas aisladas.
+
+### Hallazgo clave durante la investigación
+Revisando el código ya existía **`Cajas_Cama_Efectivo`** (`derivados.py`),
+que reconcilia el "Cajas por cama" real del Maestro contra la geometría
+UMA (degradándolo solo si es geométricamente imposible) -exactamente el
+número que hay que usar como objetivo de UNA cama. El packer NO debía
+recalcular su propia grilla (como hacía `packing_bloques.py` antes de este
+patch) -debía usar ESE valor.
+
+También se recuperó `src/layout_solver.py` (V5-P3), que se había borrado
+en la limpieza pensando que estaba huérfano -en realidad es el módulo
+correcto para "dado un objetivo de cajas, dar posiciones reales", que el
+armado por camas necesita. Quedó disponible pero no se terminó cableando
+en este patch (ver "queda abierto" más abajo) -el armado por filas simple
+(`_mejor_orientacion_grilla` + MaxRects de una sola profundidad) ya
+resuelve el caso principal sin necesitar guillotina/pinwheel.
+
+### Diseño
+1. **Por cama, un SKU ancla**: el de más demanda pendiente entre los que
+   quepan en la altura que resta del pallet. La altura de la cama es la
+   de ESE SKU.
+2. **El ancla llena la huella fila por fila**, una sola orientación fija
+   (nunca mezclada -eso fragmentaba el espacio en el modelo de torres),
+   hasta `min(Cajas_Cama_Efectivo, demanda_pendiente)`.
+3. **El resto de esa MISMA cama** se completa con otros SKUs pendientes
+   cuya altura de caja esté dentro de `TOLERANCIA_HUECO_CAMA_CM` (8cm,
+   heredado de la calibración V4 -"con 3cm el motor daba 91% de pallets
+   parciales, con 8cm 76%") de la altura de la cama -**en ambas
+   direcciones**, ver bug de abajo.
+4. Reusa el motor 3D de `packing_columnar.py` sin tocarlo: la única
+   diferencia es que el cuboide libre inicial de cada cama tiene
+   profundidad = SOLO la altura de esa cama (no el presupuesto de altura
+   completo del pallet) -el mismo best-fit que antes armaba columnas de
+   piso a techo ahora llena en XY antes de subir, sin cambiar una línea
+   de `packing_columnar.py`.
+
+### Bug real encontrado por los tests (no por casualidad)
+Primera versión del filtro de compatibilidad de altura:
+`alto_caja_secundario <= altura_cama + tolerancia` -asimétrico, solo
+evitaba que un SKU MÁS ALTO se saliera de la cama. Un SKU MUCHO MÁS BAJO
+pasaba el filtro igual (ej. 20cm de alto compartiendo una cama de 100cm)
+porque físicamente SÍ entra en la profundidad disponible -pero deja
+exactamente el hueco de 80cm que se estaba tratando de eliminar. Atrapado
+por `test_sku_muy_mas_bajo_no_comparte_cama_aunque_fisicamente_entre`
+(escrito a propósito para reproducir el caso de la imagen que mandó el
+usuario). Corregido a un chequeo SIMÉTRICO:
+`abs(alto_caja_secundario - altura_cama) <= tolerancia`.
+
+También se encontró y descartó una primera versión con margen de
+sobresaliente condicional por cama ("si el ancla llena la cama entera
+sola, usar la base extendida") -la heurística para decidir "va a quedar
+sola" resultó frágil (un SKU grande con demanda exacta a su propia
+capacidad de grilla activaba el modo exclusivo aunque quedara espacio de
+sobra para un SKU chico distinto). Se simplificó a base ESTRICTA 120x100
+para todas las camas -el sobresaliente por SKU dominante queda pendiente
+como mejora futura, no se fuerza con una regla que no se pudo validar
+robusta a tiempo.
+
+### Resultado
+```
+                       Antes (torres)   Después (camas)
+Dataset grande:        53 pallets       47 pallets
+Dataset 18.08 (ayer):  60 pallets       52 pallets
+```
+0 violaciones geométricas, demanda exacta, **0 camas con hueco mayor a la
+tolerancia en TODO el dataset real** (verificado explícitamente, no solo
+en los tests unitarios).
+
+### Queda abierto (no se tocó en este patch)
+- El margen de sobresaliente para el caso "un SKU domina toda una cama"
+  quedó descartado por ahora (ver bug de arriba) -si hace falta cerrar esa
+  brecha chica, hay que diseñar un criterio más robusto que "la demanda
+  iguala la capacidad de grilla propia", quizás intentando la versión
+  extendida y viendo si de verdad no queda nadie más pendiente compatible
+  antes de comprometerse.
+- `layout_solver.py` (guillotina + pinwheel, posiciones reales para un
+  objetivo dado) está disponible pero sin cablear -si el armado fila por
+  fila no alcanza a cumplir `Cajas_Cama_Efectivo` en algún caso real
+  (todavía no se vio ninguno en los dos datasets probados), ahí es donde
+  entraría como intento adicional antes de aceptar el faltante.
+
+### Invariantes
+- Demanda exacta y 0 violaciones geométricas: verificado en ambos
+  datasets reales.
+- 0 camas con hueco > `TOLERANCIA_HUECO_CAMA_CM` en todo el dataset real
+  (no solo en tests sintéticos).
+- tests: 112 passed (suite completa).
+
+---

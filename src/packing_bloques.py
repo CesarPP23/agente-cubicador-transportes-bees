@@ -1,27 +1,39 @@
-"""[SKU_BLOQUE] Lógica de armado nueva, instrucción explícita del usuario:
+"""[SKU_BLOQUE] Lógica de armado por CAMAS -corrección explícita del usuario
+sobre cómo se arma un pallet físicamente:
 
-"si me piden 100 cajas de kr negra y el maestro me dice que 1 pallet es
-150 cajas entonces yo puedo poner en un solo pallet las 100 cajas y la
-altura restante que me queda para cumplir con los parámetros ya
-establecidos busco otros skus que también consolidados me ayuden a llegar
-a la altura óptima, si ya no encuentro consolidados entonces busco
-remanentes"
+"nunca pero nunca se empieza haciendo columnas, siempre primero se van
+llenando las filas de abajo hacia arriba construyendo un bloque de
+120x100" -y por capa, "no puede elegir una sola orientación [nueva, propia],
+tiene que buscar la orientación adecuada para cumplir con las cajas por
+cama del maestro, y así cumplirla hasta lo que diga la demanda sin
+sobrepasar el máximo de cajas por PH que dice el maestro". Y entre SKUs
+distintos de la misma cama: "no puede haber huecos tan grandes entre
+ellos, máximo huecos que te permitan poner una cama encima y que sea
+estable".
 
-Cada SKU es un BLOQUE indivisible mientras sea posible:
-1. Si la demanda total de un SKU en un CD supera lo que entra en UN pallet
-   (`Cajas por PH`, la capacidad operacional declarada por Maestro_SKUs), se
-   extraen pallets 100% dedicados hasta dejar como mucho un resto < 1
-   pallet. Ese resto (o la demanda entera, si ya cabía en 1 pallet) es el
-   "bloque" del SKU -nunca se parte a propósito.
-2. Para armar un pallet: se elige el bloque más grande como ancla, se
-   coloca ENTERO, y se buscan otros bloques ENTEROS (de otros SKUs) que
-   quepan -todo o nada- hasta que no entre ninguno más. Recién cuando ya
-   no hay ningún bloque entero que quepa, se PARTE uno (remanente) para
-   terminar de llenar la altura -último recurso, no la regla general.
-
-Reusa el mecanismo de colocación 3D de `packing_columnar.py`
-(`_PalletEnConstruccion`, MaxRects) -lo que cambia es el ORDEN y el
-criterio de qué se coloca entero vs qué se parte, no la geometría."""
+Arquitectura:
+1. El pallet se arma CAMA POR CAMA, de piso a techo -nunca se abre una
+   columna aislada de un SKU que deje aire debajo suyo para otro SKU
+   después. Cada cama tiene una altura fija (la del SKU "ancla" que la
+   abre) y se completa ANTES de pasar a la siguiente.
+2. Dentro de una cama: el SKU ancla (el de más demanda pendiente entre los
+   que quepan en lo que resta de altura del pallet) llena la huella
+   120x100 fila por fila -no cualquier orden, una sola orientación fija
+   por cama (nunca mezclada, eso fragmentaba el espacio en versiones
+   anteriores). El objetivo de cuántas cajas entran por cama NO lo inventa
+   el packer: es `Cajas_Cama_Efectivo` (`derivados.py`), que ya reconcilia
+   el "Cajas por cama" real del Maestro contra la geometría UMA -acá solo
+   se USA ese número, no se recalcula.
+3. Si el ancla no llena toda la huella de la cama, el resto de esa MISMA
+   cama se completa con otros SKUs pendientes cuya altura de caja sea
+   compatible (dentro de `TOLERANCIA_HUECO_CAMA_CM`) -para que el hueco que
+   quede sea chico y la cama siga siendo una base estable para la próxima.
+4. Reusa el motor 3D de `packing_columnar.py` (`_PalletEnConstruccion`,
+   MaxRects) -lo que cambia es que cada cama se arma con un cuboide libre
+   inicial de profundidad Z = SOLO la altura de esa cama (no el presupuesto
+   de altura completo del pallet), así el mismo best-fit que antes producía
+   torres de piso a techo ahora llena en el plano XY antes de subir.
+"""
 import pandas as pd
 
 import config
@@ -29,14 +41,23 @@ from models import PalletV5
 from src.packing_columnar import _altura_presupuesto, _CuboidLibre, _PalletEnConstruccion
 from src.torres import TorreCandidate, generar_torres_candidatas
 
+TOL = 1e-6
+
+# [sección 3] Cuánta diferencia de altura se tolera entre el SKU ancla de
+# una cama y otro SKU que se agrega a la MISMA cama -valor heredado de la
+# calibración V4 contra datos reales (Cubicaje18.07.2026.xlsx: con 3cm el
+# motor daba 91% de pallets parciales, con 8cm 76%, retorno decreciente
+# después). Punto de partida razonable, no un número confirmado formalmente
+# con operación -ajustar acá si hace falta.
+TOLERANCIA_HUECO_CAMA_CM = 8.0
+
 
 def _mejor_ajuste_para_sku(
     pc: _PalletEnConstruccion, candidatas: list[TorreCandidate], cantidad: int, permitir_parcial: bool
 ) -> tuple[TorreCandidate, int, float, int] | None:
     """Prueba todas las orientaciones de un SKU contra UN pallet en
     construcción. Devuelve (candidata, idx_libre, sobra, cantidad_colocable)
-    o None si ninguna orientación entra (completa, si permitir_parcial es
-    False; al menos parcial, si es True)."""
+    o None si ninguna orientación entra."""
     mejor = None
     for cand in candidatas:
         tope = min(cand.max_cajas_verticales, cantidad)
@@ -51,237 +72,89 @@ def _mejor_ajuste_para_sku(
     return mejor
 
 
-def _colocar_bloque_completo(
-    pc: _PalletEnConstruccion, sku: str, cantidad: int, por_sku: dict[str, list[TorreCandidate]]
-) -> bool:
-    """Coloca TODO `cantidad` de este SKU en `pc`, usando tantas torres
-    (columnas XY distintas dentro del MISMO pallet) como haga falta -un
-    footprint chico puede necesitar varias columnas side-by-side para un
-    bloque grande, eso no es "repartir en varios pallets", sigue siendo
-    UN pallet. Atómico: si no logra colocar el bloque COMPLETO, hace
-    rollback exacto (no deja nada a medias) y devuelve False -nunca se
-    permite dejar "una parte sí, una parte no" de un bloque que se
-    supone entero."""
-    snap_torres = list(pc.pallet.torres)
-    snap_libres = list(pc.libres)
-    snap_altura = pc.pallet.altura_final
-    snap_peso = pc.pallet.peso_estimado
-    snap_ocup = pc.pallet.ocupacion_xy
-    snap_vol = pc.pallet.volumen_utilizado
+def _mejor_orientacion_grilla(candidatas: list[TorreCandidate]) -> TorreCandidate:
+    """Fija UNA sola orientación para toda una cama (base estricta
+    120x100) -nunca mezclada dentro de la misma cama, eso fragmentaba el
+    espacio de formas que después ninguna orientación podía volver a
+    aprovechar bien. Base estricta (no la extendida con sobresaliente):
+    una cama puede terminar compartida por varios SKUs, y mezclar
+    sobresalientes de SKUs distintos en direcciones distintas da un
+    perfil irregular -ver PATCH_LOG.md, sección sobresaliente."""
+    def _capacidad_grilla(c: TorreCandidate) -> int:
+        cols = int(config.PALLET_LARGO // c.largo)
+        filas = int(config.PALLET_ANCHO // c.ancho)
+        return cols * filas
 
-    restante = cantidad
+    return max(candidatas, key=_capacidad_grilla)
+
+
+def _armar_cama(
+    pallet: PalletV5,
+    z: float,
+    altura_cama: float,
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    ancla_sku: str,
+) -> bool:
+    """[sección 2-3] Arma UNA cama a la altura `z`, con profundidad fija
+    `altura_cama` -el cuboide libre inicial de este `_PalletEnConstruccion`
+    SOLO tiene esa profundidad, así que ninguna torre puede crecer más
+    alto que esta cama (evita el bug de "columnas de piso a techo").
+    Devuelve True si se colocó algo."""
+    objetivo_ancla = min(pendientes[ancla_sku], capacidad_cama_por_sku.get(ancla_sku, pendientes[ancla_sku]))
+
+    # [simplificado] Base ESTRICTA (120x100) para todas las camas -el
+    # margen de sobresaliente por SKU dominante se maneja aparte (ver
+    # PATCH_LOG.md); acá el foco es no dejar huecos grandes entre SKUs
+    # que comparten cama, así que se prioriza dejar la huella exacta
+    # disponible para que otros SKUs puedan sumarse de verdad.
+    cand_ancla = _mejor_orientacion_grilla(por_sku[ancla_sku])
+
+    libre_inicial = _CuboidLibre(0.0, 0.0, z, config.PALLET_LARGO, config.PALLET_ANCHO, altura_cama)
+    pc = _PalletEnConstruccion(pallet=pallet, libres=[libre_inicial])
+
+    colocado_total = False
+    restante = objetivo_ancla
     guard = 0
     while restante > 0:
         guard += 1
         if guard > 1000:
             break
-        ajuste = _mejor_ajuste_para_sku(pc, por_sku[sku], restante, permitir_parcial=True)
+        ajuste = _mejor_ajuste_para_sku(pc, [cand_ancla], restante, permitir_parcial=True)
         if ajuste is None:
             break
         cand, idx_libre, _sobra, cantidad_colocable = ajuste
         pc.colocar(cand, cantidad_colocable, idx_libre)
         restante -= cantidad_colocable
+        colocado_total = True
+    pendientes[ancla_sku] -= objetivo_ancla - restante
 
-    if restante > 0:
-        pc.pallet.torres = snap_torres
-        pc.libres = snap_libres
-        pc.pallet.altura_final = snap_altura
-        pc.pallet.peso_estimado = snap_peso
-        pc.pallet.ocupacion_xy = snap_ocup
-        pc.pallet.volumen_utilizado = snap_vol
-        return False
-    return True
-
-
-def _mejor_orientacion_grilla(candidatas: list[TorreCandidate]) -> TorreCandidate:
-    """[fix] Para un pallet 100% DEDICADO a un solo SKU, conviene fijar UNA
-    sola orientación para el pallet entero (grilla columnas x filas x
-    altura) en vez de dejar que el best-fit incremental de MaxRects vaya
-    mezclando orientaciones caja a caja -eso fragmenta el espacio libre de
-    formas que después ninguna orientación puede volver a aprovechar bien
-    (medido: SJ97/22454 quedaba en 180 cajas con la exploración mezclada,
-    contra 189 de la grilla pura en la MEJOR de las dos orientaciones).
-
-    [sobresaliente] La grilla se calcula sobre la base EXTENDIDA
-    (config.PALLET_LARGO_EFECTIVO/ANCHO_EFECTIVO, +2.5cm por lado -el
-    estándar logístico ya confirmado, ver config.SOBRESALIENTE_MAX_CM), NO
-    la base estricta 120x100. Es seguro acá porque un pallet dedicado tiene
-    UNA sola orientación para TODAS sus cajas -el sobresaliente queda parejo
-    de un solo lado, no el perfil irregular que preocupaba mezclar
-    sobresalientes de SKUs distintos en direcciones distintas (esa
-    preocupación sigue aplicando a los pallets mixtos, que NO usan esta
-    función y siguen con la base estricta)."""
-    def _capacidad_grilla(c: TorreCandidate) -> int:
-        cols = int(config.PALLET_LARGO_EFECTIVO // c.largo)
-        filas = int(config.PALLET_ANCHO_EFECTIVO // c.ancho)
-        return cols * filas * c.max_cajas_verticales
-
-    return max(candidatas, key=_capacidad_grilla)
-
-
-def _altura_potencial(sku: str, cantidad: int, por_sku: dict[str, list[TorreCandidate]]) -> float:
-    """Proxy determinístico para ordenar bloques -altura si se apilara en
-    UNA sola columna (la más alta posible, sin repartir en huella). No hace
-    falta que sea exacta, solo consistente para decidir qué bloque probar
-    primero (más grande primero)."""
-    alto_caja = por_sku[sku][0].alto_caja
-    return cantidad * alto_caja
-
-
-def _dedicar_por_sku(
-    df_cd: pd.DataFrame, cd: str, contador: list[int]
-) -> tuple[list[PalletV5], dict[str, int], dict[str, list[TorreCandidate]]]:
-    """[sección 1] Por SKU: si la demanda pasa la capacidad de un pallet
-    completo (`Cajas por PH`), arma tantos pallets 100% dedicados como
-    quepan -reusa el mecanismo 3D real (no un cálculo aparte) para que la
-    geometría/orientación quede igual de correcta que en cualquier otro
-    pallet. Devuelve los dedicados, el bloque restante por SKU (>0 solo
-    donde queda algo) y las candidatas por SKU (para no regenerarlas)."""
-    candidatas = generar_torres_candidatas(df_cd, config.ALTURA_PRODUCTO_MAX)
-    por_sku: dict[str, list[TorreCandidate]] = {}
-    for c in candidatas:
-        por_sku.setdefault(c.sku, []).append(c)
-
-    col_cantidad = "Cajas_Remanente" if "Cajas_Remanente" in df_cd.columns else "Cajas_Teoricas_Redondeadas"
-    demanda_por_sku: dict[str, int] = {}
-    for _, fila in df_cd.iterrows():
-        sku = fila["SKU"]
-        if sku not in por_sku:
-            continue
-        cant = int(fila[col_cantidad]) if pd.notna(fila[col_cantidad]) else 0
-        demanda_por_sku[sku] = demanda_por_sku.get(sku, 0) + cant
-
-    capacidad_por_sku: dict[str, int] = {}
-    if "Cajas por PH" in df_cd.columns:
-        for _, fila in df_cd.drop_duplicates(subset="SKU").iterrows():
-            sku = fila["SKU"]
-            if sku not in por_sku:
-                continue
-            cap = fila.get("Cajas por PH")
-            capacidad_por_sku[sku] = int(cap) if pd.notna(cap) and cap > 0 else 0
-
-    dedicados: list[PalletV5] = []
-    bloques: dict[str, int] = {}
-
-    for sku, demanda in demanda_por_sku.items():
-        if demanda <= 0:
-            continue
-        capacidad = capacidad_por_sku.get(sku, 0)
-        if capacidad <= 0:
-            # Sin "Cajas por PH" confiable -todo el SKU es un único bloque,
-            # el packer decide si cabe entero o no (nunca se pierde demanda).
-            bloques[sku] = demanda
-            continue
-
-        pallets_completos = demanda // capacidad
-        resto = demanda - pallets_completos * capacidad
-
-        # [fix] UNA sola orientación fija para todo el pallet dedicado -ver
-        # docstring de `_mejor_orientacion_grilla`. `permitir_parcial=True`
-        # ya alcanza para llenar toda la grilla en un solo `mejor_ajuste`
-        # (cantidad_colocable = lo que entra en el cuboide -acá es el
-        # pallet entero vacío, entra la grilla completa de una).
-        mejor_candidata = _mejor_orientacion_grilla(por_sku[sku])
-
-        for _ in range(int(pallets_completos)):
-            contador[0] += 1
-            pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
-            # [sobresaliente] Base EXTENDIDA (125x105) para este pallet
-            # dedicado -ver docstring de `_mejor_orientacion_grilla`.
-            libre_inicial = _CuboidLibre(
-                0.0, 0.0, 0.0, config.PALLET_LARGO_EFECTIVO, config.PALLET_ANCHO_EFECTIVO, _altura_presupuesto()
-            )
-            pc = _PalletEnConstruccion(pallet=pallet, libres=[libre_inicial])
-            restante = capacidad
-            guard = 0
-            while restante > 0:
-                guard += 1
-                if guard > 1000:
-                    break
-                mejor = _mejor_ajuste_para_sku(pc, [mejor_candidata], restante, permitir_parcial=True)
-                if mejor is None:
-                    break
-                cand, idx_libre, _sobra, cantidad_colocable = mejor
-                pc.colocar(cand, cantidad_colocable, idx_libre)
-                restante -= cantidad_colocable
-            dedicados.append(pallet)
-            if restante > 0:
-                # La grilla de la mejor orientación fija no alcanzó a cubrir
-                # toda la capacidad declarada ("Cajas por PH") -puede pasar
-                # cuando el número del Maestro asume un margen de
-                # sobresaliente que el packing real todavía no aplica (ver
-                # config.SOBRESALIENTE_MAX_CM). El faltante NO se pierde: se
-                # suma al bloque de este SKU para que la fase de bloques lo
-                # intente colocar en otro lado.
-                bloques[sku] = bloques.get(sku, 0) + restante
-
-        if resto > 0:
-            bloques[sku] = bloques.get(sku, 0) + int(resto)
-
-    return dedicados, bloques, por_sku
-
-
-def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None) -> list[PalletV5]:
-    """[V-SKU_BLOQUE] Punto de entrada. `df_cd` debe traer demanda pendiente
-    (`Cajas_Remanente` o `Cajas_Teoricas_Redondeadas`), geometría efectiva
-    reconciliada y `Cajas por PH` (de Maestro) -sin esta última columna, un
-    SKU nunca se "dedica" de antemano, pasa entero como bloque único."""
-    contador = contador if contador is not None else [0]
-    dedicados, pendientes, por_sku = _dedicar_por_sku(df_cd, cd, contador)
-    if not por_sku:
-        return dedicados
-
-    resultado: list[PalletV5] = list(dedicados)
-    sin_colocar: dict[str, int] = {}
-
-    while any(v > 0 for v in pendientes.values()):
-        activos = sorted(
-            (s for s, v in pendientes.items() if v > 0),
-            key=lambda s: -_altura_potencial(s, pendientes[s], por_sku),
-        )
-        ancla_sku = activos[0]
-
-        contador[0] += 1
-        pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
-        pc = _PalletEnConstruccion(pallet=pallet)
-
-        # [sección 2] El ancla se coloca ENTERA -por construcción, un
-        # bloque nunca supera la capacidad de un pallet fresco (viene de
-        # `_dedicar_por_sku`, que ya usa esa misma capacidad como tope).
-        # Puede necesitar varias columnas (torres) side-by-side si el
-        # footprint es chico frente a la cantidad -`_colocar_bloque_completo`
-        # ya lo resuelve, atómico.
-        if not _colocar_bloque_completo(pc, ancla_sku, pendientes[ancla_sku], por_sku):
-            # No debería pasar (geometría inviable ya la filtra validacion.py
-            # antes de llegar acá) -pero no se pierde demanda en silencio.
-            sin_colocar[ancla_sku] = sin_colocar.get(ancla_sku, 0) + pendientes[ancla_sku]
-            pendientes[ancla_sku] = 0
-            continue
-        pendientes[ancla_sku] = 0
-
-        # Otros bloques ENTEROS, más grande primero, todo-o-nada.
-        progreso = True
-        while progreso:
-            progreso = False
-            candidatos = sorted(
-                (s for s, v in pendientes.items() if v > 0),
-                key=lambda s: -_altura_potencial(s, pendientes[s], por_sku),
-            )
-            for sku in candidatos:
-                if _colocar_bloque_completo(pc, sku, pendientes[sku], por_sku):
-                    pendientes[sku] = 0
-                    progreso = True
-                    break
-
-        # [último recurso] Ya no entra ningún bloque entero -partir UNO
-        # (el más grande restante que al menos entre parcial) para
-        # terminar de llenar la altura de ESTE pallet.
+    # [sección 3] Rellenar lo que sobra de ESTA misma cama con otros SKUs
+    # pendientes cuya altura de caja sea compatible -huecos chicos, cama
+    # estable para la que sigue. La tolerancia es SIMÉTRICA: un SKU más
+    # alto que la cama no entra físicamente (eso ya lo filtra el ajuste de
+    # abajo), pero uno MUCHO más bajo que la cama SÍ entraría físicamente
+    # -y dejaría exactamente el hueco grande que se quiere evitar. Por eso
+    # se descarta también si la diferencia hacia abajo supera la
+    # tolerancia, no solo hacia arriba.
+    progreso = True
+    while progreso:
+        progreso = False
         candidatos = sorted(
-            (s for s, v in pendientes.items() if v > 0),
-            key=lambda s: -_altura_potencial(s, pendientes[s], por_sku),
+            (
+                s
+                for s, v in pendientes.items()
+                if v > 0
+                and s != ancla_sku
+                and abs(por_sku[s][0].alto_caja - altura_cama) <= TOLERANCIA_HUECO_CAMA_CM + TOL
+            ),
+            key=lambda s: abs(por_sku[s][0].alto_caja - altura_cama),
         )
         for sku in candidatos:
-            ajuste = _mejor_ajuste_para_sku(pc, por_sku[sku], pendientes[sku], permitir_parcial=True)
+            objetivo = min(pendientes[sku], capacidad_cama_por_sku.get(sku, pendientes[sku]))
+            cand_sku = _mejor_orientacion_grilla(por_sku[sku])
+            ajuste = _mejor_ajuste_para_sku(pc, [cand_sku], objetivo, permitir_parcial=True)
             if ajuste is None:
                 continue
             cand, idx_libre, _sobra, cantidad_colocable = ajuste
@@ -289,14 +162,88 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
                 continue
             pc.colocar(cand, cantidad_colocable, idx_libre)
             pendientes[sku] -= cantidad_colocable
-            break  # un solo bloque partido por pallet -no volver a fragmentar de más
+            colocado_total = True
+            progreso = True
+            break
 
-        resultado.append(pallet)
+    return colocado_total
 
-    if sin_colocar and resultado:
-        resultado[-1].metadata["sin_colocar"] = sin_colocar
+
+def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None) -> list[PalletV5]:
+    """[V-SKU_BLOQUE, camas] Punto de entrada. `df_cd` debe traer demanda
+    pendiente (`Cajas_Remanente` o `Cajas_Teoricas_Redondeadas`), geometría
+    efectiva reconciliada y, si está disponible, `Cajas_Cama_Efectivo`
+    (derivados.py) -sin esa columna, una cama no tiene tope propio más que
+    la huella/orientación elegida."""
+    contador = contador if contador is not None else [0]
+    candidatas = generar_torres_candidatas(df_cd, config.ALTURA_PRODUCTO_MAX)
+    if not candidatas:
+        return []
+
+    por_sku: dict[str, list[TorreCandidate]] = {}
+    for c in candidatas:
+        por_sku.setdefault(c.sku, []).append(c)
+
+    col_cantidad = "Cajas_Remanente" if "Cajas_Remanente" in df_cd.columns else "Cajas_Teoricas_Redondeadas"
+    pendientes: dict[str, int] = {}
+    for _, fila in df_cd.iterrows():
+        sku = fila["SKU"]
+        if sku not in por_sku:
+            continue
+        cant = int(fila[col_cantidad]) if pd.notna(fila[col_cantidad]) else 0
+        pendientes[sku] = pendientes.get(sku, 0) + cant
+
+    capacidad_cama_por_sku: dict[str, int] = {}
+    if "Cajas_Cama_Efectivo" in df_cd.columns:
+        for _, fila in df_cd.drop_duplicates(subset="SKU").iterrows():
+            sku = fila["SKU"]
+            if sku not in por_sku:
+                continue
+            cap = fila.get("Cajas_Cama_Efectivo")
+            if pd.notna(cap) and cap > 0:
+                capacidad_cama_por_sku[sku] = int(cap)
+
+    presupuesto = _altura_presupuesto()
+    pallets: list[PalletV5] = []
+    sin_colocar: dict[str, int] = {}
+
+    while any(v > 0 for v in pendientes.values()):
+        contador[0] += 1
+        pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
+        z = 0.0
+        avanzo_en_este_pallet = False
+
+        while z < presupuesto - TOL:
+            activos = [s for s in pendientes if pendientes[s] > 0]
+            if not activos:
+                break
+            # [sección 2] El ancla de esta cama: la mayor demanda pendiente
+            # entre los SKUs cuya altura de caja todavía entra en lo que
+            # resta del pallet.
+            candidatos_ancla = [s for s in activos if por_sku[s][0].alto_caja <= presupuesto - z + TOL]
+            if not candidatos_ancla:
+                break  # nada más cabe en la altura que queda de este pallet
+            ancla_sku = max(candidatos_ancla, key=lambda s: pendientes[s])
+            altura_cama = por_sku[ancla_sku][0].alto_caja
+
+            coloco = _armar_cama(pallet, z, altura_cama, pendientes, por_sku, capacidad_cama_por_sku, ancla_sku)
+            if not coloco:
+                # el ancla no entró ni una caja -geometría inviable para
+                # este SKU en este pallet, no reintentar en loop infinito.
+                sin_colocar[ancla_sku] = sin_colocar.get(ancla_sku, 0) + pendientes[ancla_sku]
+                pendientes[ancla_sku] = 0
+                continue
+            avanzo_en_este_pallet = True
+            z += altura_cama
+
+        if not avanzo_en_este_pallet:
+            break  # ningún SKU pendiente entra en un pallet fresco -evitar loop infinito
+        pallets.append(pallet)
+
+    if sin_colocar and pallets:
+        pallets[-1].metadata["sin_colocar"] = sin_colocar
     elif sin_colocar:
         contador[0] += 1
-        resultado.append(PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd, metadata={"sin_colocar": sin_colocar}))
+        pallets.append(PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd, metadata={"sin_colocar": sin_colocar}))
 
-    return resultado
+    return pallets
