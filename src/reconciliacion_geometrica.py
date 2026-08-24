@@ -206,9 +206,17 @@ def reconciliar_sku(row) -> GeometriaSKU:
     cajas_raw = row.get("Cajas por cama")
     cajas_maestro = int(cajas_raw) if pd.notna(cajas_raw) and cajas_raw > 0 else None
 
-    largo_uma = None if pd.isna(largo_uma) else float(largo_uma)
-    ancho_uma = None if pd.isna(ancho_uma) else float(ancho_uma)
-    alto_uma = None if pd.isna(alto_uma) else float(alto_uma)
+    # [fix] Una dimensión en 0 (dato real, no vacío -UMA con "Largo/Ancho/
+    # Alto de caja" = 0) es tan inútil como que falte: una caja de 0cm no
+    # se puede colocar en ningún lado. Antes esto solo chequeaba `is None`
+    # -una fila con las 3 medidas en 0.0 pasaba de largo hasta el final de
+    # la cascada de reconciliación con geometría 0x0x0 marcada como
+    # "válida" (requiere_revision=False), y la SKU desaparecía del plan sin
+    # ningún aviso (bug real, encontrado con datos de producción -18 SKUs,
+    # ~295 cajas perdidas en silencio).
+    largo_uma = None if pd.isna(largo_uma) or largo_uma <= 0 else float(largo_uma)
+    ancho_uma = None if pd.isna(ancho_uma) or ancho_uma <= 0 else float(ancho_uma)
+    alto_uma = None if pd.isna(alto_uma) or alto_uma <= 0 else float(alto_uma)
 
     def _insuficiente(motivo: str) -> GeometriaSKU:
         return GeometriaSKU(

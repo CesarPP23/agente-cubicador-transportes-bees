@@ -1616,3 +1616,58 @@ en los tests unitarios).
 - tests: 112 passed (suite completa).
 
 ---
+
+## Bug real: SKUs con dimensiones en 0 desaparecían del plan sin aviso
+
+Reportado por el usuario con datos reales: comparando `Envios_Julio` (demanda
+de entrada) contra `Plan_Picking` (salida), varias CDs mostraban unidades de
+menos (ej. BK31: 25.720 demandadas vs 19.752 planificadas -5.968 de menos).
+
+### Diagnóstico
+No era un problema proporcional/generalizado -18 SKUs puntuales (de 209)
+estaban 100% AUSENTES del plan, ni siquiera como pallet "Requiere Revisión".
+Esas 18 SKUs sumaban exactamente la diferencia en cajas de las 6 CDs
+(~295 cajas), y por tener "Unidades por caja" alto (hasta 3.360 unidades
+por caja en un caso), esas pocas cajas perdidas explicaban miles de
+unidades de diferencia.
+
+Causa raíz: la hoja `UMA` del archivo real tiene, para esas 18 SKUs,
+`Largo de caja = Ancho de caja = Alto de caja = 0.0` -un dato REAL (no
+vacío/NaN), producto de que nadie cargó las medidas físicas todavía.
+`reconciliacion_geometrica.reconciliar_sku` solo chequeaba `is None` para
+decidir si la geometría era insuficiente -un 0.0 pasa ese chequeo sin
+problema, así que la fila seguía de largo por TODA la cascada de
+reconciliación (intentando comparar una capacidad calculada sobre una caja
+de 0x0x0 contra lo que declara el Maestro) hasta terminar en
+`MAESTRO_IMPOSIBLE_DEGRADADO` o `UMA_VALIDADA` con `requiere_revision=False`
+-geometría 0x0x0 marcada como "válida". El packer, correctamente, nunca
+pudo colocar una caja de tamaño cero -pero como nadie la marcó para
+revisión, tampoco generó un pallet "Requiere Revisión": la demanda
+simplemente desaparecía, sin ningún rastro en ninguna hoja del Excel.
+
+### Fix
+`src/reconciliacion_geometrica.py::reconciliar_sku`: al parsear
+`largo_uma`/`ancho_uma`/`alto_uma`, ahora se tratan como faltantes tanto
+`NaN` como `<= 0` (antes solo `NaN`). Con esto, cualquier dimensión en 0
+cae directo en el camino `DATO_INSUFICIENTE` / `requiere_revision=True`
+-mismo camino que ya existía para el caso "sin dato" (NaN), ahora también
+cubre el caso "dato en cero". La SKU pasa a un pallet "REQUIERE REVISIÓN"
+visible en el plan, no desaparece.
+
+### Verificación (con el archivo real del usuario)
+```
+Antes:  6 CDs con diferencia negativa (demanda > planificado), hasta -7.168
+        unidades en una sola CD. 18 SKUs totalmente ausentes del plan.
+Después: 0 CDs con diferencia -demanda == planificado EXACTO en las 6.
+         Las 18 SKUs aparecen como DATO_INSUFICIENTE / Requiere Revisión.
+```
+
+### Invariantes
+- tests nuevos en `test_reconciliacion_v5_p2.py`: dimensión en 0 (las 3, o
+  solo el alto) da `DATO_INSUFICIENTE`/`requiere_revision=True`.
+- Verificado contra el archivo real del usuario: demanda == planificado
+  exacto en las 6 CDs (antes había una diferencia de hasta -7.168 unidades
+  en una sola CD).
+- tests: 114 passed (suite completa).
+
+---
