@@ -64,9 +64,20 @@ def calcular_derivados(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # El remate (Comestibles/Cigarros) ahora tiene nivel 7 en vez de None, para
-    # poder compararlo con el resto cuando una cama mezcla categorías.
+    # poder comparar con el resto cuando una cama mezcla categorías.
     niveles = [config.nivel_de_categoria(c) for c in df["Categoria_Normalizada"]]
     df["Nivel_Categoria"] = pd.Series(niveles, index=df.index, dtype=object)
-    df["Es_Categoria_Remate"] = df["Categoria_Normalizada"].isin(config.CATEGORIAS_REMATE)
+
+    # [fix] SKUs frágiles identificados por texto en la Descripción (no por
+    # Categoría del Maestro -el SKU puede compartir Categoría con productos
+    # que sí soportan peso encima): se fuerza su nivel al de remate
+    # (NIVEL_REMATE, el más alto), así el armado por camas nunca coloca
+    # nada arriba -mismo mecanismo que ya usa Comestibles/Cigarros, solo que
+    # activado por nombre de producto en vez de por Categoría entera.
+    # Confirmado con el usuario: "Four Loko" es sensible a peso, se rompe.
+    es_fragil_por_nombre = df["Descripción"].astype(str).str.contains("four loko", case=False, na=False)
+    df.loc[es_fragil_por_nombre, "Nivel_Categoria"] = config.NIVEL_REMATE
+
+    df["Es_Categoria_Remate"] = df["Categoria_Normalizada"].isin(config.CATEGORIAS_REMATE) | es_fragil_por_nombre
 
     return df

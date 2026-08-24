@@ -80,7 +80,24 @@ def _palletv5_a_pallet(pv5, info_sku: dict) -> Pallet:
     return pallet
 
 
+_COLUMNAS_NOMBRE_CD = ["Nombre CD", "NOMBRE BK", "Nombre_CD", "Nombre CD Destino"]
+
+
+def _construir_nombres_cd(envios: pd.DataFrame) -> dict[str, str]:
+    """[feedback picking] "Falta nombre de CD" -si `Envios_Julio` trae una
+    columna reconocible con el nombre legible del CD (ej. "CD Cañete" para
+    "BK31"), se usa para la columna `Nombre_CD` del plan de picking. Si no
+    existe ninguna de las variantes conocidas, devuelve vacío -no se
+    inventa un nombre que no está en el dato de entrada."""
+    columna = next((c for c in _COLUMNAS_NOMBRE_CD if c in envios.columns), None)
+    if columna is None:
+        return {}
+    pares = envios[["CD", columna]].dropna().drop_duplicates(subset="CD")
+    return dict(zip(pares["CD"], pares[columna]))
+
+
 def ejecutar_core_sku_bloque(envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataFrame) -> ResultadoPipeline:
+    nombres_cd = _construir_nombres_cd(envios)
     df_validado, log_df = validacion.validar_y_limpiar(envios, maestro, uma)
     df_demanda = demanda.normalizar_demanda(df_validado)
     df_geo, auditoria_geometrica_df = reconciliacion_geometrica.reconciliar(df_demanda)
@@ -147,7 +164,7 @@ def ejecutar_core_sku_bloque(envios: pd.DataFrame, maestro: pd.DataFrame, uma: p
     )
     bench_df = benchmark.benchmark_df([bench_resultado])
 
-    plan_picking_df = exportar.construir_plan_picking_df(todos_pallets, info_sku)
+    plan_picking_df = exportar.construir_plan_picking_df(todos_pallets, info_sku, nombres_cd)
     resumen_cd_df = exportar.construir_resumen_cd_df(todos_pallets)
 
     return ResultadoPipeline(

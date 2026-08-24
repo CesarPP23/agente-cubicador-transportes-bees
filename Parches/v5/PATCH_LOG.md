@@ -1671,3 +1671,81 @@ Después: 0 CDs con diferencia -demanda == planificado EXACTO en las 6.
 - tests: 114 passed (suite completa).
 
 ---
+
+## Feedback real de operación: estabilidad por categoría + export de picking
+
+El usuario compartió capturas de la revisión operativa de una prueba real
+(hojas de picking armadas y ejecutadas con el output del cubicador) con 3
+tipos de hallazgo: un SKU sensible al peso (Four Loko), pallets inestables
+(agua con trago encima), y columnas faltantes para armar/ejecutar picking.
+
+### Gap confirmado antes de tocar nada
+El rediseño por camas de esta semana (`packing_bloques.py`) NO tenía
+ningún concepto de fragilidad/orden por categoría -se perdió por completo
+al reescribir desde cero (V4 sí lo tenía, vía `apilado_3d.py`, borrado en
+la limpieza). El sistema `Nivel_Categoria`/`ORDEN_CATEGORIAS`/
+`CATEGORIAS_REMATE` seguía existiendo en `config.py`/`derivados.py` (se
+sigue calculando la columna), pero nada en el packer la leía.
+
+### Cambios
+- `src/derivados.py`: SKUs cuya `Descripción` contiene "four loko" (sin
+  importar mayúsculas) se fuerzan a `Nivel_Categoria = NIVEL_REMATE` -por
+  texto, no por Categoría del Maestro (sigue siendo "Licores" como
+  cualquier lata, no toda esa Categoría es frágil).
+- `src/packing_bloques.py`: el armado por camas ahora respeta un piso de
+  categoría por pallet (`nivel_min_pallet`) que solo sube, nunca baja -una
+  vez que se colocó una cama de NABs (nivel 6), Licores (nivel 1) queda
+  bloqueado del resto de ESE pallet (tendría que ir a un pallet nuevo). La
+  selección del SKU ancla de cada cama nueva prioriza la categoría más
+  baja primero (no solo demanda pendiente) -si no, un SKU de categoría
+  alta con mucha demanda podía ganar el ancla de la PRIMERA cama y
+  bloquear categorías más bajas de todo el pallet innecesariamente.
+  `_armar_cama` devuelve ahora `(colocó_algo, nivel_máximo_de_la_cama)`.
+  Confirmado con el usuario: NABs nunca abajo de Licores, Licores sí puede
+  ir abajo de NABs -exactamente el orden que ya tenía `ORDEN_CATEGORIAS`.
+- `src/exportar.py::construir_plan_picking_df`: 3 columnas nuevas
+  -`N_Parihuela` (secuencial 1,2,3... por CD, no el ID técnico
+  `PV5-BK31-001`), `Cajas_Por_PH` y `Unidades_Por_Caja` (referencia para
+  quien arma la hoja de picking). Parámetro nuevo opcional `nombres_cd`
+  (dict CD->nombre legible).
+- `src/pipeline.py::_construir_info_sku`: agrega `cajas_por_ph` (columna
+  cruda "Cajas por PH" del Maestro).
+- `src/pipeline_sku_bloque.py`: `_construir_nombres_cd(envios)` -si
+  `Envios_Julio` trae una columna reconocible ("Nombre CD", "NOMBRE BK",
+  etc.), se usa para `Nombre_CD`; si no, queda vacío -no se inventa un
+  nombre que no está en el dato de entrada (el template actual del
+  proyecto no tiene esa columna, hay que agregarla si se quiere ver
+  poblada).
+
+### Resultado sobre el dataset real
+```
+Antes (sin orden por categoría):  47 pallets
+Después (con el orden respetado): 55 pallets
+```
+Sube -es el costo real y esperado de una restricción de negocio genuina
+(no un bug): una cama que antes se llenaba con lo que fuera compatible en
+altura ahora también tiene que ser compatible en categoría, así que hay
+menos combinaciones válidas. Se reporta tal cual, no se ajustó nada para
+disimularlo. Demanda exacta y 0 violaciones geométricas verificado.
+
+### Pendiente, no implementado en este patch (requiere una decisión de
+diseño que todavía no está confirmada)
+Las líneas de Cigarros/BAT en el plan de picking muestran `Cajas_Totales_
+Pallet` fraccionario (ej. 0,20) -matemáticamente correcto (es la porción
+real de esa SKU dentro de la caja BAT consolidada) pero inutilizable para
+un picker, que no puede agarrar "0,2 cajas". Falta definir CÓMO mostrarlo
+mejor (¿ocultar cajas y mostrar solo unidades en esas líneas?, ¿una nota
+aparte?) antes de tocar el export.
+
+### Invariantes
+- tests nuevos: `test_packing_bloques.py` (NABs nunca abajo de Licores,
+  Licores sí puede ir abajo de NABs, Four Loko siempre última cama, sin
+  columna Nivel_Categoria no cambia nada), `test_derivados.py` (detección
+  de Four Loko por texto, no por Categoría), `test_exportar_plan_picking.py`
+  (N° Parihuela secuencial por CD, Cajas_Por_PH/Unidades_Por_Caja,
+  Nombre_CD opcional con passthrough end-to-end).
+- Demanda exacta, 0 violaciones geométricas: verificado contra el dataset
+  real.
+- tests: 126 passed (suite completa).
+
+---

@@ -23,6 +23,10 @@ def _construir_info_sku(df: pd.DataFrame) -> dict[str, dict]:
             "alto_efectivo": fila.get("Alto_Efectivo"),
             "geometria_inferida": bool(fila.get("Geometria_Inferida", False)),
             "unidades_por_caja": fila.get("Unidades_por_Caja", fila.get("Unidades por caja")),
+            # [feedback picking] Referencia para quien arma la hoja de
+            # picking -cuántas cajas de este SKU conforman un pallet
+            # homogéneo completo, según el Maestro.
+            "cajas_por_ph": fila.get("Cajas por PH"),
         }
     return info
 

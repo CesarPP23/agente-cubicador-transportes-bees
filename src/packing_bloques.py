@@ -96,13 +96,25 @@ def _armar_cama(
     por_sku: dict[str, list[TorreCandidate]],
     capacidad_cama_por_sku: dict[str, int],
     ancla_sku: str,
-) -> bool:
+    nivel_por_sku: dict[str, int],
+    nivel_min_permitido: int,
+) -> tuple[bool, int]:
     """[sección 2-3] Arma UNA cama a la altura `z`, con profundidad fija
     `altura_cama` -el cuboide libre inicial de este `_PalletEnConstruccion`
     SOLO tiene esa profundidad, así que ninguna torre puede crecer más
     alto que esta cama (evita el bug de "columnas de piso a techo").
-    Devuelve True si se colocó algo."""
+
+    `nivel_min_permitido`: ninguna caja de esta cama puede tener un
+    Nivel_Categoria MENOR al de lo que ya está apilado debajo en este
+    mismo pallet -Licores (nivel 1) nunca arriba de NABs (nivel 6), remate
+    (Comestibles/Cigarros/Four Loko, nivel 7) siempre lo último. El caller
+    ya filtra el `ancla_sku` por esto; acá se aplica el mismo piso a los
+    SKUs de relleno de la cama.
+
+    Devuelve (se_colocó_algo, nivel_máximo_de_esta_cama) -el caller usa el
+    nivel máximo para actualizar el piso de la PRÓXIMA cama del pallet."""
     objetivo_ancla = min(pendientes[ancla_sku], capacidad_cama_por_sku.get(ancla_sku, pendientes[ancla_sku]))
+    nivel_cama = nivel_por_sku.get(ancla_sku, 0)
 
     # [simplificado] Base ESTRICTA (120x100) para todas las camas -el
     # margen de sobresaliente por SKU dominante se maneja aparte (ver
@@ -147,6 +159,7 @@ def _armar_cama(
                 for s, v in pendientes.items()
                 if v > 0
                 and s != ancla_sku
+                and nivel_por_sku.get(s, 0) >= nivel_min_permitido
                 and abs(por_sku[s][0].alto_caja - altura_cama) <= TOLERANCIA_HUECO_CAMA_CM + TOL
             ),
             key=lambda s: abs(por_sku[s][0].alto_caja - altura_cama),
@@ -164,9 +177,10 @@ def _armar_cama(
             pendientes[sku] -= cantidad_colocable
             colocado_total = True
             progreso = True
+            nivel_cama = max(nivel_cama, nivel_por_sku.get(sku, 0))
             break
 
-    return colocado_total
+    return colocado_total, nivel_cama
 
 
 def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None) -> list[PalletV5]:
@@ -203,6 +217,22 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
             if pd.notna(cap) and cap > 0:
                 capacidad_cama_por_sku[sku] = int(cap)
 
+    # [orden por categoría] Licores (nivel 1) nunca arriba de NABs (nivel
+    # 6); remate (Comestibles/Cigarros/Four Loko -ver derivados.py-, nivel
+    # 7) siempre lo último. Sin dato de categoría (ej. la pseudo-fila BAT,
+    # que no trae Categoria_Normalizada propia) se asume remate -Cigarros
+    # ya es remate por Categoría, es el mismo producto físico.
+    nivel_por_sku: dict[str, int] = {}
+    if "Nivel_Categoria" in df_cd.columns:
+        for _, fila in df_cd.drop_duplicates(subset="SKU").iterrows():
+            sku = fila["SKU"]
+            if sku not in por_sku:
+                continue
+            nivel = fila.get("Nivel_Categoria")
+            nivel_por_sku[sku] = int(nivel) if pd.notna(nivel) else config.NIVEL_REMATE
+    for sku in por_sku:
+        nivel_por_sku.setdefault(sku, config.NIVEL_REMATE)
+
     presupuesto = _altura_presupuesto()
     pallets: list[PalletV5] = []
     sin_colocar: dict[str, int] = {}
@@ -212,6 +242,7 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
         pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
         z = 0.0
         avanzo_en_este_pallet = False
+        nivel_min_pallet = 0  # piso de categoría del pallet -sube, nunca baja
 
         while z < presupuesto - TOL:
             activos = [s for s in pendientes if pendientes[s] > 0]
@@ -219,20 +250,37 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
                 break
             # [sección 2] El ancla de esta cama: la mayor demanda pendiente
             # entre los SKUs cuya altura de caja todavía entra en lo que
-            # resta del pallet.
-            candidatos_ancla = [s for s in activos if por_sku[s][0].alto_caja <= presupuesto - z + TOL]
+            # resta del pallet Y cuyo nivel de categoría no está por debajo
+            # de lo que ya se apiló en camas anteriores de este pallet.
+            candidatos_ancla = [
+                s
+                for s in activos
+                if por_sku[s][0].alto_caja <= presupuesto - z + TOL
+                and nivel_por_sku.get(s, 0) >= nivel_min_pallet
+            ]
             if not candidatos_ancla:
-                break  # nada más cabe en la altura que queda de este pallet
-            ancla_sku = max(candidatos_ancla, key=lambda s: pendientes[s])
+                break  # nada más cabe (altura o categoría) en este pallet
+            # Categoría más baja primero (Licores antes que NABs) -no solo
+            # reactivo (el filtro de arriba ya lo prohibiría después), sino
+            # a propósito: si NABs ganara el ancla de la PRIMERA cama por
+            # tener más demanda, Licores quedaría bloqueado del resto de
+            # este pallet entero (nivel_min_pallet ya no bajaría). Dentro
+            # de la misma categoría, más demanda pendiente primero -sigue
+            # concentrando el mismo SKU en camas consecutivas.
+            ancla_sku = min(candidatos_ancla, key=lambda s: (nivel_por_sku.get(s, 0), -pendientes[s]))
             altura_cama = por_sku[ancla_sku][0].alto_caja
 
-            coloco = _armar_cama(pallet, z, altura_cama, pendientes, por_sku, capacidad_cama_por_sku, ancla_sku)
+            coloco, nivel_cama = _armar_cama(
+                pallet, z, altura_cama, pendientes, por_sku, capacidad_cama_por_sku,
+                ancla_sku, nivel_por_sku, nivel_min_pallet,
+            )
             if not coloco:
                 # el ancla no entró ni una caja -geometría inviable para
                 # este SKU en este pallet, no reintentar en loop infinito.
                 sin_colocar[ancla_sku] = sin_colocar.get(ancla_sku, 0) + pendientes[ancla_sku]
                 pendientes[ancla_sku] = 0
                 continue
+            nivel_min_pallet = max(nivel_min_pallet, nivel_cama)
             avanzo_en_este_pallet = True
             z += altura_cama
 

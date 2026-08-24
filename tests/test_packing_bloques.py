@@ -9,7 +9,7 @@ from src.packing_bloques import TOLERANCIA_HUECO_CAMA_CM, armar_pallets_bloques
 from src.validacion_v5 import validar_geometria_v5
 
 
-def _fila(sku, largo, ancho, alto, cantidad, cajas_cama=None, cd="BK31"):
+def _fila(sku, largo, ancho, alto, cantidad, cajas_cama=None, cd="BK31", nivel=None):
     fila = {
         "SKU": sku, "CD": cd, "Cajas_Remanente": cantidad,
         "Largo_Efectivo": largo, "Ancho_Efectivo": ancho, "Alto_Efectivo": alto,
@@ -17,6 +17,8 @@ def _fila(sku, largo, ancho, alto, cantidad, cajas_cama=None, cd="BK31"):
     }
     if cajas_cama is not None:
         fila["Cajas_Cama_Efectivo"] = cajas_cama
+    if nivel is not None:
+        fila["Nivel_Categoria"] = nivel
     return fila
 
 
@@ -148,6 +150,91 @@ def test_demanda_grande_ocupa_varias_camas_del_mismo_pallet():
     pallets = armar_pallets_bloques(df, "BK31")
     despachado = sum(t.cantidad for p in pallets for t in p.torres if t.sku == "GRANDE")
     assert despachado == 370
+
+
+def test_licores_nunca_queda_arriba_de_nabs():
+    """NABs (nivel 6) nunca puede quedar en una cama de altura MENOR (más
+    abajo) que una cama de Licores (nivel 1) del mismo pallet -aunque NABs
+    tenga más demanda pendiente, que antes hubiera ganado el ancla de la
+    primera cama por peso puro."""
+    df = pd.DataFrame(
+        [
+            _fila("NABS", 30, 20, 20.0, 100, cajas_cama=30, nivel=6),  # mucha demanda, ganaría por peso puro
+            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, nivel=1),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_por_cama = _torres_por_z(pallets)
+
+    for (pallet_id, z), torres in torres_por_cama.items():
+        skus_en_cama = {t.sku for t in torres}
+        if "NABS" in skus_en_cama:
+            # cualquier cama de LICOR en el MISMO pallet tiene que estar a
+            # una z MENOR (más abajo) que esta cama de NABS.
+            for (otro_pallet, otro_z), otras_torres in torres_por_cama.items():
+                if otro_pallet != pallet_id:
+                    continue
+                if any(t.sku == "LICOR" for t in otras_torres):
+                    assert otro_z < z, "LICOR quedó en una cama igual o más alta que NABS en el mismo pallet"
+
+
+def test_licores_si_puede_quedar_debajo_de_nabs():
+    df = pd.DataFrame(
+        [
+            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, nivel=1),
+            _fila("NABS", 30, 20, 20.0, 20, cajas_cama=30, nivel=6),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_por_cama = _torres_por_z(pallets)
+    zs_licor = [z for (_pid, z), torres in torres_por_cama.items() if any(t.sku == "LICOR" for t in torres)]
+    zs_nabs = [z for (_pid, z), torres in torres_por_cama.items() if any(t.sku == "NABS" for t in torres)]
+    assert zs_licor and zs_nabs
+    assert max(zs_licor) < min(zs_nabs)
+
+
+def test_four_loko_queda_arriba_de_todo_por_nivel_remate():
+    """[Four Loko] Se identifica por Nivel_Categoria ya resuelto a
+    NIVEL_REMATE (config.NIVEL_REMATE) -acá se prueba el efecto en el
+    packer, no la detección por texto (eso es derivados.py). Con nivel de
+    remate, ninguna otra SKU puede quedar en una cama más alta -Four Loko
+    siempre es la última."""
+    import config
+
+    df = pd.DataFrame(
+        [
+            _fila("FOURLOKO", 20, 20, 20.0, 5, cajas_cama=20, nivel=config.NIVEL_REMATE),
+            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, nivel=1),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_por_cama = _torres_por_z(pallets)
+    for (pallet_id, z), torres in torres_por_cama.items():
+        if any(t.sku == "LICOR" for t in torres):
+            for (otro_pallet, otro_z), otras_torres in torres_por_cama.items():
+                if otro_pallet != pallet_id:
+                    continue
+                if any(t.sku == "FOURLOKO" for t in otras_torres):
+                    assert z < otro_z, "algo quedó en la misma cama o más alto que Four Loko"
+
+
+def test_sin_columna_nivel_categoria_no_cambia_nada():
+    """Sin la columna Nivel_Categoria (compatibilidad con datasets viejos o
+    tests que no la setean), todo el mundo cae en el mismo nivel por
+    default -no debería cambiar ningún resultado existente."""
+    df = pd.DataFrame(
+        [
+            _fila("A", 30, 20, 25.0, 37, cajas_cama=20),
+            _fila("B", 25, 25, 20.0, 12, cajas_cama=50),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    despachado = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    assert despachado.get("A", 0) == 37
+    assert despachado.get("B", 0) == 12
 
 
 def test_no_viola_geometria():

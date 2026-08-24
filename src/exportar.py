@@ -5,13 +5,33 @@ import pandas as pd
 from models import Pallet, PalletV5, ResultadoPipeline
 
 
-def construir_plan_picking_df(pallets: list[Pallet], info_sku: dict[str, dict] | None = None) -> pd.DataFrame:
+def construir_plan_picking_df(
+    pallets: list[Pallet], info_sku: dict[str, dict] | None = None, nombres_cd: dict[str, str] | None = None
+) -> pd.DataFrame:
     """[V3 / sección 20] Agrega columnas de geometría (Fuente_Geometria,
     *_Efectivo, Geometria_Inferida) y de BAT/soporte a nivel de pallet
     (Altura_Pre_BAT, Cajas_BAT, Unidades_BAT, Support_Ratio_Min,
     Delta_Target_198_3) sobre el output de V2. `info_sku` es opcional para no
-    romper llamadas viejas -sin él, las columnas de geometría quedan vacías."""
+    romper llamadas viejas -sin él, las columnas de geometría quedan vacías.
+
+    [feedback picking] `nombres_cd` (CD -> nombre legible, ej. "BK31" ->
+    "CD Cañete") es opcional -si el Excel de entrada no trae esa columna en
+    `Envios_Julio`, `Nombre_CD` queda vacío en vez de inventar un nombre."""
     info_sku = info_sku or {}
+    nombres_cd = nombres_cd or {}
+
+    # [feedback picking] "Falta el detalle de número de parihuelas" -numera
+    # los pallets 1, 2, 3... POR CD, en el orden en que aparecen (no el ID
+    # técnico PV5-BK31-001, que mezcla el motor de armado con el número).
+    numero_parihuela: dict[tuple, int] = {}
+    contador_por_cd: dict[str, int] = {}
+    for pallet in pallets:
+        clave = (pallet.cd, pallet.id)
+        if clave in numero_parihuela:
+            continue
+        contador_por_cd[pallet.cd] = contador_por_cd.get(pallet.cd, 0) + 1
+        numero_parihuela[clave] = contador_por_cd[pallet.cd]
+
     filas = []
     for pallet in pallets:
         cajas_bat = sum(1 for c in pallet.cajas_bat) if pallet.cajas_bat else 0
@@ -23,6 +43,8 @@ def construir_plan_picking_df(pallets: list[Pallet], info_sku: dict[str, dict] |
             filas.append(
                 {
                     "CD": pallet.cd,
+                    "Nombre_CD": nombres_cd.get(pallet.cd),
+                    "N_Parihuela": numero_parihuela[(pallet.cd, pallet.id)],
                     "ID_Pallet": pallet.id,
                     "Tipo_Pallet": pallet.tipo,
                     "Nivel_Categoria": linea.nivel_categoria,
@@ -32,6 +54,8 @@ def construir_plan_picking_df(pallets: list[Pallet], info_sku: dict[str, dict] |
                     "Cajas_Demanda_Oficial": linea.cajas_demanda_oficial,
                     "Cajas_Extra_Consolidacion": linea.cajas_extra_consolidacion,
                     "Cajas_Totales_Pallet": cajas_totales,
+                    "Unidades_Por_Caja": unidades_por_caja or None,
+                    "Cajas_Por_PH": meta.get("cajas_por_ph"),
                     "Cantidad_Unidades": round(cajas_totales * unidades_por_caja, 2) if unidades_por_caja else None,
                     "Fuente_Geometria": meta.get("fuente_geometria"),
                     "Largo_Efectivo": meta.get("largo_efectivo"),
@@ -49,8 +73,9 @@ def construir_plan_picking_df(pallets: list[Pallet], info_sku: dict[str, dict] |
                 }
             )
     columnas = [
-        "CD", "ID_Pallet", "Tipo_Pallet", "Nivel_Categoria", "SKU", "Descripcion", "Categoria",
-        "Cajas_Demanda_Oficial", "Cajas_Extra_Consolidacion", "Cajas_Totales_Pallet", "Cantidad_Unidades",
+        "CD", "Nombre_CD", "N_Parihuela", "ID_Pallet", "Tipo_Pallet", "Nivel_Categoria", "SKU", "Descripcion",
+        "Categoria", "Cajas_Demanda_Oficial", "Cajas_Extra_Consolidacion", "Cajas_Totales_Pallet",
+        "Unidades_Por_Caja", "Cajas_Por_PH", "Cantidad_Unidades",
         "Fuente_Geometria", "Largo_Efectivo", "Ancho_Efectivo", "Alto_Efectivo", "Geometria_Inferida",
         "Altura_Final_Pallet_cm", "Altura_Pre_BAT_cm", "Cajas_BAT", "Unidades_BAT",
         "Peso_Estimado_Pallet_kg", "Support_Ratio_Min", "Delta_Target_198_3", "Estado",
