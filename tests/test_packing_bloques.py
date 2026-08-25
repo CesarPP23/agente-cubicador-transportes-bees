@@ -201,6 +201,32 @@ def test_four_loko_queda_arriba_de_todo_por_nivel_remate():
                     assert z < otro_z, "algo quedó en la misma cama o más alto que Four Loko"
 
 
+def test_categorias_pueden_compartir_la_misma_capa_si_la_geometria_lo_permite():
+    """[relajación pedida por el usuario tras el fix de flotación] La regla
+    real es por columna física ("no se le puede encimar licores sobre
+    nabs"), no "una categoría entera antes que la siguiente". Con NABS de
+    huella 100x30 (deja tiras de 20cm sin usar en los 120 de largo) y
+    REMATE de huella chica (15x15, cabe en esas tiras), REMATE debe poder
+    colocarse en la MISMA capa Z que NABS -sin esperar a que NABS agote
+    toda su demanda primero- y sin violar el orden de categoría."""
+    df = pd.DataFrame(
+        [
+            _fila("NABS", 100, 30, 20.0, 15, cajas_cama=30, nivel=6),
+            _fila("REMATE", 15, 15, 20.0, 8, cajas_cama=30, nivel=7),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_por_cama = _torres_por_z(pallets)
+    capas_mixtas = [g for g in torres_por_cama.values() if {t.sku for t in g} == {"NABS", "REMATE"}]
+    assert capas_mixtas, "REMATE debería poder compartir capa con NABS cuando la huella lo permite"
+    assert validar_geometria_v5(pallets) == []
+    despachado = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    assert despachado == {"NABS": 15, "REMATE": 8}
+
+
 def test_sin_columna_nivel_categoria_no_cambia_nada():
     """Sin la columna Nivel_Categoria (compatibilidad con datasets viejos o
     tests que no la setean), todo el mundo cae en el mismo nivel por

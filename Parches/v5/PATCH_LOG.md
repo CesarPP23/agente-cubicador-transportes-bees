@@ -1898,21 +1898,19 @@ debía, en un dataset donde no había una mejora real disponible para este
 tipo de estrategia.
 
 ### Qué SÍ arreglaría esto (no implementado, decisión pendiente con el usuario)
-1. Relajar el orden estricto de categoría en casos puntuales (ej. permitir
-   que Remate compita por hueco ANTES de que NABs reclame toda la huella,
-   en vez de reservarle solo lo que sobra) -pero esto contradice la regla
-   de negocio explícita ("no se le puede encimar licores [b] sobre nabs").
+1. ~~Relajar el orden estricto de categoría en casos puntuales~~ -ver
+   sección siguiente, sí se implementó. Corrección sobre lo que se dijo
+   acá originalmente: NO contradice ninguna regla de negocio confirmada
+   por el usuario -la regla real, confirmada explícitamente, es por
+   COLUMNA física ("no se le puede encimar licores sobre nabs"), no "una
+   categoría entera antes que la siguiente". Esto último era una
+   simplificación de implementación propia, nunca pedida.
 2. Una búsqueda conjunta multi-SKU real (probar varias combinaciones de
    qué SKU "ancla" abre cada pallet y con qué otros se combina, no solo la
    primera que gana por prioridad) -el mismo espíritu de
    `multistart.py`/`residual_search.py`, borrados en la limpieza de este
-   branch. Es un esfuerzo bastante más grande y con más superficie de
-   riesgo que este patch: no se implementó sin decisión explícita del
-   usuario.
-Se deja el paso de consolidación igual (no hace daño, puede ayudar en
-datasets con patrones distintos de fragmentación -ej. remanentes con
-huellas más compatibles entre categorías), pero no resuelve el problema
-de este dataset específico.
+   branch. Sigue sin implementarse: es un esfuerzo bastante más grande y
+   con más superficie de riesgo, no se emprende sin decisión explícita.
 
 ### Invariantes
 - `tests/test_packing_bloques.py::test_consolidacion_de_remanentes_nunca_pierde_ni_duplica_demanda`:
@@ -1921,5 +1919,80 @@ de este dataset específico.
   cajas por caja con la esperada y 0 violaciones geométricas -sea cual sea
   el número de pallets que termine usando.
 - tests: 126 passed (suite completa).
+
+---
+
+## Competencia por nivel: de "bandas por categoría" a "por columna real"
+
+El usuario preguntó directamente qué regla de negocio se contradecía con
+arreglar el tema de las alturas. Repensándolo con él: NINGUNA. La regla
+confirmada explícitamente ("los pallets que contienen nabs no se le puede
+encimar licores, sobre licores sí se puede encimar nabs") es sobre qué
+queda apoyado DIRECTAMENTE encima de qué EN LA MISMA COLUMNA física del
+pallet -no dice nada sobre "agotar toda una categoría antes de tocar la
+siguiente". Esa restricción adicional (procesar los niveles en pasadas
+secuenciales, sección 4 de versiones anteriores de este archivo) fue una
+simplificación de implementación propia, no algo pedido -y es la causa
+real de por qué NABs (con una huella que fragmenta el piso en tiras
+angostas) le dejaba a Remate solo las sobras, en vez de dejarlo competir
+por el piso desde el principio.
+
+### Cambio
+`_empacar` ya no procesa "un nivel completo, después el siguiente". TODOS
+los SKUs de TODOS los niveles compiten juntos, en cada colocación, por el
+cuboide libre disponible más bajo -exactamente igual que antes en cuanto a
+"cama por cama, fila por fila, nunca columnas", pero sin la separación
+artificial por categoría. La regla real (columna por columna) se garantiza
+en cada colocación individual: `_soporte_viola_nivel` revisa, antes de
+colocar una caja a una Z mayor a 0, si el soporte real e inmediato debajo
+de su huella (mismo criterio que la validación anti-flotación: huella que
+se solapa, tope exactamente en esa Z) pertenece a un nivel de categoría
+mayor -si es así, esa colocación se descarta para ese cuboide (pero el SKU
+sigue pudiendo colocarse en cualquier otro cuboide donde no viole la
+regla). Empate de Z entre SKUs de categoría distinta: sigue prefiriendo
+categoría más baja primero (para que el pallet tienda a formar capas
+limpias cuando la geometría lo permite), pero ya no lo FUERZA cuando la
+geometría no da.
+
+Verificado con un caso construido a propósito (NABs huella 100x30, deja
+tiras de 20cm sin usar en los 120 de largo; Remate huella 15x15, chica) que
+Remate efectivamente entra en la MISMA capa Z que NABs -sin esperar a que
+NABs agote su demanda- sin ninguna violación geométrica (ver
+`test_categorias_pueden_compartir_la_misma_capa_si_la_geometria_lo_permite`).
+
+### Resultado sobre el dataset real -honesto, sin cambio
+```
+Antes: 75 pallets, 30 bajo 170cm, 76% aprovechamiento de altura.
+Después: 75 pallets, 30 bajo 170cm, 76% aprovechamiento de altura (igual).
+```
+Se verificó (no se asumió) que el mecanismo nuevo SÍ está activo: NABs
+sigue ganando casi siempre la competencia por Z porque su propia huella
+(20x32.5cm) es lo bastante chica como para encajar también en los mismos
+fragmentos angostos que Remate necesitaría -como NABs tiene prioridad de
+categoría en los empates, sigue ganando esos espacios primero, y termina
+usando su demanda completa (14 cajas) de todas formas antes de que Remate
+tenga una oportunidad real de colarse ahí. No es que el mecanismo no
+funcione (el test construido arriba prueba que si Remate fuera el único
+que puede usar esos huecos, sí se cuela) -es que en ESTE dataset
+específico, NABs y Remate compiten genuinamente por el MISMO espacio
+físico, y NABs gana esa competencia por diseño (prioridad de categoría),
+tal como debe ser. El techo de eficiencia de este dataset no está en el
+ORDEN de armado -ya se probaron dos estrategias distintas (consolidación
+de remanentes, competencia por columna) y ninguna cambió el resultado- 
+sino en cuánto puede combinarse geométricamente lo que hay que enviar a
+cada CD. Una mejora real necesitaría la opción 2 de la sección anterior
+(búsqueda conjunta multi-SKU), no más ajustes al orden de competencia.
+
+### Invariantes
+- `tests/test_packing_bloques.py::test_categorias_pueden_compartir_la_misma_capa_si_la_geometria_lo_permite`:
+  Remate comparte capa Z con NABs cuando la huella lo permite, 0
+  violaciones geométricas, demanda despachada exacta.
+- Se re-verificaron todos los tests de orden de categoría existentes
+  (Licores nunca arriba de NABs, Four Loko siempre última) -siguen
+  pasando con la competencia unificada, la garantía ahora vive en
+  `_soporte_viola_nivel` en vez de en la secuencia del barrido.
+- tests: 127 passed (suite completa). Verificado contra el dataset real:
+  0 violaciones geométricas, demanda exacta (mismo resultado que antes,
+  documentado arriba).
 
 ---

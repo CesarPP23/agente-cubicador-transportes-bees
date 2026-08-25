@@ -41,10 +41,20 @@ Arquitectura (corregida):
    cupo ahí, ese cuboide se descarta para ese SKU (pero sigue disponible
    para cualquier otro).
 4. Entre SKUs de categorías distintas: Licores (nivel bajo) nunca queda
-   arriba de NABs (nivel alto) -se procesan los niveles de categoría en
-   orden estricto ascendente dentro de cada pallet, agotando (o
-   descartando por no caber) un nivel completo antes de tocar el
-   siguiente.
+   apoyado directamente ENCIMA de NABs (nivel alto) -la regla real
+   confirmada por el usuario es por COLUMNA física, no por "banda
+   horizontal completa": "no se le puede encimar licores sobre nabs".
+   Se verifica en cada colocación, no separando el armado en pasadas por
+   nivel -todos los SKUs de todos los niveles compiten juntos por el
+   cuboide libre más bajo disponible en todo momento, y solo se descarta
+   una colocación si el soporte real e inmediato debajo de esa huella
+   pertenece a un nivel mayor al que se está por colocar (ver
+   `_soporte_viola_nivel`). Esto es deliberadamente MENOS estricto que
+   "primero se agota una categoría entera antes de tocar la siguiente"
+   -esa regla adicional nunca fue pedida, era una simplificación de
+   implementación que dejaba pallets cortos cuando la huella de una
+   categoría fragmentaba el piso de forma incompatible con la siguiente
+   (ver PATCH_LOG.md, sección "competencia por nivel").
 5. [consolidación de remanentes] El barrido de arriba es voraz: abre un
    pallet nuevo apenas queda algo pendiente, así que SKUs de baja demanda
    que se van agotando de a poco (su tope por capa, o su compatibilidad de
@@ -92,17 +102,46 @@ def _cabe_en_pallet(cand: TorreCandidate, presupuesto: float) -> bool:
     return cols > 0 and filas > 0 and cand.alto_caja <= presupuesto + TOL
 
 
+def _soporte_viola_nivel(
+    pallet: PalletV5, x: float, y: float, largo: float, ancho: float, z: float,
+    nivel_sku: int, nivel_por_sku: dict[str, int],
+) -> bool:
+    """[sección 4] La regla real confirmada por el usuario es por columna
+    física: una caja nunca puede quedar apoyada DIRECTAMENTE encima de otra
+    de un nivel de categoría mayor (ej. Licores sobre NABs). En z=0 (piso
+    del pallet) no hay restricción -cualquier categoría puede arrancar ahí.
+    Para z>0, se identifican las torres que son el soporte real e inmediato
+    de esta huella (mismo criterio que la validación anti-flotación: tope
+    de esas torres exactamente en `z`, huella que se solapa) -si CUALQUIERA
+    de esas torres de soporte pertenece a un nivel mayor al que se está por
+    colocar, es una violación."""
+    if z <= TOL:
+        return False
+    for t in pallet.torres:
+        if abs((t.z + t.altura) - z) > TOL:
+            continue
+        if t.x + t.largo <= x + TOL or x + largo <= t.x + TOL:
+            continue
+        if t.y + t.ancho <= y + TOL or y + ancho <= t.y + TOL:
+            continue
+        if nivel_por_sku.get(t.sku, 0) > nivel_sku:
+            return True
+    return False
+
+
 def _mejor_cuboide_para_sku(
-    pallet: PalletV5, pc: _PalletEnConstruccion, cand: TorreCandidate, tope_capa: int | None
+    pallet: PalletV5, pc: _PalletEnConstruccion, cand: TorreCandidate, tope_capa: int | None,
+    nivel_sku: int, nivel_por_sku: dict[str, int],
 ) -> int | None:
-    """[sección 2-3] Entre los cuboides libres que reciban 1 caja de
+    """[sección 2-4] Entre los cuboides libres que reciban 1 caja de
     `cand`, el de menor Z (más bajo) -así se llena SIEMPRE la capa más
     baja disponible antes de subir, nunca se salta a una más alta habiendo
-    sitio abajo (row-first, nunca columnas). Si `tope_capa` (Cajas_Cama_
-    Efectivo real del Maestro) ya se alcanzó para este SKU en la Z exacta
-    de un cuboide, ese cuboide se descarta -evita que la geometría pura
-    permita más cajas por capa de las que el Maestro valida como reales,
-    aunque el grid matemático diría que caben más."""
+    sitio abajo (row-first, nunca columnas). Descarta un cuboide si: (a)
+    `tope_capa` (Cajas_Cama_Efectivo real del Maestro) ya se alcanzó para
+    este SKU en la Z exacta de ese cuboide -evita que la geometría pura
+    permita más cajas por capa de las que el Maestro valida como reales-,
+    o (b) colocar ahí violaría el orden de categoría por columna (ver
+    `_soporte_viola_nivel`)."""
     mejor_idx, mejor_clave = None, None
     for idx, c in enumerate(pc.libres):
         if cand.largo > c.w + TOL or cand.ancho > c.h + TOL or cand.alto_caja > c.d + TOL:
@@ -113,6 +152,8 @@ def _mejor_cuboide_para_sku(
             )
             if ya_en_esta_capa >= tope_capa:
                 continue
+        if _soporte_viola_nivel(pallet, c.x, c.y, cand.largo, cand.ancho, c.z, nivel_sku, nivel_por_sku):
+            continue
         clave = (c.z, c.volumen)
         if mejor_clave is None or clave < mejor_clave:
             mejor_idx, mejor_clave = idx, clave
@@ -124,7 +165,6 @@ def _empacar(
     por_sku: dict[str, list[TorreCandidate]],
     capacidad_cama_por_sku: dict[str, int],
     nivel_por_sku: dict[str, int],
-    niveles_presentes: list[int],
     cd: str,
     contador: list[int],
 ) -> list[PalletV5]:
@@ -140,44 +180,49 @@ def _empacar(
         pc = _PalletEnConstruccion(pallet=pallet)
         avanzo_en_este_pallet = False
 
-        # [sección 4] Niveles de categoría en orden estricto -se agota (o
-        # se descarta por no caber más) un nivel completo antes de tocar
-        # el siguiente, así nunca queda un SKU de nivel bajo arriba de uno
-        # de nivel alto dentro del mismo pallet.
-        for nivel in niveles_presentes:
-            guard = 0
-            while True:
-                guard += 1
-                if guard > 20_000:
-                    break
-                activos = [s for s in pendientes if pendientes[s] > 0 and nivel_por_sku.get(s, 0) == nivel]
-                if not activos:
-                    break
+        # [sección 4] TODOS los SKUs de TODOS los niveles compiten juntos
+        # por el cuboide libre más bajo disponible -no se procesa "primero
+        # una categoría entera, después la siguiente". El orden de
+        # categoría (ninguna caja apoyada directo encima de una de nivel
+        # mayor) lo garantiza `_mejor_cuboide_para_sku` en cada colocación
+        # individual, no la secuencia del barrido.
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 100_000:
+                break
+            activos = [s for s in pendientes if pendientes[s] > 0]
+            if not activos:
+                break
 
-                # [sección 2] Entre TODOS los SKUs de este nivel con
-                # demanda pendiente, cuál -colocado en su mejor cuboide
-                # propio- logra la Z más baja. Empate: más demanda
-                # pendiente primero (sigue concentrando el mismo SKU en
-                # capas consecutivas, como pedía el usuario).
-                mejor = None
-                for sku in activos:
-                    cand = _mejor_orientacion_grilla(por_sku[sku])
-                    tope_capa = capacidad_cama_por_sku.get(sku)
-                    idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa)
-                    if idx_libre is None:
-                        continue
-                    z_destino = pc.libres[idx_libre].z
-                    clave = (z_destino, -pendientes[sku])
-                    if mejor is None or clave < mejor[0]:
-                        mejor = (clave, sku, cand, idx_libre)
+            # [sección 2] Entre TODOS los SKUs pendientes, cuál -colocado
+            # en su mejor cuboide propio- logra la Z más baja. Empates:
+            # nivel de categoría más bajo primero (Licores antes que NABs
+            # cuando ambos podrían ir igual de bajo, para que el pallet
+            # tienda a formar capas limpias cuando la geometría lo permite
+            # sin forzarlo), y dentro del mismo nivel, más demanda
+            # pendiente primero (sigue concentrando el mismo SKU en capas
+            # consecutivas, como pedía el usuario).
+            mejor = None
+            for sku in activos:
+                cand = _mejor_orientacion_grilla(por_sku[sku])
+                tope_capa = capacidad_cama_por_sku.get(sku)
+                nivel_sku = nivel_por_sku.get(sku, 0)
+                idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
+                if idx_libre is None:
+                    continue
+                z_destino = pc.libres[idx_libre].z
+                clave = (z_destino, nivel_sku, -pendientes[sku])
+                if mejor is None or clave < mejor[0]:
+                    mejor = (clave, sku, cand, idx_libre)
 
-                if mejor is None:
-                    break  # nada de este nivel entra ya en este pallet
+            if mejor is None:
+                break  # nada entra ya en este pallet, ni siquiera más arriba
 
-                _, sku, cand, idx_libre = mejor
-                pc.colocar(cand, 1, idx_libre)
-                pendientes[sku] -= 1
-                avanzo_en_este_pallet = True
+            _, sku, cand, idx_libre = mejor
+            pc.colocar(cand, 1, idx_libre)
+            pendientes[sku] -= 1
+            avanzo_en_este_pallet = True
 
         if not avanzo_en_este_pallet:
             break  # nada entró en un pallet fresco -evitar loop infinito (no debería pasar tras el chequeo previo)
@@ -259,8 +304,7 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
             sin_colocar[sku] = pendientes[sku]
             pendientes[sku] = 0
 
-    niveles_presentes = sorted(set(nivel_por_sku.values()))
-    pallets = _empacar(pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, niveles_presentes, cd, contador)
+    pallets = _empacar(pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, cd, contador)
 
     # [sección 5] Consolidación de remanentes: los pallets que quedaron muy
     # cortos se deshacen y se reempacan juntos -si mejora (menos pallets),
@@ -274,9 +318,7 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
         for p in cortos:
             for t in p.torres:
                 pendientes_residual[t.sku] = pendientes_residual.get(t.sku, 0) + t.cantidad
-        reempacados = _empacar(
-            pendientes_residual, por_sku, capacidad_cama_por_sku, nivel_por_sku, niveles_presentes, cd, contador
-        )
+        reempacados = _empacar(pendientes_residual, por_sku, capacidad_cama_por_sku, nivel_por_sku, cd, contador)
         if len(reempacados) >= len(cortos):
             break  # no mejoró -se descarta el intento, se conserva lo que ya había
         ids_cortos = {id(p) for p in cortos}
