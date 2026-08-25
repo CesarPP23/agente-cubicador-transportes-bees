@@ -1851,3 +1851,75 @@ decisión con el usuario sobre cómo abordarlo.
 - tests: 125 passed (suite completa).
 
 ---
+
+## Consolidación de remanentes (sección 5) -intento, resultado honesto
+
+A pedido explícito del usuario (elegido entre 3 opciones tras el fix de
+flotación: "atacar la consolidación de remanentes ahora"), se agregó un
+paso de reempaque en `armar_pallets_bloques`: al terminar el barrido
+principal, los pallets por debajo del 60% del presupuesto de altura
+(`UMBRAL_CONSOLIDACION_FRACCION`) se deshacen (sus torres vuelven a ser
+demanda pendiente) y se reintenta empacarlos juntos con el mismo motor
+(`_empacar`, hasta `MAX_INTENTOS_CONSOLIDACION=3` veces) -si el resultado
+tiene MENOS pallets que antes, se acepta; si no, se descarta sin tocar
+nada (nunca puede empeorar el resultado original).
+
+### Diagnóstico real, no solo teórico
+Se investigó CADA pallet corto de `Cubicaje18.07.2026.xlsx` (ej.
+`PV5-BK31-008`: 5 cajas repartidas en 3 SKUs de Comestibles) antes de
+implementar esto. La causa NO es que el barrido abra pallets nuevos por
+timing/orden y deje SKUs compatibles separados sin necesidad -de hecho
+`armar_pallets_bloques` ya intenta TODOS los niveles disponibles dentro de
+CADA pallet antes de cerrarlo, así que cualquier combinación posible ya se
+intentó en el momento. La causa real es una tensión genuina entre dos
+reglas de negocio: la categoría estrictamente ascendente (nivel 6 siempre
+se coloca ANTES/abajo que nivel 7 dentro de un mismo pallet) y la
+geometría de huella. Ejemplo real medido: el SKU 23036 (nivel NABs,
+huella 20x32.5cm) con 14 cajas de demanda ocupa ~78% de la huella completa
+120x100 del pallet en un patrón que no deja fragmentos grandes -los
+"huecos" que deja son casi todos más angostos que cualquier SKU de nivel
+Remate (huellas de 40-55cm de lado). Como NABs va SIEMPRE antes que
+Remate, Remate queda atrapado con esos fragmentos angostos sin importar
+CON QUÉ otro remanente se lo combine -reempacar junto con otros remanentes
+no cambia ese resultado, porque el conflicto no es de agrupamiento, es
+geométrico y determinístico.
+
+### Resultado sobre el dataset real
+```
+Antes de la consolidación: 75 pallets, 30 bajo 170cm.
+Después de la consolidación: 75 pallets, 30 bajo 170cm (sin cambio).
+```
+Se verificó (con debug directo, no solo el resultado final) que la
+consolidación SÍ se activa (detecta pallets cortos, los reempaca) pero el
+reempaque reproduce el mismo número de pallets -se descarta correctamente
+en cada intento, tal como está diseñado (nunca acepta un resultado igual
+o peor). No es un bug: es la garantía de "nunca empeora" funcionando como
+debía, en un dataset donde no había una mejora real disponible para este
+tipo de estrategia.
+
+### Qué SÍ arreglaría esto (no implementado, decisión pendiente con el usuario)
+1. Relajar el orden estricto de categoría en casos puntuales (ej. permitir
+   que Remate compita por hueco ANTES de que NABs reclame toda la huella,
+   en vez de reservarle solo lo que sobra) -pero esto contradice la regla
+   de negocio explícita ("no se le puede encimar licores [b] sobre nabs").
+2. Una búsqueda conjunta multi-SKU real (probar varias combinaciones de
+   qué SKU "ancla" abre cada pallet y con qué otros se combina, no solo la
+   primera que gana por prioridad) -el mismo espíritu de
+   `multistart.py`/`residual_search.py`, borrados en la limpieza de este
+   branch. Es un esfuerzo bastante más grande y con más superficie de
+   riesgo que este patch: no se implementó sin decisión explícita del
+   usuario.
+Se deja el paso de consolidación igual (no hace daño, puede ayudar en
+datasets con patrones distintos de fragmentación -ej. remanentes con
+huellas más compatibles entre categorías), pero no resuelve el problema
+de este dataset específico.
+
+### Invariantes
+- `tests/test_packing_bloques.py::test_consolidacion_de_remanentes_nunca_pierde_ni_duplica_demanda`:
+  con 8 SKUs de baja demanda repartidos en 5 niveles de categoría (el
+  patrón real que produce pallets cortos), la demanda despachada coincide
+  cajas por caja con la esperada y 0 violaciones geométricas -sea cual sea
+  el número de pallets que termine usando.
+- tests: 126 passed (suite completa).
+
+---

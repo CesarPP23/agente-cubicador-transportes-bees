@@ -220,6 +220,34 @@ def test_sin_columna_nivel_categoria_no_cambia_nada():
     assert despachado.get("B", 0) == 12
 
 
+def test_consolidacion_de_remanentes_nunca_pierde_ni_duplica_demanda():
+    """[sección 5, consolidación de remanentes] Con muchos SKUs de baja
+    demanda repartidos en varios niveles de categoría (el patrón real que
+    produce pallets cortos), la consolidación puede o no reducir el número
+    de pallets -pero bajo ninguna circunstancia debe perder o duplicar
+    demanda, ni introducir una violación geométrica nueva."""
+    df = pd.DataFrame(
+        [
+            _fila("N1", 20, 20, 20.0, 3, cajas_cama=30, nivel=1),
+            _fila("N2A", 25, 20, 22.0, 4, cajas_cama=20, nivel=2),
+            _fila("N2B", 30, 25, 18.0, 5, cajas_cama=15, nivel=2),
+            _fila("N3", 20, 20, 25.0, 2, cajas_cama=30, nivel=3),
+            _fila("N6A", 32, 20, 25.0, 6, cajas_cama=18, nivel=6),
+            _fila("N6B", 40, 30, 22.0, 3, cajas_cama=8, nivel=6),
+            _fila("N7A", 44, 32, 27.0, 2, cajas_cama=6, nivel=7),
+            _fila("N7B", 39, 39, 20.0, 4, cajas_cama=9, nivel=7),
+        ]
+    )
+    esperado = {"N1": 3, "N2A": 4, "N2B": 5, "N3": 2, "N6A": 6, "N6B": 3, "N7A": 2, "N7B": 4}
+    pallets = armar_pallets_bloques(df, "BK31")
+    despachado: dict[str, int] = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    assert despachado == esperado
+    assert validar_geometria_v5(pallets) == []
+
+
 def test_no_viola_geometria():
     df = pd.DataFrame(
         [
