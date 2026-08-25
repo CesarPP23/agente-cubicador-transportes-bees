@@ -1,8 +1,14 @@
-"""[SKU_BLOQUE] Pipeline para la lógica de bloques (ver
-src/packing_bloques.py -instrucción explícita del usuario sobre cómo tiene
-que priorizar el armado: cada SKU es un bloque indivisible mientras sea
-posible, se agrupan bloques enteros para llegar a la altura óptima, y solo
-se parte un bloque como último recurso).
+"""[SKU_BLOQUE] Pipeline para la lógica de bloques.
+
+[PH_FRACCION -ver PATCH_LOG.md] El motor de armado activo es
+`src/packing_ph_fraccion.py::armar_pallets_ph_fraccion` (importado acá
+como `armar_pallets_bloques` para no tocar el resto de este archivo) -
+calibrado contra un cubicaje real armado a mano, arma por fracción de PH
+en vez de geometría exacta caja por caja. `src/packing_bloques.py` (el
+motor geométrico exacto, MaxRects 3D con verificación caja por caja) sigue
+en el repo y probado, pero ya no es el que usa el pipeline -se puede volver
+a él cambiando el import de acá si hace falta la verificación exacta en
+vez de la densidad real.
 
 Reutiliza VAL/DEM/GEO/DER/SPLIT/PESO/EXP tal cual el resto de los motores
 -esa infraestructura no depende de la estrategia de armado."""
@@ -22,7 +28,7 @@ from src import (
     validacion,
     validacion_peso,
 )
-from src.packing_bloques import armar_pallets_bloques
+from src.packing_ph_fraccion import armar_pallets_ph_fraccion as armar_pallets_bloques
 from src.pipeline import (
     _construir_info_sku,
     _construir_pallets_geometria_insuficiente,

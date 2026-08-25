@@ -2245,3 +2245,46 @@ py`/`app.py`.
 - tests: 136 passed (suite completa, motor nuevo + todo lo anterior).
 
 ---
+
+## PH_FRACCION conectado al pipeline
+
+Confirmado explícitamente por el usuario: "si conectalo pero no lo
+pushees". `src/pipeline_sku_bloque.py` ahora importa `armar_pallets_
+ph_fraccion` de `src/packing_ph_fraccion.py` (con el alias `armar_pallets_
+bloques` para no tocar el resto del archivo) -es el motor que arma el
+pipeline real, incluyendo `ejecutar_desde_archivo`/la app de Streamlit.
+`src/packing_bloques.py` (motor geométrico exacto) sigue en el repo,
+probado, disponible por si hace falta volver atrás -cambiar el import de
+`pipeline_sku_bloque.py` alcanza.
+
+### Verificado end-to-end (pipeline completo, no el módulo aislado)
+```
+Cubicaje18.07.2026.xlsx: 53 pallets (75 al inicio de esta sesión, antes
+  de cualquier fix). 0 violaciones (solape/overflow/altura/cobertura por
+  capa). Demanda exacta.
+
+Dataset real del usuario (Copia de Plantilla_Ejemplo...(1) (2).xlsx),
+  con BAT incluido -antes solo se había probado el módulo aislado sin
+  BAT:
+  BK31: 3 (target 2)  -> dentro del margen ±1
+  BK36: 2 (target 2)  -> exacto
+  BK51: 6 (target 4)  -> FUERA del margen por 1 (±1 = 3-5); con BAT
+    incluido sale 1 más que en la prueba aislada sin BAT (que había dado
+    5, dentro del margen)
+  BK61: 5 (target 4)  -> dentro del margen
+  BK65: 4 (target 3)  -> dentro del margen
+```
+4 de 5 CDs dentro del margen real con el pipeline completo (BK51 queda 1
+pallet por encima del margen, con BAT incluido) -mejora sustancial de
+todas formas frente al motor exacto (8, fuera del margen por 3). 0
+violaciones geométricas, demanda exacta, tiempos de ejecución más rápidos
+que el motor exacto (shelf-packing por presupuesto de área es mucho más
+barato que la búsqueda de mejor cuboide libre de MaxRects).
+
+### Invariantes
+- Suite completa corrida contra el pipeline real (no solo el módulo
+  aislado): 136 passed, incluyendo `test_pipeline_real_data.py` (datos
+  reales de referencia de la sesión).
+- Verificado manualmente con `ejecutar_desde_archivo` contra ambos
+  datasets reales: demanda exacta, 0 violaciones geométricas y de
+  cobertura por capa.
