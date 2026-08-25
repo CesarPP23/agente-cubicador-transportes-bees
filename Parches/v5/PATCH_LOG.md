@@ -1749,3 +1749,105 @@ aparte?) antes de tocar el export.
 - tests: 126 passed (suite completa).
 
 ---
+
+## Bug real: cajas flotando (reporte del usuario con foto del Inspector)
+
+Reporte textual del usuario, con foto de un pallet real (PV5-BK35-016) y
+`Plan_Picking_Optimizado (9).xlsx`: **"siguen habiendo camas por debajo de
+170 cm y mira ese ejemplo que te mande de como estas apilando las cajas,
+habiamos quedado que tienen que ser cama por cama, completar la cama para
+recien pasar a la siguiente no apilarlo en colunas, eso no es nada seguro
+hay cajas que estan flotandoen el vacio, toda caja debe esta puesta sobre
+otra caja"**.
+
+### Causa raíz -no era arquitectura, era el motor 3D compartido
+La sospecha inicial fue que `_armar_cama` reseteaba el espacio libre en
+cada frontera de cama asumiendo 100% de soporte a esa altura (la cama
+anterior típicamente solo ocupa 82-90% de la huella). Se rediseñó
+`src/packing_bloques.py` para usar UN SOLO `_PalletEnConstruccion` continuo
+por pallet (nunca se resetea), colocando de a 1 caja por vez y priorizando
+siempre el cuboide libre de menor Z disponible entre todos los SKUs del
+mismo nivel de categoría -así se reproduce "cama por cama" sin volver a
+introducir columnas ni perder la continuidad real del espacio 3D.
+
+Pero el bug real estaba un nivel más abajo, en
+`src/packing_columnar.py::_actualizar_libres_maxrects` (el motor MaxRects
+3D compartido, usado también por `armar_pallets_columnar` aunque esa
+función ya no está en el pipeline activo). El fragmento "arriba en Z" que
+se genera después de colocar una caja usaba `libre.w`/`libre.h` -el
+footprint COMPLETO del cuboide libre que se estaba partiendo- en vez de la
+intersección real con la caja recién colocada. Cuando una caja chica se
+coloca en la esquina de un cuboide libre mucho más grande (muy común: el
+best-fit no exige que la caja llene el cuboide entero), el cuboide "de
+arriba" resultante reclamaba TODO ese footprint grande como soporte a la
+altura de la caja chica -aunque el resto de esa área siguiera vacía desde
+el piso. Cualquier caja puesta ahí después terminaba flotando de verdad,
+sin nada real debajo en la parte no cubierta por la caja original. Se
+encontró recién al escribir el chequeo geométrico nuevo (ver abajo) y
+correrlo contra un test con SKUs de alturas mixtas -sin ese chequeo, el
+bug seguía siendo invisible para la suite.
+
+Corrección: el fragmento "arriba" ahora se recorta a la intersección real
+en XY entre la caja colocada y el cuboide que se parte (`ix0,ix1,iy0,iy1`),
+nunca al footprint completo del cuboide original.
+
+### Invariante nueva, permanente: anti-flotación
+`src/validacion_v5.py::validar_pallet_v5` ahora chequea, para toda torre
+que no arranca en z=0, que TODA su huella (no solo parte) tenga soporte
+real -unión de huellas de otras torres cuyo tope de Z coincide exactamente
+con su base. Si no, se reporta como violación (`"...caja flotando"`), con
+el mismo peso que overlap/overflow (el gate P14 las trata igual, son
+bloqueantes). Esto convierte "no cajas flotando" en un invariante
+verificado automáticamente en cada corrida, no solo una inspección visual
+ocasional.
+
+### `Cajas_Cama_Efectivo` sin frontera explícita de "cama"
+Como ya no existe un punto de reset entre camas, el cupo real por capa
+(`Cajas_Cama_Efectivo` del Maestro) se valida contando, en cada intento de
+colocación, cuántas torres de ese mismo SKU ya existen exactamente en la Z
+del cuboide candidato (`_mejor_cuboide_para_sku`) -si ya se alcanzó el
+cupo ahí, ese cuboide se descarta para ese SKU (pero sigue disponible para
+cualquier otro SKU o para el mismo SKU en una Z distinta, ya no capada).
+
+### Resultado sobre el dataset real (Cubicaje18.07.2026.xlsx)
+```
+Violaciones geométricas (overlap/overflow/flotación): 0 (antes del fix, con
+el chequeo nuevo agregado: 3 violaciones de flotación solo en un test
+sintético de 34 cajas -en datos reales el bug era más difuso pero real).
+Pallets: 75 (antes de este fix, con el bug: 48-62 según la corrida).
+Altura promedio: 163.1cm de 215.0 (antes, con el bug: ~198-200cm).
+Pallets parciales (<170cm): 30 de 75 (40%).
+Demanda: exacta (0 unidades de error).
+```
+Sube MUCHO el conteo de pallets y baja fuerte el aprovechamiento de
+altura -esto es el costo real de sacar una ganancia que era ilegítima
+(altura lograda apoyando cajas en aire, no en soporte real), no una
+regresión de una versión que funcionaba bien. Se reporta tal cual, sin
+ajustar nada para disimularlo.
+
+Diagnóstico de por qué tantos pallets quedan cortos (<170cm): son
+literalmente pallets de remanente -SKUs de baja demanda que, agrupados
+entre categorías compatibles, ya no alcanzan a llenar una altura completa
+(ejemplo real: `PV5-BK31-008`, 5 cajas totales repartidas en 3 SKUs de
+Comestibles/BAT). Esto es un problema de CONSOLIDACIÓN de remanentes entre
+SKUs de baja demanda -distinto del bug de flotación, no resuelto en este
+patch. La arquitectura V4 tenía un módulo dedicado a esto
+(`consolidacion_sku.py`, `residual_search.py`) que se borró en la limpieza
+de este mismo branch por considerarse innecesario una vez que SKU_BLOQUE
+se volvió la única estrategia -este resultado sugiere que sí hacía falta
+para el caso de remanentes, aunque sea con otro diseño. Pendiente de
+decisión con el usuario sobre cómo abordarlo.
+
+### Invariantes
+- `tests/test_validacion_v5.py`: actualizado
+  (`test_detecta_overlap_vertical_si_los_rangos_de_z_se_cruzan` ahora
+  espera 2 violaciones -el fixture manual también viola anti-flotación,
+  correctamente detectado).
+- `tests/test_packing_bloques.py`: se reemplazaron los tests basados en
+  `TOLERANCIA_HUECO_CAMA_CM` (constante eliminada, ya no aplica con
+  tracking 3D continuo) por tests basados en `validar_geometria_v5` -el
+  juez final de que nada quede flotando, en vez de una regla ad-hoc de
+  tolerancia de altura.
+- tests: 125 passed (suite completa).
+
+---

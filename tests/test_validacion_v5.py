@@ -61,8 +61,12 @@ def test_detecta_overlap_vertical_si_los_rangos_de_z_se_cruzan():
     torre_arriba = crear_torre(cand_arriba, x=0, y=0, cantidad=3, z=30.0)  # z: 30-90, se cruza con 0-50
     pallet = PalletV5(id="P9", cd="BK31", torres=[torre_base, torre_arriba], altura_final=config.ALTURA_PALLET_VACIO + 90)
     violaciones = validar_pallet_v5(pallet)
-    assert len(violaciones) == 1
-    assert "se superpone" in violaciones[0]
+    # B arranca en z=30, que no es el tope real de ninguna torre (A termina
+    # en z=50) -además de superponerse con A, tampoco tiene soporte real
+    # debajo en su propio z: son dos violaciones genuinas y distintas.
+    assert len(violaciones) == 2
+    assert any("se superpone" in v for v in violaciones)
+    assert any("caja flotando" in v for v in violaciones)
 
 
 def test_detecta_overflow_fuera_de_la_base():

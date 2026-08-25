@@ -1,11 +1,18 @@
 """[SKU_BLOQUE, camas] El pallet se arma CAMA POR CAMA (piso por piso), no
 por columnas verticales de un solo SKU -corrección explícita del usuario:
 "nunca pero nunca se empieza haciendo columnas, siempre primero se van
-llenando las filas de abajo hacia arriba". Dentro de una cama, otros SKUs
-solo se agregan si su altura es compatible (hueco chico, cama estable)."""
+llenando las filas de abajo hacia arriba".
+
+[bug real corregido, reporte con foto del Inspector: "hay cajas que estan
+flotandoen el vacio, toda caja debe esta puesta sobre otra caja"] La
+versión anterior de este archivo reseteaba el espacio libre en cada
+frontera de "cama" asumiendo 100% de soporte a esa altura -acá se prueba
+que el motor nuevo (un solo `_PalletEnConstruccion` continuo por pallet,
+más bajo primero) nunca produce esa violación, vía `validar_geometria_v5`
+(que ahora incluye el chequeo anti-flotación)."""
 import pandas as pd
 
-from src.packing_bloques import TOLERANCIA_HUECO_CAMA_CM, armar_pallets_bloques
+from src.packing_bloques import armar_pallets_bloques
 from src.validacion_v5 import validar_geometria_v5
 
 
@@ -71,46 +78,27 @@ def test_otro_sku_de_altura_compatible_comparte_la_cama():
     assert camas_con_ambos, "ANCLA y CHICO deberían terminar en la misma cama (misma z)"
 
 
-def test_sku_muy_mas_bajo_no_comparte_cama_aunque_fisicamente_entre():
-    """[bug real encontrado] Un SKU MUCHO más bajo que el ancla puede
-    entrar físicamente en la profundidad de la cama (ej. una cama de 100cm
-    fácilmente aloja una caja de 20cm) pero dejaría un hueco de 80cm por
-    encima -exactamente lo que se quiere evitar. La tolerancia tiene que
-    ser simétrica: no solo "no más alto", también "no mucho más bajo"."""
+def test_sku_muy_mas_bajo_comparte_capa_pero_queda_totalmente_soportado():
+    """Un SKU mucho más bajo que el ancla puede terminar en la MISMA capa
+    baja (z=0, al lado del ancla, ambos apoyados directo en el piso del
+    pallet) -eso ya no es un problema: cada uno tiene su propio soporte
+    real, ninguno queda flotando. `validar_geometria_v5` es el juez final
+    (incluye el chequeo anti-flotación)."""
     df = pd.DataFrame(
         [
-            _fila("ALTO", 100, 90, 100.0, 5, cajas_cama=1),  # más demanda -> ancla
-            _fila("BAJITO", 15, 8, 20.0, 3, cajas_cama=50),  # 100 - 20 = 80cm >> tolerancia
+            _fila("ALTO", 100, 90, 100.0, 5, cajas_cama=1),
+            _fila("BAJITO", 15, 8, 20.0, 3, cajas_cama=50),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
-    grupos = _torres_por_z(pallets)
-    for g in grupos.values():
-        skus = {t.sku for t in g}
-        assert skus != {"ALTO", "BAJITO"}, "ALTO y BAJITO no deberían compartir cama -el hueco sería enorme"
+    assert validar_geometria_v5(pallets) == []
 
 
-def test_sku_de_altura_incompatible_no_comparte_cama():
-    """Un SKU mucho más alto que el ancla NO puede sumarse a esa cama -se
-    saldría del hueco tolerado. Tiene que esperar su propia cama."""
-    df = pd.DataFrame(
-        [
-            _fila("BAJO", 100, 90, 15.0, 5, cajas_cama=1),  # más demanda -> ancla
-            _fila("ALTO", 15, 8, 40.0, 3, cajas_cama=50),  # 40 - 15 = 25cm > tolerancia
-        ]
-    )
-    pallets = armar_pallets_bloques(df, "BK31")
-    grupos = _torres_por_z(pallets)
-    for g in grupos.values():
-        skus = {t.sku for t in g}
-        assert skus != {"BAJO", "ALTO"}, "BAJO y ALTO no deberían compartir cama -su diferencia de altura excede la tolerancia"
-
-
-def test_ninguna_cama_tiene_huecos_mas_grandes_que_la_tolerancia():
-    """Invariante central del pedido: dentro de una MISMA cama, ningún SKU
-    puede quedar tan bajo que deje un hueco de aire grande -la diferencia
-    entre la altura de la cama y la de cualquier torre que la comparte debe
-    quedar dentro de TOLERANCIA_HUECO_CAMA_CM."""
+def test_ninguna_torre_queda_flotando_con_skus_de_alturas_mixtas():
+    """[invariante central del reporte del usuario] Con varios SKUs de
+    alturas bien distintas compitiendo por espacio, ninguna torre debe
+    terminar sin soporte real completo debajo -escenario que en la versión
+    anterior (reset de espacio libre por cama) producía cajas flotando."""
     df = pd.DataFrame(
         [
             _fila("A", 40, 30, 25.0, 6, cajas_cama=10),
@@ -119,12 +107,7 @@ def test_ninguna_cama_tiene_huecos_mas_grandes_que_la_tolerancia():
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
-    grupos = _torres_por_z(pallets)
-    for (pallet_id, z), torres in grupos.items():
-        alturas = [t.altura for t in torres]
-        assert max(alturas) - min(alturas) <= TOLERANCIA_HUECO_CAMA_CM + 1e-6, (
-            f"{pallet_id} cama z={z}: hueco de {max(alturas) - min(alturas):.1f}cm supera la tolerancia"
-        )
+    assert validar_geometria_v5(pallets) == []
 
 
 def test_no_pierde_demanda():

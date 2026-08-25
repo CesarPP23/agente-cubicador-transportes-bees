@@ -98,7 +98,20 @@ def _actualizar_libres_maxrects(
     (izquierda/derecha/abajo/arriba en XY, y arriba en Z -nunca "abajo en
     Z": siempre se coloca a ras del piso del cuboide elegido, así que nunca
     queda un hueco debajo de lo recién puesto). Poda los que quedan
-    contenidos en otro."""
+    contenidos en otro.
+
+    [bug real corregido, reporte del usuario con foto del Inspector: "hay
+    cajas que estan flotandoen el vacio"] El fragmento "arriba en Z" solo
+    es soporte real dentro de la INTERSECCIÓN en XY entre la caja recién
+    puesta y el cuboide que se está partiendo -no en todo el ancho/alto del
+    cuboide original. Antes usaba `libre.w`/`libre.h` (el footprint
+    COMPLETO del cuboide libre, que puede ser mucho más grande que la caja
+    que se acaba de colocar dentro de él, p.ej. una caja chica colocada en
+    la esquina de un cuboide libre grande): eso hacía que TODO ese
+    footprint quedara "elevado" a la altura de la caja, aunque el resto del
+    footprint siguiera vacío desde el piso -cualquier caja puesta después
+    ahí terminaba flotando, sin nada real debajo en la parte no cubierta
+    por la caja original."""
     nuevos: list[_CuboidLibre] = []
     for libre in libres:
         if not _se_solapan(libre, x, y, z, w, h, d):
@@ -113,7 +126,10 @@ def _actualizar_libres_maxrects(
         if y + h < libre.top - TOL:
             nuevos.append(_CuboidLibre(libre.x, y + h, libre.z, libre.w, libre.top - (y + h), libre.d))
         if z + d < libre.ceil - TOL:
-            nuevos.append(_CuboidLibre(libre.x, libre.y, z + d, libre.w, libre.h, libre.ceil - (z + d)))
+            ix0, ix1 = max(libre.x, x), min(libre.right, x + w)
+            iy0, iy1 = max(libre.y, y), min(libre.top, y + h)
+            if ix1 - ix0 > TOL and iy1 - iy0 > TOL:
+                nuevos.append(_CuboidLibre(ix0, iy0, z + d, ix1 - ix0, iy1 - iy0, libre.ceil - (z + d)))
 
     return _podar_libres([c for c in nuevos if c.w > TOL and c.h > TOL and c.d > TOL])
 
