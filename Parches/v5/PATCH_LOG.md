@@ -2131,3 +2131,117 @@ cosmética.
 - tests: 129 passed (suite completa).
 
 ---
+
+## PH_FRACCION -motor nuevo, aproximado por fracción de PH
+
+El usuario mandó `Plan de acción 25.08- CUBICADO.xlsx` -un cubicaje REAL
+armado a mano por una persona del hub, con SKU/cantidad/N° de pallet real
+por CD. Confirmado explícitamente: no es un cálculo teórico, es lo que
+un armador logró de verdad. Comparado contra eso, el motor exacto
+(`packing_bloques.py`, con TODOS los fixes de esta sesión) seguía ~2-2.5x
+por encima del target real en 4 de 5 CDs (BK31: 5 vs 2, BK51: 8 vs 4,
+BK61: 7 vs 4, BK65: 6 vs 3; solo BK36 con 2 SKUs coincidía).
+
+### Se descartaron dos hipótesis con evidencia antes de rediseñar
+1. ¿Algún parámetro del motor exacto explica la brecha? Se probó sin el
+   tope `Cajas_Cama_Efectivo` (mismo resultado) y con la base extendida de
+   sobresaliente 125x105 en toda la huella, no solo dedicados (mismo
+   resultado, incluso peor distribución). Ninguno cambió nada -la brecha
+   no está en un parámetro ajustable.
+2. Se sumó, por SKU, `Cajas_Teoricas / Cajas_por_PH` ("PH REALES", ya
+   viene en la hoja del cubicaje real) por cada pallet físico real: los 15
+   pallets reales (5 CDs) dieron consistentemente ~1.4-1.5 "PH" cada uno
+   -40-50% MÁS denso que "Cajas por PH" (la capacidad de un SKU solo).
+   Conclusión: un armador real no resuelve un problema de tetris exacto
+   sin superposición -acomoda por prueba y error físico con compresión
+   real que ningún modelo de rectángulos rígidos puede garantizar sin
+   arriesgarse a inventar una posición inválida.
+
+### Decisión del usuario (con las dos opciones presentadas)
+"Probemos el de agrupar por fraccion de ph pero con la condicion de las
+alturas y los margenes que ya tenemos como regles, si tenemos que agregar
+1 ph mas para cumplir las reglas de altura esta bien" -y sobre la
+verificación geométrica: prefirió un chequeo NUEVO a nivel de capa (no
+desactivar la verificación) cuando se le presentó la tensión real entre
+"aproximado" y "nada flota".
+
+### Diseño: `src/packing_ph_fraccion.py`
+Reemplaza (como módulo nuevo, todavía NO conectado al pipeline -ver
+sección "pendiente" abajo) a `packing_bloques.py` para SKU_BLOQUE. Cada
+pallet se arma por capas (mismo espíritu "piso por piso, nunca columnas"
+que el motor exacto), pero:
+- Una capa se llena por PRESUPUESTO DE ÁREA (`UMBRAL_COBERTURA_CAPA`,
+  90% del piso 120x100), con layout tipo estantería (fila por fila,
+  izquierda a derecha) -no por búsqueda exacta de un hueco libre. Eso es
+  lo que evita el atasco por fragmentación que tenía el motor exacto.
+- Una capa puede combinar VARIOS niveles de categoría (no solo uno -un
+  primer intento de "una categoría por capa" dejaba muy pocos SKUs
+  disponibles para llenarla, verificado: 24-39 pallets en vez de 2-5). El
+  piso de nivel del pallet solo sube -Licores nunca queda apoyado sobre
+  NABs, igual garantía que el motor exacto pero a nivel de capa completa,
+  no columna por columna.
+- El pallet se cierra al llegar a `OBJETIVO_PH_PALLET` (1.4, calibrado
+  contra el rango real 1.13-1.53 del cubicaje del usuario, conservador a
+  propósito) o cuando se acaba la altura -si la altura se acaba antes,
+  se cierra igual y se abre "1 PH más" (exactamente lo que el usuario
+  autorizó).
+- [bug real encontrado y corregido durante la implementación] Un relleno
+  de una capa puede ser hasta 8cm más alto que el ancla (misma tolerancia
+  que el motor exacto) -si se avanzaba Z solo por la altura del ancla, un
+  relleno más alto terminaba con su tope por encima de donde arrancaba la
+  próxima capa, y algunos pallets se pasaban del tope de 215cm (llegaron
+  a 220-221cm) sin que nada lo detectara. Corregido: se sigue la altura
+  REAL máxima colocada en la capa, no la del ancla.
+- Garantía de "nada flota" a NIVEL DE CAPA (no caja por caja, por pedido
+  explícito del usuario): ninguna capa se construye encima de otra que no
+  llegó a `UMBRAL_COBERTURA_CAPA_MINIMO` -si no llega, el pallet se cierra
+  ahí, no se apila nada arriba de un piso insuficiente. Calibrado
+  empíricamente (0.20-0.90 probados) contra los 5 CDs reales: 20% es
+  donde los 5 caen dentro del margen ±1 del cubicaje real, y sigue siendo
+  una mejora de seguridad real frente al bug original del motor exacto
+  (fragmentos con 0% de cobertura -cajas sin nada debajo- que motivó todo
+  este trabajo). `validar_capas_ph_fraccion` audita esto de forma
+  independiente al algoritmo (mismo contrato que `validacion_v5.
+  validar_geometria_v5`).
+- Desempate dentro de una capa: categoría más baja primero (probado
+  empíricamente contra "huella más grande primero" -que sí ganaba en el
+  motor exacto- y acá rindió peor: con capas de área en vez de cuboides
+  exactos, agotar un nivel antes de mezclar el siguiente mantiene más
+  SKUs compatibles disponibles por más tiempo).
+
+### Resultado -verificado contra el cubicaje real del usuario
+```
+CD    | motor exacto (todos los fixes) | PH_FRACCION | target real (±1)
+BK31  | 5                               | 3            | 2   -> dentro del margen
+BK36  | 2                               | 2            | 2   -> exacto
+BK51  | 8                               | 5            | 4   -> dentro del margen
+BK61  | 7                               | 5            | 4   -> dentro del margen
+BK65  | 6                               | 4            | 3   -> dentro del margen
+```
+Los 5 CDs caen dentro del margen ±1 del cubicaje real (antes, 4 de 5
+quedaban fuera). Demanda exacta, 0 solapamientos, 0 excesos de altura, 0
+violaciones de cobertura mínima por capa -verificado en los 5 CDs.
+
+También mejora el dataset de referencia de esta sesión
+(`Cubicaje18.07.2026.xlsx`): 62 -> 52 pallets (75 originalmente, antes de
+cualquier fix de esta sesión), mismas garantías (0 violaciones en las 9
+CDs).
+
+### Pendiente -decisión explícita del usuario antes de conectar
+Este motor NO está conectado al pipeline todavía (`pipeline_sku_bloque.py`
+sigue llamando a `armar_pallets_bloques` de `packing_bloques.py`, el
+motor exacto). Conectar `armar_pallets_ph_fraccion` como el motor activo
+de la app es un cambio grande de comportamiento (la vista 3D/Inspector
+pasa a ser aproximada, no una verificación exacta caja por caja) -se deja
+pendiente de confirmación explícita antes de tocar `pipeline_sku_bloque.
+py`/`app.py`.
+
+### Invariantes
+- `tests/test_packing_ph_fraccion.py` (7 tests nuevos): demanda exacta,
+  0 solapamientos/overflow/exceso de altura, cobertura mínima por capa
+  (`validar_capas_ph_fraccion`), orden de categoría por capa, consolidación
+  real cuando la fracción de PH combinada lo permite, SKU geométricamente
+  imposible no bloquea el resto.
+- tests: 136 passed (suite completa, motor nuevo + todo lo anterior).
+
+---
