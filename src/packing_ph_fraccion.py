@@ -157,6 +157,8 @@ def _armar_capa(
     capacidad_cama_por_sku: dict[str, int],
     nivel_por_sku: dict[str, int],
     ph_por_caja: dict[str, float],
+    tope_pallet_por_sku: dict[str, int],
+    colocado_en_pallet: dict[str, int],
 ) -> tuple[bool, float, float, bool, int]:
     """[sección "cómo se resuelve la tensión"] Llena UNA capa (altura
     aproximada `altura_capa` -la del SKU ancla-) con layout de estantería
@@ -195,6 +197,15 @@ def _armar_capa(
     sale en `False` y el caller cierra el pallet ahí -no se apila nada
     arriba de un piso que no llegó a cubrir el mínimo real.
 
+    [bug real, reportado por el usuario con captura del Excel: SKU 22443
+    (Cielo Agua 1L) con 98 cajas en UN pallet, cuando el Maestro dice
+    `Cajas por PH`=75 -el máximo físico validado para ese SKU solo en un
+    pallet] `tope_pallet_por_sku` (de `Cajas por PH`) y `colocado_en_
+    pallet` (cuánto de cada SKU ya lleva TODO el pallet, no solo esta
+    capa -se comparte y se actualiza entre capas del mismo pallet) evitan
+    que un SKU supere ese máximo real aunque distintas capas del mismo
+    pallet sigan queriendo sumarle más.
+
     Devuelve (se_colocó_algo, ph_acumulado_en_esta_capa, altura_real_capa,
     cobertura_suficiente, nivel_máximo_usado_en_esta_capa)."""
     area_objetivo = config.PALLET_LARGO * config.PALLET_ANCHO * UMBRAL_COBERTURA_CAPA
@@ -220,6 +231,7 @@ def _armar_capa(
             and abs(por_sku[s][0].alto_caja - altura_capa) <= TOLERANCIA_ALTURA_CAPA_CM + TOL
             and por_sku[s][0].alto_caja <= presupuesto - z + TOL
             and colocado_en_capa.get(s, 0) < capacidad_cama_por_sku.get(s, float("inf"))
+            and colocado_en_pallet.get(s, 0) < tope_pallet_por_sku.get(s, float("inf"))
         ]
         if not candidatos:
             break
@@ -249,6 +261,7 @@ def _armar_capa(
         _colocar_torre(pallet, cand, x_cursor, y_cursor, z)
         pendientes[sku] -= 1
         colocado_en_capa[sku] = colocado_en_capa.get(sku, 0) + 1
+        colocado_en_pallet[sku] = colocado_en_pallet.get(sku, 0) + 1
         x_cursor += cand.largo
         fila_alto = max(fila_alto, cand.ancho)
         area_usada += cand.largo * cand.ancho
@@ -326,7 +339,16 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
     # el pipeline real) la SKU no aporta al objetivo de PH -sigue
     # colocándose igual, solo que no cuenta para decidir cuándo cerrar el
     # pallet.
+    #
+    # [bug real, reportado por el usuario con captura del Excel: SKU 22443
+    # con 98 cajas en UN pallet, cuando `Cajas por PH`=75] La MISMA columna
+    # también es el tope físico real de cuántas cajas de un SKU pueden ir
+    # en UN pallet -sea homogéneo o mezclado con otros SKUs, ese máximo no
+    # cambia (es el límite físico validado de ESE producto, no del pallet
+    # en general). `tope_pallet_por_sku` guarda el número entero (no la
+    # fracción) para aplicarlo como tope duro por pallet en `_armar_capa`.
     ph_por_caja: dict[str, float] = {}
+    tope_pallet_por_sku: dict[str, int] = {}
     if "Cajas por PH" in df_cd.columns:
         for _, fila in df_cd.drop_duplicates(subset="SKU").iterrows():
             sku = fila["SKU"]
@@ -335,6 +357,7 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
             cph = fila.get("Cajas por PH")
             if pd.notna(cph) and cph > 0:
                 ph_por_caja[sku] = 1.0 / float(cph)
+                tope_pallet_por_sku[sku] = int(cph)
 
     presupuesto = _altura_presupuesto()
 
@@ -356,6 +379,9 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
         ph_acumulado = 0.0
         nivel_min_pallet = 0
         avanzo_en_este_pallet = False
+        # [tope real por SKU, ver "sección PH real" arriba] se resetea por
+        # pallet -el máximo de `Cajas por PH` es por pallet, no global.
+        colocado_en_pallet: dict[str, int] = {}
 
         # [bug real, reportado por el usuario: pallets cerrando cortos con
         # más demanda compatible pendiente] `OBJETIVO_PH_PALLET` es un
@@ -375,6 +401,7 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
                 if pendientes[s] > 0
                 and nivel_por_sku.get(s, 0) >= nivel_min_pallet
                 and por_sku[s][0].alto_caja <= presupuesto - z + TOL
+                and colocado_en_pallet.get(s, 0) < tope_pallet_por_sku.get(s, float("inf"))
             ]
             if not activos_ancla:
                 break
@@ -394,6 +421,7 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
             coloco, ph_capa, altura_real_capa, cobertura_suficiente, nivel_max_capa = _armar_capa(
                 pallet, z, altura_capa, presupuesto, nivel_min_capa, pendientes, por_sku,
                 capacidad_cama_por_sku, nivel_por_sku, ph_por_caja,
+                tope_pallet_por_sku, colocado_en_pallet,
             )
             if not coloco:
                 break  # nada entró en esta capa -altura o geometría agotada para este pallet

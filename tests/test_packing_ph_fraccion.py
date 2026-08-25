@@ -136,6 +136,23 @@ def test_sin_cajas_por_ph_igual_arma_sin_perder_demanda():
     assert despachado == 12
 
 
+def test_ningun_sku_supera_cajas_por_ph_en_un_solo_pallet():
+    """[bug real, reportado por el usuario con captura del Excel: SKU
+    22443 (Cielo Agua de Mesa 1L) con 98 cajas en UN pallet, cuando el
+    Maestro dice `Cajas por PH`=75 -el máximo físico validado para ese SKU
+    solo en un pallet, sea homogéneo o mezclado con otros] Con demanda
+    mucho mayor a `Cajas por PH`, ningún pallet debe superar ese tope para
+    ese SKU -el remanente tiene que repartirse en otro(s) pallet(s), sin
+    perder demanda."""
+    df = pd.DataFrame([_fila("22443", 32.5, 24, 27.0, 302, cajas_por_ph=75, nivel=6)])
+    pallets = armar_pallets_ph_fraccion(df, "BK36")
+    for p in pallets:
+        cant = sum(t.cantidad for t in p.torres if t.sku == "22443")
+        assert cant <= 75, f"{p.id} tiene {cant} cajas de 22443, supera Cajas por PH=75"
+    despachado = sum(t.cantidad for p in pallets for t in p.torres)
+    assert despachado == 302
+
+
 def test_objetivo_ph_es_piso_no_techo():
     """[bug real, encontrado corriendo la app con datos reales -BK51: un
     pallet cerraba a 145cm con ph_acumulado=0.43, muy lejos de llegar al

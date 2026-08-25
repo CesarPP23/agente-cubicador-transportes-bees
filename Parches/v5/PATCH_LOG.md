@@ -2354,3 +2354,52 @@ de cobertura por capa en ambos datasets. Demanda exacta.
   en los tests sintéticos existentes antes de este patch, ambos se
   encontraron corriendo el pipeline real con datos reales del usuario.
 - Suite completa: 138 passed.
+
+---
+
+## Bug real, reportado con captura del Excel: un SKU superaba su propio
+## `Cajas por PH` dentro de un pallet mezclado
+
+El usuario revisó el Excel de salida a mano y encontró: SKU 22443 (Cielo
+Agua de Mesa sin Gas 1L) con **98 cajas en un solo pallet**, cuando el
+Maestro dice `Cajas por PH`=75 (75 = 15 cajas por cama × 5 camas por PH,
+el máximo físico validado para ese SKU armado solo). Cita textual: "ahi
+estamos infringiendo la regla de un maximo por sku unico, ahi lo que
+deberia pasar es hacer 1 pallet de 75 cajas y lo remanente que sea de
+otro sku".
+
+### Causa real
+`packing_ph_fraccion.py` usaba `Cajas por PH` SOLO para calcular la
+fracción de PH (`ph_por_caja = 1/Cajas_por_PH`, para decidir cuándo un
+pallet está "lleno" en promedio) -nunca como un tope DURO de cuántas
+cajas de ESE SKU pueden ir en UN pallet. `Cajas_Cama_Efectivo` sí se
+respetaba, pero solo POR CAPA (se resetea entre capas del mismo pallet)
+-nada impedía que el mismo SKU volviera a aparecer en varias capas del
+MISMO pallet hasta superar su propio máximo real.
+
+### Corrección
+Nuevo `tope_pallet_por_sku` (de `Cajas por PH`, el número entero, no la
+fracción) + `colocado_en_pallet` (cuánto de cada SKU ya lleva TODO el
+pallet, compartido y actualizado entre capas del mismo pallet, se
+resetea recién al abrir un pallet nuevo -el tope es por pallet, no
+global). Se aplica tanto al elegir el ancla de una capa nueva como a los
+candidatos de relleno dentro de `_armar_capa`. El remanente que no entra
+por el tope queda pendiente y compite en el/los pallet(s) siguientes,
+exactamente como pidió el usuario.
+
+### Resultado
+```
+Verificado con datos reales (ambos datasets): 0 SKUs exceden su propio
+Cajas_Por_PH en ningún pallet (antes, sin chequear directamente, no
+había garantía -este caso real lo probó).
+Dataset del usuario: sigue con los 5 CDs dentro del margen ±1, 0
+violaciones. Dataset de referencia: 50 -> 51 pallets (regresión chica y
+esperada -no se puede seguir sobre-empacando un SKU más allá de su
+máximo real, ese "ahorro" de un pallet era ilegítimo).
+```
+
+### Invariantes
+- `tests/test_packing_ph_fraccion.py::test_ningun_sku_supera_cajas_por_ph_en_un_solo_pallet`:
+  con demanda muy superior al tope (302 vs 75), ningún pallet individual
+  supera 75 cajas de ese SKU, demanda total despachada exacta.
+- tests: 139 passed (suite completa).
