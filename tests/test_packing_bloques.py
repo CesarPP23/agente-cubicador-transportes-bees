@@ -274,6 +274,42 @@ def test_consolidacion_de_remanentes_nunca_pierde_ni_duplica_demanda():
     assert validar_geometria_v5(pallets) == []
 
 
+def test_huella_grande_gana_el_empate_de_z_sobre_mas_demanda():
+    """[bug real, encontrado con datos reales del usuario -Plan_Picking_
+    Optimizado (11).xlsx, CD BK31 pallets 003+004: 76.4cm + 112.9cm,
+    sumados ~189cm, pero en pallets SEPARADOS, mismo nivel de categoría
+    (7, Comestibles) los dos] El usuario preguntó directamente por qué no
+    estaban juntos si sumados entraban. Causa real: el desempate de "cuál
+    SKU gana el mismo Z" priorizaba más demanda pendiente -eso hacía que
+    SKUs chicas de mucha demanda acapararan el piso PRIMERO mientras
+    estaba abierto, dejando a las SKUs grandes (BAT, huella 52.5x34; otras
+    de ~40x30-47) sin ningún bolsillo grande donde entrar más tarde.
+    Reproducido acá con las mismas huellas/demandas reales: SKUS chicas de
+    mucha demanda (30x30, demanda 4) compitiendo con SKUs grandes de poca
+    demanda (45x35, demanda 2) -las grandes deben conseguir lugar (huella
+    gana el empate), no quedar sin colocar."""
+    df = pd.DataFrame(
+        [
+            _fila("CHICA1", 30, 30, 18.0, 4, cajas_cama=12, nivel=7),
+            _fila("CHICA2", 30, 30, 18.0, 4, cajas_cama=12, nivel=7),
+            _fila("CHICA3", 27, 30, 16.0, 4, cajas_cama=10, nivel=7),
+            _fila("GRANDE1", 45, 35, 24.0, 2, cajas_cama=5, nivel=7),
+            _fila("GRANDE2", 42, 32, 23.5, 2, cajas_cama=8, nivel=7),
+            _fila("GRANDE3", 52.5, 34, 49.0, 2, cajas_cama=6, nivel=7),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    despachado = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    assert despachado == {"CHICA1": 4, "CHICA2": 4, "CHICA3": 4, "GRANDE1": 2, "GRANDE2": 2, "GRANDE3": 2}
+    assert validar_geometria_v5(pallets) == []
+    # todo esto debería entrar en un solo pallet, no repartirse en varios
+    # cortos -es el escenario real del usuario.
+    assert len(pallets) == 1, f"se esperaba 1 pallet, salieron {len(pallets)}: {[round(p.altura_final) for p in pallets]}"
+
+
 def test_orientacion_cae_a_la_rotada_si_la_preferida_no_entra_en_nada():
     """[bug real, encontrado con datos reales del usuario -Plan_Picking_
     Optimizado (10).xlsx, CD BK31: 5 pallets, ninguno pasaba los 170cm]

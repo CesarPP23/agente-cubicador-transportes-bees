@@ -200,9 +200,18 @@ def _empacar(
             # nivel de categoría más bajo primero (Licores antes que NABs
             # cuando ambos podrían ir igual de bajo, para que el pallet
             # tienda a formar capas limpias cuando la geometría lo permite
-            # sin forzarlo), y dentro del mismo nivel, más demanda
-            # pendiente primero (sigue concentrando el mismo SKU en capas
-            # consecutivas, como pedía el usuario).
+            # sin forzarlo), y dentro del mismo nivel, MAYOR huella
+            # primero -no más demanda primero. Verificado con datos reales
+            # (BK31, PATCH_LOG.md): priorizar demanda dejaba que SKUs
+            # chicas de mucha demanda acapararan el piso mientras estaba
+            # abierto, fragmentándolo en bolsillos angostos -las SKUs
+            # grandes (que tienen MENOS margen para encajar en cualquier
+            # lado) terminaban esperando y se quedaban sin sitio. "Piezas
+            # grandes primero" es la heurística estándar de bin-packing:
+            # colocar lo más difícil de encajar mientras todavía hay piso
+            # abierto, dejar lo chico (más flexible) para después. Empate
+            # de huella: más demanda pendiente primero (sigue concentrando
+            # el mismo SKU en capas consecutivas, como pedía el usuario).
             mejor = None
             for sku in activos:
                 tope_capa = capacidad_cama_por_sku.get(sku)
@@ -233,7 +242,8 @@ def _empacar(
                 if idx_libre is None:
                     continue
                 z_destino = pc.libres[idx_libre].z
-                clave = (z_destino, nivel_sku, -pendientes[sku])
+                area = cand.largo * cand.ancho
+                clave = (z_destino, nivel_sku, -area, -pendientes[sku])
                 if mejor is None or clave < mejor[0]:
                     mejor = (clave, sku, cand, idx_libre)
 

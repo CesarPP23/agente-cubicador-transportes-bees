@@ -2064,3 +2064,70 @@ reintentar con la otra orientación.
 - tests: 128 passed (suite completa).
 
 ---
+
+## Bug real, pregunta directa del usuario: "por qué no están en el mismo
+## pallet si sumados entran"
+
+Con el fix de orientación ya corriendo en su local, el usuario subió un
+nuevo resultado y preguntó puntualmente por CD BK31: los pallets 003
+(76.4cm) y 004 (112.9cm) suman ~189cm -entrarían juntos en el límite de
+altura- pero quedaron en pallets separados. Preguntó qué regla lo impedía.
+
+### Diagnóstico: NINGUNA regla de categoría -los dos pallets eran 100%
+### nivel 7 (Comestibles/Cigarros)
+Se reconstruyó la demanda exacta de esos dos pallets desde el propio
+archivo de salida del usuario y se corrió junta en un solo `armar_pallets_
+bloques`: el resultado fue EXACTAMENTE el mismo split (76.4 + 112.9cm) -no
+era timing del barrido (la consolidación de remanentes ya lo intenta y
+correctamente lo descartó porque no mejoraba). El problema estaba en dos
+niveles:
+
+1. Al cerrar el primer pallet reconstruido, quedaban pendientes 3 SKUs
+   grandes (BAT 52.5x34cm, dos SKUs de ~40-47cm de lado) y NINGÚN cuboide
+   libre remanente era lo bastante ancho para ninguna de las dos
+   orientaciones de ninguna de las tres -otro caso real de fragmentación
+   geométrica, no un bug de código.
+2. La causa RAÍZ de por qué el piso terminó fragmentado así: el desempate
+   de "cuál SKU gana el mismo Z" priorizaba más demanda pendiente
+   primero. Eso hacía que SKUs CHICAS de mucha demanda (ej. 30x30cm,
+   demanda 4) acapararan el piso mientras estaba abierto -ganaban el
+   empate una y otra vez sobre las SKUs GRANDES de poca demanda (BAT,
+   demanda 2), que quedaban relegadas a competir recién cuando ya casi no
+   quedaba piso libre grande. Es la heurística de bin-packing al revés:
+   lo difícil de encajar (huella grande) hay que colocarlo PRIMERO
+   mientras hay piso abierto; lo fácil (huella chica) se acomoda después
+   en lo que sobra -acá pasaba lo opuesto.
+
+### Corrección
+El desempate de "misma Z, mismo nivel" ahora prioriza mayor huella (largo
+x ancho) primero, no más demanda pendiente -la demanda pendiente pasa a
+ser el ÚLTIMO desempate (para seguir concentrando el mismo SKU en capas
+consecutivas cuando hay empate real de huella). Verificado directamente
+sobre el caso reportado: los mismos SKUs, en el mismo pallet, ahora
+alcanzan 204.8cm (20 de 24 cajas) en vez de repartirse en 76.4+112.9cm.
+
+### Resultado sobre datasets reales -segunda ronda de mejora, acumulada
+sobre el fix de orientación
+```
+Cubicaje18.07.2026.xlsx: 69 -> 62 pallets (75 originalmente, antes de
+  ambos fixes de esta sesión), altura promedio 168.5 -> 173.3cm,
+  aprovechamiento 78% -> 81%.
+Dataset completo del usuario (6 CDs, archivo (11), ya con el fix de
+  orientación aplicado): 50 -> 45 pallets, 19 -> 16 pallets bajo 170cm.
+Acumulado desde el inicio de esta ronda de optimización (archivo (10),
+  antes de cualquiera de los dos fixes): 53 -> 45 pallets, 22 -> 16 bajo
+  170cm.
+```
+0 violaciones geométricas, demanda exacta en todos los casos. Sigue
+habiendo remanentes que no llegan a 170cm (16 de 45 en el dataset del
+usuario) -no se llegó a cero, pero es una reducción real y verificada, no
+cosmética.
+
+### Invariantes
+- `tests/test_packing_bloques.py::test_huella_grande_gana_el_empate_de_z_sobre_mas_demanda`:
+  reproduce el caso real (SKUs chicas de mucha demanda vs SKUs grandes de
+  poca demanda, mismo nivel) -antes del fix hubiera dado 2+ pallets, ahora
+  se exige explícitamente 1 solo pallet, demanda exacta, 0 violaciones.
+- tests: 129 passed (suite completa).
+
+---
