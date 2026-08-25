@@ -47,14 +47,21 @@ Cómo se resuelve la tensión "aproximado pero sin flotar":
   se construye encima de una anterior que no llegó al umbral -si una capa
   no lo alcanza, el pallet se cierra ahí, no se sigue apilando arriba de
   un piso insuficiente.
-- Cada capa es de UN SOLO nivel de categoría (no se mezclan categorías
-  dentro de la misma capa como sí permite el motor exacto) -es la garantía
-  más simple y robusta de que "Licores nunca encima de NABs" se cumple
-  sin verificación columna por columna: el piso de nivel del pallet solo
-  sube, nunca baja, capa por capa completa.
-- El objetivo de fracción de PH por pallet (`OBJETIVO_PH_PALLET`) es el
-  criterio principal para cerrar un pallet -si la geometría (altura
-  disponible) se acaba antes de llegar al objetivo, se cierra igual y se
+- Una capa puede combinar VARIOS niveles de categoría (un primer intento
+  de "una sola categoría por capa" dejaba muy pocos SKUs disponibles para
+  llenarla -verificado: 24-39 pallets en vez de 2-6). El piso de nivel del
+  pallet solo sube, nunca baja -"Licores nunca encima de NABs" se cumple a
+  nivel de capa completa (no columna por columna): una vez que una capa
+  usó NABs, ninguna capa siguiente puede volver a usar Licores.
+- `OBJETIVO_PH_PALLET` (1.4, calibrado contra el cubicaje real del
+  usuario) es un PISO de referencia, NO un techo que cierre el pallet
+  apenas se alcanza -bug real encontrado con datos del usuario: cerrar ahí
+  dejaba pallets con 50-100cm de altura libre sin usar mientras quedaba
+  demanda compatible pendiente, que terminaba en otro pallet corto
+  después en vez de seguir subiendo en el mismo. El pallet sigue creciendo
+  mientras haya altura y algo compatible que colocar -`ph_acumulado` queda
+  como referencia en `pallet.metadata`, no como criterio de cierre. Si la
+  altura se acaba antes de llegar al piso de 1.4, se cierra igual y se
   abre un pallet más (el "+1 PH" que el usuario aceptó explícitamente).
 """
 import pandas as pd
@@ -198,6 +205,7 @@ def _armar_capa(
     colocado_en_capa: dict[str, int] = {}
     altura_real_capa = 0.0
     nivel_max_capa = nivel_min_capa
+    skus_disponibles: set[str] = set()
 
     guard = 0
     while area_usada < area_objetivo - TOL:
@@ -215,6 +223,7 @@ def _armar_capa(
         ]
         if not candidatos:
             break
+        skus_disponibles.update(candidatos)
 
         # [bin-packing real, verificado con datos reales -ver PATCH_LOG.md]
         # acá, a diferencia del motor exacto, categoría más baja primero
@@ -250,6 +259,18 @@ def _armar_capa(
 
     area_minima = config.PALLET_LARGO * config.PALLET_ANCHO * UMBRAL_COBERTURA_CAPA_MINIMO
     cobertura_suficiente = area_usada >= area_minima - TOL
+    if not cobertura_suficiente and len(skus_disponibles) <= 1:
+        # [bug real, reportado por el usuario: pallets cerrando cortos con
+        # más demanda compatible pendiente -caso BAT] Si en NINGÚN momento
+        # hubo más de un SKU compatible (misma altura, mismo piso de
+        # nivel) para esta capa, la cobertura baja no es una mala elección
+        # del algoritmo -es que no había con qué mejorarla (ej. el host de
+        # BAT, 49cm, mucho más alto que el resto: no tiene "compañeros" de
+        # altura compatible). Bloquear el resto del pallet por esto
+        # desperdicia altura y demanda real que sí podría combinarse en
+        # otras capas -se acepta esta capa como "lo mejor posible" y se
+        # deja seguir.
+        cobertura_suficiente = True
     return colocado_algo, ph_capa, altura_real_capa, cobertura_suficiente, nivel_max_capa
 
 
@@ -336,7 +357,18 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
         nivel_min_pallet = 0
         avanzo_en_este_pallet = False
 
-        while z < presupuesto - TOL and ph_acumulado < OBJETIVO_PH_PALLET - TOL:
+        # [bug real, reportado por el usuario: pallets cerrando cortos con
+        # más demanda compatible pendiente] `OBJETIVO_PH_PALLET` es un
+        # PISO -lo que un armador real logra en promedio-, no un TECHO. Si
+        # el loop cortara apenas `ph_acumulado` lo alcanza, un pallet con
+        # SKUs de fracción de PH alta (mucha demanda de pocos SKUs) cerraba
+        # con 50-100cm de altura libre sin usar mientras quedaba demanda
+        # compatible pendiente -esa demanda terminaba en otro pallet corto
+        # después, en vez de seguir subiendo en el mismo. El pallet sigue
+        # creciendo mientras haya altura y algo que colocar; `ph_acumulado`
+        # queda solo como referencia (metadata) de qué tan cerca o lejos
+        # quedó del promedio real.
+        while z < presupuesto - TOL:
             activos_ancla = [
                 s
                 for s in pendientes
@@ -381,6 +413,7 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
 
         if not avanzo_en_este_pallet:
             break  # nada entró en un pallet fresco -evitar loop infinito
+        pallet.metadata["ph_acumulado"] = round(ph_acumulado, 3)
         pallets.append(pallet)
 
     if sin_colocar and pallets:
@@ -399,22 +432,31 @@ def validar_capas_ph_fraccion(pallets: list[PalletV5]) -> list[str]:
     capa) y chequea que NINGUNA capa, salvo la más alta de su pallet
     (nada se apoya en ella, no hace falta que sostenga nada), quede por
     debajo de `UMBRAL_COBERTURA_CAPA_MINIMO` (el piso real de seguridad,
-    no el objetivo de llenado). Devuelve una lista de violaciones legibles
-    (vacía si todo cumple) -mismo contrato que `validacion_v5.
+    no el objetivo de llenado) -salvo que esa capa tenga un solo SKU (caso
+    real: el host de BAT, 49cm, mucho más alto que el resto -no tiene
+    "compañeros" de altura compatible, la cobertura baja no es una mala
+    elección del algoritmo, es que no había con qué mejorarla; ver
+    `_armar_capa`, mismo criterio). Devuelve una lista de violaciones
+    legibles (vacía si todo cumple) -mismo contrato que `validacion_v5.
     validar_geometria_v5`, pero para el criterio de este modo aproximado
     (a nivel de capa, no caja por caja)."""
     area_minima = config.PALLET_LARGO * config.PALLET_ANCHO * UMBRAL_COBERTURA_CAPA_MINIMO
     violaciones: list[str] = []
     for pallet in pallets:
         capas: dict[float, float] = {}
+        skus_por_capa: dict[float, set] = {}
         for t in pallet.torres:
-            capas[round(t.z, 3)] = capas.get(round(t.z, 3), 0.0) + t.largo * t.ancho
+            z_r = round(t.z, 3)
+            capas[z_r] = capas.get(z_r, 0.0) + t.largo * t.ancho
+            skus_por_capa.setdefault(z_r, set()).add(t.sku)
         if not capas:
             continue
         z_max = max(capas)
         for z, area in capas.items():
             if z == z_max:
                 continue  # la capa más alta no sostiene nada -no necesita cobertura mínima
+            if len(skus_por_capa[z]) <= 1:
+                continue  # un solo SKU disponible -no había con qué mejorar la cobertura
             if area < area_minima - TOL:
                 pct = 100 * area / (config.PALLET_LARGO * config.PALLET_ANCHO)
                 violaciones.append(

@@ -2288,3 +2288,69 @@ barato que la búsqueda de mejor cuboide libre de MaxRects).
 - Verificado manualmente con `ejecutar_desde_archivo` contra ambos
   datasets reales: demanda exacta, 0 violaciones geométricas y de
   cobertura por capa.
+
+---
+
+## PH_FRACCION: dos bugs reales más, encontrados corriendo la app de verdad
+
+El usuario corrió la app conectada (Streamlit) con su dataset real y
+mandó el resultado: seguía sin llegar a los targets ni a lo reportado
+antes, con pallets bajo 170cm. Diagnóstico con el archivo de salida real
+(no sintético):
+
+### Bug 1: `OBJETIVO_PH_PALLET` como TECHO en vez de PISO
+El loop principal cortaba un pallet apenas `ph_acumulado >= 1.4`, aunque
+quedara mucha altura libre y demanda compatible pendiente. Ejemplo real
+(BK51): un pallet cerraba a 145cm con `ph_acumulado=0.43` -bien lejos de
+1.4- porque en realidad NO fue el objetivo de PH el que lo cortó (ver bug
+2). Se corrigió igual la lectura de la intención: 1.4 es lo que un
+armador real LOGRA en promedio, no un techo que deba frenar el armado
+apenas se alcanza -el pallet ahora sigue creciendo mientras haya altura y
+demanda compatible, sin importar cuánto `ph_acumulado` ya lleve.
+`ph_acumulado` queda en `pallet.metadata` como referencia, ya no corta el
+loop.
+
+### Bug 2 -la causa real de los pallets cortos: capas de un solo SKU
+sin "compañero" de altura
+Investigando por qué el pallet de BK51 igual cortaba a 145cm después del
+fix de arriba: el host de BAT (52.5x34x49cm -mucho más alto que
+cualquier otro SKU) formaba una capa DONDE ERA EL ÚNICO CANDIDATO
+POSIBLE (nada más en el CD tiene una altura compatible dentro de la
+tolerancia de 8cm) -esa capa nunca podía llegar al 20% mínimo de
+cobertura por sí sola, y la garantía "nada flota a nivel de capa" cerraba
+TODO el pallet ahí, desperdiciando altura y demanda real que sí podía
+combinarse en otras capas.
+
+Corrección: si una capa tuvo, en TODO momento, un solo SKU disponible
+como candidato (no existía ninguna alternativa que el algoritmo pudiera
+haber usado para mejorar la cobertura), su cobertura baja no es una mala
+elección -es escasez real, y bloquear el resto del pallet por eso no
+mejora la seguridad, solo desperdicia capacidad. Se acepta esa capa como
+"lo mejor posible" y el pallet sigue. `validar_capas_ph_fraccion` se
+actualizó con el mismo criterio (no marca como violación una capa de un
+solo SKU), para no reportar como "problema" algo que la generación ya
+decidió aceptar a propósito.
+
+### Resultado -verificado con el pipeline real, ambos datasets
+```
+Dataset real del usuario (5 CDs):
+  Antes de estos 2 fixes: 20 pallets, 1 CD fuera de margen (BK51=6).
+  Después: 19 pallets, LOS 5 CDs dentro del margen ±1.
+  BK31=3(target 2) BK36=2(target 2, exacto) BK51=5(target 4)
+  BK61=5(target 4) BK65=4(target 3)
+  Pallets bajo 170cm: 4 -> 3 (uno por CD como mucho, remanente genuino).
+
+Cubicaje18.07.2026.xlsx (referencia de la sesión, 9 CDs):
+  53 -> 50 pallets. Aprovechamiento de altura promedio: 84% -> 89%.
+  Pallets bajo 170cm: 13 -> 9 (mayormente 1 por CD, remanente genuino).
+```
+0 violaciones geométricas duras (overlap/overflow/altura) y 0 violaciones
+de cobertura por capa en ambos datasets. Demanda exacta.
+
+### Invariantes
+- `tests/test_packing_ph_fraccion.py`: 2 tests nuevos
+  (`test_objetivo_ph_es_piso_no_techo`, `test_sku_alto_sin_companero_
+  no_corta_el_pallet_completo`) -ninguno de los dos bugs se manifestaba
+  en los tests sintéticos existentes antes de este patch, ambos se
+  encontraron corriendo el pipeline real con datos reales del usuario.
+- Suite completa: 138 passed.

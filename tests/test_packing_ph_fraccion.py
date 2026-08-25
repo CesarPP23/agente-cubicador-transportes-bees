@@ -136,6 +136,60 @@ def test_sin_cajas_por_ph_igual_arma_sin_perder_demanda():
     assert despachado == 12
 
 
+def test_objetivo_ph_es_piso_no_techo():
+    """[bug real, encontrado corriendo la app con datos reales -BK51: un
+    pallet cerraba a 145cm con ph_acumulado=0.43, muy lejos de llegar al
+    "techo"] Con un SKU de fracción de PH muy alta (poca huella, mucha
+    demanda por caja de PH) que por sí solo ya supera el objetivo de 1.4,
+    el pallet NO debe cerrarse ahí si sigue habiendo altura libre y
+    demanda compatible pendiente -1.4 es lo que un armador real logra en
+    PROMEDIO, no un techo que corte el armado apenas se alcanza."""
+    df = pd.DataFrame(
+        [
+            _fila("DENSO", 20, 20, 15.0, 20, cajas_por_ph=10, nivel=1),  # ph=2.0 él solo
+            _fila("COMPATIBLE", 22, 18, 15.0, 40, cajas_por_ph=1000, nivel=1),  # ph≈0, misma altura
+        ]
+    )
+    pallets = armar_pallets_ph_fraccion(df, "BK31")
+    despachado = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    # si el objetivo de PH fuera un techo, COMPATIBLE apenas entraría
+    # (DENSO solo ya llega a 2.0 PH); acá debe entrar la demanda completa
+    # porque sigue habiendo piso/altura libre para combinarla.
+    assert despachado.get("COMPATIBLE", 0) == 40
+    assert despachado.get("DENSO", 0) == 20
+
+
+def test_sku_alto_sin_companero_no_corta_el_pallet_completo():
+    """[bug real, encontrado corriendo la app con datos reales -caso BAT:
+    52.5x34x49cm, mucho más alto que cualquier otro SKU del CD] Cuando un
+    SKU es el ÚNICO candidato posible para su capa (nada más tiene una
+    altura compatible), su cobertura baja no es una mala elección del
+    algoritmo -es escasez real. No debe cortar el resto del pallet: la
+    demanda de OTRAS alturas, compatible en nivel, debe poder seguir
+    apilándose en camas propias por encima."""
+    df = pd.DataFrame(
+        [
+            _fila("ALTO_SOLO", 50, 35, 49.0, 2, cajas_por_ph=10, nivel=7),
+            _fila("NORMAL1", 30, 20, 20.0, 30, cajas_por_ph=60, nivel=7),
+            _fila("NORMAL2", 28, 22, 18.0, 30, cajas_por_ph=60, nivel=7),
+        ]
+    )
+    pallets = armar_pallets_ph_fraccion(df, "BK31")
+    despachado = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    assert despachado == {"ALTO_SOLO": 2, "NORMAL1": 30, "NORMAL2": 30}
+    # el pallet que contiene ALTO_SOLO debe seguir teniendo altura útil
+    # apilada arriba de esa capa -no debe quedar cortado justo ahí.
+    pallet_con_alto = next(p for p in pallets if any(t.sku == "ALTO_SOLO" for t in p.torres))
+    assert pallet_con_alto.altura_final > config.ALTURA_PALLET_VACIO + 49.0 + 10
+    assert validar_capas_ph_fraccion(pallets) == []
+
+
 def test_sku_geometricamente_imposible_no_bloquea_el_resto():
     df = pd.DataFrame(
         [
