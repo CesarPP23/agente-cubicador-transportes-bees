@@ -205,10 +205,31 @@ def _empacar(
             # consecutivas, como pedía el usuario).
             mejor = None
             for sku in activos:
-                cand = _mejor_orientacion_grilla(por_sku[sku])
                 tope_capa = capacidad_cama_por_sku.get(sku)
                 nivel_sku = nivel_por_sku.get(sku, 0)
+                cand = _mejor_orientacion_grilla(por_sku[sku])
                 idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
+                if idx_libre is None and len(por_sku[sku]) > 1:
+                    # [fallback de orientación] La orientación preferida
+                    # (mejor grilla) no entra en NINGÚN cuboide libre en
+                    # este momento -antes de dar por perdido este SKU en
+                    # este pallet, probar su otra orientación. Real,
+                    # verificado con datos reales: el piso se fragmenta en
+                    # bolsillos con formas que no coinciden con la
+                    # orientación preferida de una SKU, pero sí con la
+                    # rotada -preferir siempre la orientación de mejor
+                    # grilla cuando sirve (así una SKU no mezcla
+                    # orientaciones sin necesidad real, eso fragmentaba en
+                    # versiones anteriores), y solo caer a la rotada como
+                    # último recurso en vez de dejar espacio utilizable sin
+                    # usar.
+                    for alterna in por_sku[sku]:
+                        if alterna is cand:
+                            continue
+                        idx_libre = _mejor_cuboide_para_sku(pallet, pc, alterna, tope_capa, nivel_sku, nivel_por_sku)
+                        if idx_libre is not None:
+                            cand = alterna
+                            break
                 if idx_libre is None:
                     continue
                 z_destino = pc.libres[idx_libre].z
@@ -292,15 +313,18 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
 
     presupuesto = _altura_presupuesto()
 
-    # [chequeo previo] Un SKU que ni siquiera entra en un pallet VACÍO
-    # nunca va a entrar en ninguno más lleno -se marca sin_colocar ANTES de
-    # abrir pallets, para no abrir uno tras otro sin poder nunca resolverlo.
+    # [chequeo previo] Un SKU que ni siquiera entra en un pallet VACÍO en
+    # NINGUNA orientación nunca va a entrar en ninguno más lleno -se marca
+    # sin_colocar ANTES de abrir pallets, para no abrir uno tras otro sin
+    # poder nunca resolverlo. Se prueban todas las orientaciones acá (no
+    # solo la preferida) -el fallback de orientación del barrido principal
+    # puede rescatar una SKU cuya orientación de mejor grilla no entra pero
+    # la rotada sí.
     sin_colocar: dict[str, int] = {}
     for sku in list(pendientes):
         if pendientes[sku] <= 0:
             continue
-        cand = _mejor_orientacion_grilla(por_sku[sku])
-        if not _cabe_en_pallet(cand, presupuesto):
+        if not any(_cabe_en_pallet(cand, presupuesto) for cand in por_sku[sku]):
             sin_colocar[sku] = pendientes[sku]
             pendientes[sku] = 0
 

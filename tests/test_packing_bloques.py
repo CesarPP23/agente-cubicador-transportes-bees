@@ -274,6 +274,35 @@ def test_consolidacion_de_remanentes_nunca_pierde_ni_duplica_demanda():
     assert validar_geometria_v5(pallets) == []
 
 
+def test_orientacion_cae_a_la_rotada_si_la_preferida_no_entra_en_nada():
+    """[bug real, encontrado con datos reales del usuario -Plan_Picking_
+    Optimizado (10).xlsx, CD BK31: 5 pallets, ninguno pasaba los 170cm]
+    `_mejor_orientacion_grilla` fija la orientación de mejor grilla sobre
+    el pallet VACÍO -pero una vez que el piso se fragmenta, esa orientación
+    puede no entrar en NINGÚN hueco que quede, aunque la rotada sí. Acá se
+    fuerza ese escenario: GRANDE ocupa casi toda la altura del pallet
+    dejando solo una tira lateral angosta (20cm) -B (30x12) en su
+    orientación preferida (30cm de largo) no entra en la tira, pero rotada
+    (12cm de largo) sí. Antes de este fix, B se quedaba sin colocar en este
+    pallet aunque hubiera lugar real; ahora debe cambiarse a la rotada."""
+    from src.packing_columnar import _altura_presupuesto
+
+    presupuesto = _altura_presupuesto()
+    df = pd.DataFrame(
+        [
+            _fila("GRANDE", 100, 100, presupuesto - 5, 1, cajas_cama=1),
+            _fila("B", 30, 12, 20.0, 2, cajas_cama=30),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    despachado = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    assert despachado.get("B", 0) == 2, "B debería entrar rotado en la tira lateral, no quedar sin colocar"
+    assert validar_geometria_v5(pallets) == []
+
+
 def test_no_viola_geometria():
     df = pd.DataFrame(
         [

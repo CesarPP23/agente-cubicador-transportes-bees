@@ -1996,3 +1996,71 @@ cada CD. Una mejora real necesitaría la opción 2 de la sección anterior
   documentado arriba).
 
 ---
+
+## Bug real encontrado con datos del usuario: orientación fija se queda sin
+## opciones cuando el piso se fragmenta
+
+El usuario corrió la app en su local, subió un dataset real (CDs
+BK31/BK34/BK35/BK46/BK54/BK56) y reportó, con el archivo de resultado
+adjunto: **"siguen habiendo pallets por debajo de lo permitido esto no
+puede suceder solucionalo, la idea de este cubicador es tener la menor
+cantidad de pallets posibles que lleguen a las alturas optimizadas"**.
+Caso extremo: CD BK31, los 5 pallets que armó quedaban entre 39 y 161cm
+-NINGUNO llegaba ni cerca de la altura óptima (~200cm).
+
+### Diagnóstico con datos reales, no sintéticos
+Se reconstruyó exactamente la demanda de BK31 a partir del propio archivo
+de salida del usuario (hojas `Torres` + `Plan_Picking` + `Auditoria_
+Geometrica` -geometría real, niveles reales, capacidad por cama real) para
+reproducir el caso sin necesitar el Excel de entrada original. Con eso se
+pudo instrumentar el algoritmo paso a paso: al cerrar el primer pallet
+(137cm, 43 cajas), quedaban 27 SKUs con demanda pendiente y 27 cuboides
+libres con bastante altura disponible (hasta 200cm de profundidad libre en
+varios) -pero NINGUNO de esos 27 SKUs entraba en NINGÚN cuboide con su
+orientación asignada.
+
+Causa real: `_mejor_orientacion_grilla` fija UNA orientación por SKU
+calculada contra el pallet VACÍO (120x100 completo) -la de mejor
+capacidad de grilla. Eso es correcto mientras el piso esté vacío o poco
+fragmentado. Pero una vez que muchos SKUs distintos (acá, 36 SKUs
+distintos con demanda chica cada uno) fragmentan el piso en bolsillos de
+formas variadas, la orientación "óptima para el pallet completo" de un SKU
+puede no calzar en NINGÚN bolsillo que quede, mientras que la orientación
+rotada sí -y como nunca se probaba la alternativa, ese SKU quedaba
+bloqueado en este pallet aunque hubiera espacio real utilizable. Prueba
+directa: de los 27 SKUs atascados, 5 SÍ cabían con la orientación
+alternativa.
+
+### Corrección
+En `_empacar`, cuando la orientación preferida de un SKU no encuentra
+ningún cuboide libre disponible, se prueba su otra orientación antes de
+descartarlo para esta colocación -nunca al revés (la preferida sigue
+ganando siempre que sirva, así un SKU no mezcla orientaciones sin
+necesidad real, que es justamente lo que fragmentaba el espacio en
+versiones anteriores de este archivo). También se corrigió el chequeo
+previo `sin_colocar` (geometría imposible en un pallet vacío) para probar
+todas las orientaciones, no solo la preferida -evita marcar como
+imposible una SKU que sí entra rotada.
+
+### Resultado
+```
+BK31 (caso reportado por el usuario): 5 pallets (0 sobre 170cm) -> 4
+  pallets (2 sobre 170cm, incluyendo uno a 208.9cm y otro a 210.9cm).
+Cubicaje18.07.2026.xlsx (dataset de referencia de esta sesión):
+  75 -> 69 pallets, altura promedio 163.1cm -> 168.5cm.
+Dataset completo del usuario (6 CDs, reconstruido desde su propio
+  archivo de salida): 53 -> 49 pallets, 22 -> 19 pallets bajo 170cm.
+```
+0 violaciones geométricas y demanda exacta en todos los casos verificados
+-no es una relajación de ninguna regla, es una corrección real de un caso
+donde el algoritmo dejaba espacio físico utilizable sin usar por no
+reintentar con la otra orientación.
+
+### Invariantes
+- `tests/test_packing_bloques.py::test_orientacion_cae_a_la_rotada_si_la_preferida_no_entra_en_nada`:
+  caso construido a propósito (un SKU grande deja una tira lateral angosta
+  donde solo la orientación rotada de otro SKU entra) -demanda despachada
+  completa, 0 violaciones.
+- tests: 128 passed (suite completa).
+
+---
