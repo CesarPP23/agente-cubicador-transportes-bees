@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 ENVIOS_COLS = ["CD", "SKU", "Descripción", "Cajas Teóricas", "Unidades"]
-MAESTRO_COLS = ["SKU", "Categoría", "Unidades por caja", "Cajas por cama", "Camas por PH", "Cajas por PH"]
+MAESTRO_COLS = ["SKU", "Categoría", "Subcategoría", "Unidades por caja", "Cajas por cama", "Camas por PH", "Cajas por PH"]
 UMA_COLS = ["SKU", "Largo de caja", "Ancho de caja", "Alto de caja", "Peso bruto por unidad"]
 
 
@@ -16,10 +16,14 @@ def _envio(cd="BK31", sku=1, descripcion="Producto", cajas=10, unidades=None):
     }
 
 
-def _maestro(sku=1, categoria="Licores", unidades_por_caja=1, cajas_por_cama=10, camas_por_ph=5, cajas_por_ph=50):
+def _maestro(
+    sku=1, categoria="Licores", subcategoria=None, unidades_por_caja=1,
+    cajas_por_cama=10, camas_por_ph=5, cajas_por_ph=50,
+):
     return {
         "SKU": sku,
         "Categoría": categoria,
+        "Subcategoría": subcategoria,
         "Unidades por caja": unidades_por_caja,
         "Cajas por cama": cajas_por_cama,
         "Camas por PH": camas_por_ph,

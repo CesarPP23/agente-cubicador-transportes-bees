@@ -2403,3 +2403,47 @@ máximo real, ese "ahorro" de un pallet era ilegítimo).
   con demanda muy superior al tope (302 vs 75), ningún pallet individual
   supera 75 cajas de ese SKU, demanda total despachada exacta.
 - tests: 139 passed (suite completa).
+
+---
+
+## Columna `Subcategoría` en el Maestro -reemplaza el match por nombre
+## de Four Loko
+
+Pedido explícito del usuario: la regla de fragilidad de Four Loko (nivel
+de remate, nunca se le pone nada encima) tiene que aplicarse a TODA una
+subcategoría del Maestro, no solo a SKUs que se llamen literalmente
+"Four Loko". Aclaración siguiente del usuario, corrigiendo un primer
+intento con un solo valor combinado ("Energizantes y RTS"): la columna
+nueva se llama `Subcategoría` y hay que buscar en ella DOS valores por
+separado, "RTD" y "Energizante" -y ahora esa columna reemplaza por
+completo la detección por texto en la Descripción (ya no se busca "four
+loko" en ningún lado).
+
+### Cambio
+- `src/derivados.py`: se sacó el match por texto (`Descripción.str.
+  contains("four loko")`) y se reemplazó por `Subcategoría.str.strip().
+  str.casefold().isin({"rtd", "energizante"})` -case-insensitive, tolera
+  espacios. Columna opcional: si el Maestro no la trae (dataset viejo),
+  simplemente no marca nada por esta vía -no rompe nada.
+- `tests/conftest.py`: `_maestro()`/`MAESTRO_COLS` ganan el parámetro
+  `subcategoria` (default `None`) para que los tests puedan setearla.
+- `src/template.py`: columna `Subcategoría` agregada a `Maestro_SKUs`
+  -fila nueva en INSTRUCCIONES explicando los dos valores válidos ("RTD"
+  o "Energizante"), y un 4to SKU de ejemplo (1004, "Four Loko Ejemplo",
+  Subcategoría="RTD") en las 3 hojas (Envios_Julio/Maestro_SKUs/UMA) para
+  que quien abra la plantilla vea un caso de uso real, no solo la
+  instrucción en texto.
+
+### Invariantes
+- `tests/test_derivados.py`: reemplazados los tests de detección por
+  nombre por 4 tests nuevos -subcategoría "RTD" fuerza a remate aunque la
+  Categoría sea Licores, subcategoría "Energizante" también, detecta sin
+  importar mayúsculas/espacios, y (cambio de diseño explícito) un SKU
+  llamado "Four Loko" SIN la subcategoría marcada en el Maestro YA NO se
+  fuerza a remate -la fuente de verdad es el Maestro, no el nombre del
+  producto.
+- Verificado end-to-end: la plantilla descargable (`construir_template`)
+  corrida por el pipeline completo -el SKU de ejemplo Four Loko
+  (Subcategoría="RTD") sale con `Nivel_Categoria=7` en el plan de picking
+  final.
+- tests: 141 passed (suite completa).

@@ -9,14 +9,16 @@ ENVIOS_EJEMPLO = pd.DataFrame(
         {"CD": "BK31", "SKU": 1002, "Descripción": "Yogurt Ejemplo 1L", "Cajas Teóricas": 25, "Unidades": 300},
         {"CD": "BK34", "SKU": 1003, "Descripción": "Cigarro Ejemplo Cajetilla", "Cajas Teóricas": 3.5, "Unidades": 70},
         {"CD": "BK34", "SKU": 1001, "Descripción": "Ron Ejemplo 750ml 1X1", "Cajas Teóricas": 15, "Unidades": 180},
+        {"CD": "BK34", "SKU": 1004, "Descripción": "Four Loko Ejemplo 473ml 6x1", "Cajas Teóricas": 8, "Unidades": 48},
     ]
 )
 
 MAESTRO_EJEMPLO = pd.DataFrame(
     [
-        {"SKU": 1001, "Categoría": "Licores", "Unidades por caja": 12, "Cajas por cama": 20, "Camas por PH": 6, "Cajas por PH": 120},
-        {"SKU": 1002, "Categoría": "Lácteos", "Unidades por caja": 12, "Cajas por cama": 15, "Camas por PH": 7, "Cajas por PH": 105},
-        {"SKU": 1003, "Categoría": "Cigarros", "Unidades por caja": 20, "Cajas por cama": 50, "Camas por PH": 3, "Cajas por PH": 150},
+        {"SKU": 1001, "Categoría": "Licores", "Subcategoría": "", "Unidades por caja": 12, "Cajas por cama": 20, "Camas por PH": 6, "Cajas por PH": 120},
+        {"SKU": 1002, "Categoría": "Lácteos", "Subcategoría": "", "Unidades por caja": 12, "Cajas por cama": 15, "Camas por PH": 7, "Cajas por PH": 105},
+        {"SKU": 1003, "Categoría": "Cigarros", "Subcategoría": "", "Unidades por caja": 20, "Cajas por cama": 50, "Camas por PH": 3, "Cajas por PH": 150},
+        {"SKU": 1004, "Categoría": "NABs", "Subcategoría": "RTD", "Unidades por caja": 6, "Cajas por cama": 30, "Camas por PH": 4, "Cajas por PH": 120},
     ]
 )
 
@@ -25,6 +27,7 @@ UMA_EJEMPLO = pd.DataFrame(
         {"SKU": 1001, "Largo de caja": 30, "Ancho de caja": 20, "Alto de caja": 25, "Peso bruto por unidad": 0.90},
         {"SKU": 1002, "Largo de caja": 25, "Ancho de caja": 25, "Alto de caja": 15, "Peso bruto por unidad": 1.00},
         {"SKU": 1003, "Largo de caja": 35, "Ancho de caja": 25, "Alto de caja": 55, "Peso bruto por unidad": 0.05},
+        {"SKU": 1004, "Largo de caja": 22, "Ancho de caja": 15, "Alto de caja": 20, "Peso bruto por unidad": 0.40},
     ]
 )
 
@@ -37,6 +40,7 @@ INSTRUCCIONES = pd.DataFrame(
         {"Hoja": "Envios_Julio", "Columna": "Unidades", "Qué va aquí": "Demanda en unidades sueltas (informativo)."},
         {"Hoja": "Maestro_SKUs", "Columna": "SKU", "Qué va aquí": "Debe coincidir exactamente con el SKU usado en Envios_Julio y UMA."},
         {"Hoja": "Maestro_SKUs", "Columna": "Categoría", "Qué va aquí": "Una de: Licores, Lácteos, Aseo, Importados, Merch, NABs, Comestibles, Cigarros. Cualquier otro valor queda marcado como 'no clasificada' y no se apila automáticamente."},
+        {"Hoja": "Maestro_SKUs", "Columna": "Subcategoría", "Qué va aquí": "Opcional. Escribir 'RTD' o 'Energizante' en los SKUs de esas subcategorías (incluye Four Loko) para que se traten como frágiles -nunca se les pone nada encima, van al final/arriba del pallet. Dejar vacío en el resto."},
         {"Hoja": "Maestro_SKUs", "Columna": "Unidades por caja", "Qué va aquí": "Cuántas unidades sueltas trae una caja de este SKU."},
         {"Hoja": "Maestro_SKUs", "Columna": "Cajas por cama", "Qué va aquí": "Cuántas cajas de este SKU caben en una cama (capa) del pallet. Si se deja vacío o en 0, se calcula automáticamente desde las dimensiones de UMA."},
         {"Hoja": "Maestro_SKUs", "Columna": "Camas por PH", "Qué va aquí": "Cuántas camas conforman un pallet homogéneo completo de este SKU."},

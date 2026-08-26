@@ -68,16 +68,26 @@ def calcular_derivados(df: pd.DataFrame) -> pd.DataFrame:
     niveles = [config.nivel_de_categoria(c) for c in df["Categoria_Normalizada"]]
     df["Nivel_Categoria"] = pd.Series(niveles, index=df.index, dtype=object)
 
-    # [fix] SKUs frágiles identificados por texto en la Descripción (no por
-    # Categoría del Maestro -el SKU puede compartir Categoría con productos
-    # que sí soportan peso encima): se fuerza su nivel al de remate
-    # (NIVEL_REMATE, el más alto), así el armado por camas nunca coloca
-    # nada arriba -mismo mecanismo que ya usa Comestibles/Cigarros, solo que
-    # activado por nombre de producto en vez de por Categoría entera.
-    # Confirmado con el usuario: "Four Loko" es sensible a peso, se rompe.
-    es_fragil_por_nombre = df["Descripción"].astype(str).str.contains("four loko", case=False, na=False)
-    df.loc[es_fragil_por_nombre, "Nivel_Categoria"] = config.NIVEL_REMATE
+    # [fix, reemplazado por columna propia -ver abajo] SKUs frágiles: se
+    # fuerza su nivel al de remate (NIVEL_REMATE, el más alto), así el
+    # armado por camas nunca coloca nada arriba -mismo mecanismo que ya usa
+    # Comestibles/Cigarros. Confirmado con el usuario: "Four Loko" es
+    # sensible a peso, se rompe -y la misma regla aplica a TODA la
+    # subcategoría "RTD"/"Energizante" del Maestro (Four Loko pertenece a
+    # esa subcategoría, pero no es el único SKU frágil de ahí). Se detecta
+    # por la columna `Subcategoría` del Maestro (valores "RTD" o
+    # "Energizante", sin importar mayúsculas/espacios) -no por texto en la
+    # Descripción, para no depender de que el SKU se llame literalmente
+    # "Four Loko". Columna opcional -si no está en esta corrida (Maestro
+    # viejo sin la columna), no se marca nada por esta vía.
+    SUBCATEGORIAS_FRAGILES = {"rtd", "energizante"}
+    if "Subcategoría" in df.columns:
+        es_fragil = df["Subcategoría"].astype(str).str.strip().str.casefold().isin(SUBCATEGORIAS_FRAGILES)
+    else:
+        es_fragil = pd.Series(False, index=df.index)
 
-    df["Es_Categoria_Remate"] = df["Categoria_Normalizada"].isin(config.CATEGORIAS_REMATE) | es_fragil_por_nombre
+    df.loc[es_fragil, "Nivel_Categoria"] = config.NIVEL_REMATE
+
+    df["Es_Categoria_Remate"] = df["Categoria_Normalizada"].isin(config.CATEGORIAS_REMATE) | es_fragil
 
     return df

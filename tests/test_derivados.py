@@ -58,14 +58,16 @@ def test_nivel_categoria_asignado_para_categoria_estable(dataset_factory):
     assert df.iloc[0]["Nivel_Categoria"] == 1
 
 
-def test_four_loko_se_fuerza_a_nivel_remate_aunque_sea_licores(dataset_factory):
+def test_subcategoria_rtd_se_fuerza_a_nivel_remate_aunque_sea_licores(dataset_factory):
     """[fix] Four Loko es sensible al peso -confirmado con el usuario, "se
-    puede romper" si le ponen algo encima. Se identifica por texto en la
-    Descripción (no por Categoría del Maestro, que sigue siendo Licores
-    como cualquier otra lata/botella -no todo Licores es frágil así)."""
+    puede romper" si le ponen algo encima- y la misma regla aplica a TODA
+    la subcategoría "RTD"/"Energizante" del Maestro (Four Loko pertenece a
+    esa subcategoría, no es el único SKU frágil ahí). Se identifica por la
+    columna `Subcategoría` del Maestro, no por texto en la Descripción -así
+    no depende de que el SKU se llame literalmente "Four Loko"."""
     envios, maestro, uma = dataset_factory(
         envios_overrides=[{"sku": 1, "descripcion": "Four Loko Purple 473ml 6x1"}],
-        maestro_overrides=[{"sku": 1, "categoria": "Licores"}],
+        maestro_overrides=[{"sku": 1, "categoria": "Licores", "subcategoria": "RTD"}],
         uma_overrides=[{"sku": 1}],
     )
     df, _ = _derivados(envios, maestro, uma)
@@ -73,14 +75,39 @@ def test_four_loko_se_fuerza_a_nivel_remate_aunque_sea_licores(dataset_factory):
     assert bool(df.iloc[0]["Es_Categoria_Remate"]) is True
 
 
-def test_four_loko_detecta_sin_importar_mayusculas(dataset_factory):
+def test_subcategoria_energizante_tambien_se_fuerza_a_nivel_remate(dataset_factory):
     envios, maestro, uma = dataset_factory(
-        envios_overrides=[{"sku": 1, "descripcion": "FOUR LOKO Watermelon 473ml"}],
-        maestro_overrides=[{"sku": 1, "categoria": "Licores"}],
+        envios_overrides=[{"sku": 1, "descripcion": "Red Bull 250ml 24x1"}],
+        maestro_overrides=[{"sku": 1, "categoria": "NABs", "subcategoria": "Energizante"}],
         uma_overrides=[{"sku": 1}],
     )
     df, _ = _derivados(envios, maestro, uma)
     assert df.iloc[0]["Nivel_Categoria"] == config.NIVEL_REMATE
+
+
+def test_subcategoria_detecta_sin_importar_mayusculas_ni_espacios(dataset_factory):
+    envios, maestro, uma = dataset_factory(
+        envios_overrides=[{"sku": 1, "descripcion": "Four Loko Watermelon 473ml"}],
+        maestro_overrides=[{"sku": 1, "categoria": "Licores", "subcategoria": "  rtd  "}],
+        uma_overrides=[{"sku": 1}],
+    )
+    df, _ = _derivados(envios, maestro, uma)
+    assert df.iloc[0]["Nivel_Categoria"] == config.NIVEL_REMATE
+
+
+def test_four_loko_sin_subcategoria_marcada_ya_no_se_detecta_por_nombre(dataset_factory):
+    """[cambio de diseño explícito] Se reemplazó el match por texto en la
+    Descripción por la columna `Subcategoría` del Maestro -si un SKU se
+    llama "Four Loko" pero el Maestro no le marcó la subcategoría, ya NO
+    se fuerza a remate. La fuente de verdad ahora es el Maestro, no el
+    nombre del producto."""
+    envios, maestro, uma = dataset_factory(
+        envios_overrides=[{"sku": 1, "descripcion": "Four Loko Purple 473ml 6x1"}],
+        maestro_overrides=[{"sku": 1, "categoria": "Licores"}],
+        uma_overrides=[{"sku": 1}],
+    )
+    df, _ = _derivados(envios, maestro, uma)
+    assert df.iloc[0]["Nivel_Categoria"] == 1
 
 
 def test_otro_licor_no_se_marca_como_remate(dataset_factory):
