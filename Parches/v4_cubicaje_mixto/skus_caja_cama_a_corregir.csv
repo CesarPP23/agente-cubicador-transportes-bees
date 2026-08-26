@@ -1,0 +1,33 @@
+SKU,nombre,largo,ancho,caja_cama_declarado,max_estricto,max_con_sobresaliente,remedido,veredicto
+15303,Whisky Something Special 750ml 1X1,43.5,33.2,10,7,8,False,IMPOSIBLE — EXCEDE EL ÁREA
+15845,Avena 3 Ositos Clasica 100g 12x1,42.0,39.0,7,6,6,True,NO ALCANZA
+16037,Ron Havana Club Anejo Esp 1lt 1X1,18.0,54.0,11,10,10,False,NO ALCANZA
+17040,PO Napoleon Diamante Semiseco 750ml 2x1,30.0,40.0,11,10,10,False,IMPOSIBLE — EXCEDE EL ÁREA
+17314,Coca Cola 600ml 12x1,34.5,20.5,22,15,18,False,IMPOSIBLE — EXCEDE EL ÁREA
+17315,Inka Cola 600ml 12x1,34.5,20.5,22,15,18,False,IMPOSIBLE — EXCEDE EL ÁREA
+17321,Coca Cola 3lts 4x1,32.0,21.0,20,16,18,False,IMPOSIBLE — EXCEDE EL ÁREA
+17322,Inka Cola 3lts 4x1,32.0,21.0,20,16,18,False,IMPOSIBLE — EXCEDE EL ÁREA
+18176,Piscano Sour Piña Colada 700ml 1x1,36.0,26.0,14,11,13,True,NO ALCANZA
+18177,Piscano Sour Limon 700ml 1x1,36.0,26.0,14,11,13,True,NO ALCANZA
+18179,Piscano Sour Maracuya 700ml 1x1 ,36.0,26.0,14,11,13,True,NO ALCANZA
+19750,Seagrams Extra Dry Gin 750ml 1x1,22.23,36.04,20,13,15,False,IMPOSIBLE — EXCEDE EL ÁREA
+20339,Cafetal Selecto 200gr 1x1,45.0,43.0,10,4,4,True,IMPOSIBLE — EXCEDE EL ÁREA
+21885,Tabernero Sangría Cj 946Ml 1x1,49.1,15.2,18,14,16,False,IMPOSIBLE — EXCEDE EL ÁREA
+22183,Ron Hechicera Banano 700ml 1x1,35.0,24.0,84,13,15,True,IMPOSIBLE — EXCEDE EL ÁREA
+22376,Kraft Real Mayo 850g 12x1,39.53,29.528,12,10,10,False,IMPOSIBLE — EXCEDE EL ÁREA
+22380,Ballantines F True Music EJ 700ml 1x1,61.3,90.4,30,1,2,False,IMPOSIBLE — EXCEDE EL ÁREA
+22385,Lanyard con Destapador Cristal 4x1,40.0,30.0,11,10,10,True,IMPOSIBLE — EXCEDE EL ÁREA
+22386,Lanyard con Destapador Pilsen 4x1,40.0,30.0,11,10,10,True,IMPOSIBLE — EXCEDE EL ÁREA
+22388,San Cristobal Vaso Cristal 6x1,46.0,31.5,10,7,8,True,IMPOSIBLE — EXCEDE EL ÁREA
+22389,San Cristobal Vaso San Juan 6x1,46.0,31.5,10,7,8,True,IMPOSIBLE — EXCEDE EL ÁREA
+22390,San Cristobal Vaso Trujillo 6x1,46.0,31.5,10,7,8,True,IMPOSIBLE — EXCEDE EL ÁREA
+22391,San Cristobal Vaso Pilsen 6x1,46.0,31.5,10,7,8,True,IMPOSIBLE — EXCEDE EL ÁREA
+22445,KR Gaseosa Cola Negra 500ml 12x1,25.0,19.0,28,25,26,False,IMPOSIBLE — EXCEDE EL ÁREA
+22842,Tabernero Espumante Especial 750ml 1x1,36.0,27.0,12,11,11,True,NO ALCANZA
+22942,Piscano Sour Mango 700ml 1x1,36.0,26.0,14,11,13,True,NO ALCANZA
+22995,Canasta Navideña MKP 2025 Vta 1x1,40.0,33.0,12,9,9,False,IMPOSIBLE — EXCEDE EL ÁREA
+23163,Smirnoff Tamarindo 700ml + Vaso 1x1,32.0,27.0,20,12,12,False,IMPOSIBLE — EXCEDE EL ÁREA
+23305,Café Juan Valdez Ristra Tira 10gr 10x1,43.5,29.0,10,8,9,True,NO ALCANZA
+23575,Sal de Andrews Triple Accion 7.9 gr 30x1,65.5,38.5,10,3,4,False,IMPOSIBLE — EXCEDE EL ÁREA
+23581,"Elgt Tropical  ""Y dale U"" 475ml 12x1",26.0,22.5,24,19,20,False,IMPOSIBLE — EXCEDE EL ÁREA
+23582,Electrolight Surtido 475 ml 12x1,26.0,22.5,24,19,20,False,IMPOSIBLE — EXCEDE EL ÁREA

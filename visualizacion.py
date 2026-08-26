@@ -1,8 +1,10 @@
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 import config
-from models import Cama, Pallet
+from models import Cama, Pallet, PalletV5
+from src.bat import BAT_SKU_MARCADOR
 
 COLOR_CATEGORIA = {
     "Licores": "#2a78d6",
@@ -95,6 +97,97 @@ def dibujar_pallet(pallet: Pallet) -> plt.Figure:
 
     for referencia, estilo in ((config.ALTURA_TOTAL_MIN, "--"), (config.ALTURA_TOTAL_MAX, "--")):
         ax.axhline(referencia, color="#52514e", linestyle=estilo, linewidth=1)
+
+    fig.tight_layout()
+    return fig
+
+
+# ============================================================================
+# [V5-P12] Visualización 3D real de PalletV5 (torres) -DOCUMENTACION_TECNICA_V5.md
+# sección 14: "toda posición exportada debe poder verse". Reemplaza la vista
+# 2D por cama (dibujar_pallet, arriba) para el modelo columnar -una torre no
+# es una franja horizontal uniforme, tiene x/y/altura propios que la vista
+# por cama no puede representar.
+# ============================================================================
+
+COLOR_BAT = "#7a5c1e"
+COLOR_BASE_PALLET = "#c9a876"
+
+VISTAS_3D = {
+    "isometrica": (22, -60),
+    "frente": (0, -90),
+    "lateral": (0, 0),
+    "superior": (90, -90),
+}
+
+
+def _cuboide(x: float, y: float, z: float, dx: float, dy: float, dz: float) -> list[list[tuple[float, float, float]]]:
+    """Devuelve las 6 caras de una caja [x,x+dx]x[y,y+dy]x[z,z+dz] como listas
+    de vértices, listas para `Poly3DCollection`."""
+    v = [
+        (x, y, z), (x + dx, y, z), (x + dx, y + dy, z), (x, y + dy, z),
+        (x, y, z + dz), (x + dx, y, z + dz), (x + dx, y + dy, z + dz), (x, y + dy, z + dz),
+    ]
+    return [
+        [v[0], v[1], v[2], v[3]],  # piso
+        [v[4], v[5], v[6], v[7]],  # techo
+        [v[0], v[1], v[5], v[4]],  # frente
+        [v[2], v[3], v[7], v[6]],  # atrás
+        [v[1], v[2], v[6], v[5]],  # derecha
+        [v[0], v[3], v[7], v[4]],  # izquierda
+    ]
+
+
+def dibujar_pallet_v5_3d(pallet: PalletV5, info_sku: dict, vista: str = "isometrica") -> plt.Figure:
+    """[V5-P12] Dibuja un PalletV5 en 3D real: una caja por posición (x, y, z)
+    dentro de cada torre, coloreada por categoría del SKU. Las cajas BAT
+    (torre con sku `bat.BAT_SKU_MARCADOR`) se marcan con `COLOR_BAT` -no
+    tienen categoría propia, son la caja física de consolidación."""
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    elev, azim = VISTAS_3D.get(vista, VISTAS_3D["isometrica"])
+    ax.view_init(elev=elev, azim=azim)
+
+    altura_max = max(pallet.altura_final, config.ALTURA_TOTAL_MAX) + 10
+    ax.set_xlim(0, config.PALLET_LARGO)
+    ax.set_ylim(0, config.PALLET_ANCHO)
+    ax.set_zlim(0, altura_max)
+    ax.set_xlabel("Largo (cm)")
+    ax.set_ylabel("Ancho (cm)")
+    ax.set_zlabel("Altura (cm)")
+    ax.set_title(f"{pallet.id} — {pallet.altura_final:.1f} cm — {pallet.estado}", fontsize=9, color=COLOR_TEXTO)
+
+    base = _cuboide(0, 0, 0, config.PALLET_LARGO, config.PALLET_ANCHO, config.ALTURA_PALLET_VACIO)
+    ax.add_collection3d(Poly3DCollection(base, facecolor=COLOR_BASE_PALLET, edgecolor=COLOR_BORDE, linewidths=0.5, alpha=0.9))
+
+    categorias_presentes = set()
+    z0 = config.ALTURA_PALLET_VACIO
+    for torre in pallet.torres:
+        es_bat = torre.sku == "__BAT__"
+        categoria = None if es_bat else info_sku.get(torre.sku, {}).get("categoria")
+        color = COLOR_BAT if es_bat else COLOR_CATEGORIA.get(categoria, COLOR_DEFECTO)
+        categorias_presentes.add("BAT (consolidación)" if es_bat else (categoria or "Sin categoría"))
+
+        if torre.placements:
+            for placement in torre.placements:
+                caras = _cuboide(placement.x, placement.y, z0 + placement.z, placement.largo, placement.ancho, placement.alto)
+                ax.add_collection3d(Poly3DCollection(caras, facecolor=color, edgecolor="white", linewidths=0.4, alpha=0.95))
+        else:
+            # Sin placements individuales (ej. torres BAT armadas por caja
+            # completa): se dibuja la torre entera como un solo bloque.
+            caras = _cuboide(torre.x, torre.y, z0 + torre.z, torre.largo, torre.ancho, torre.altura)
+            ax.add_collection3d(Poly3DCollection(caras, facecolor=color, edgecolor="white", linewidths=0.4, alpha=0.95))
+
+        etiqueta = "BAT" if es_bat else str(torre.sku)
+        ax.text(
+            torre.x + torre.largo / 2, torre.y + torre.ancho / 2, z0 + torre.z + torre.altura + 2,
+            f"{etiqueta}\nx{torre.cantidad}", ha="center", va="bottom", fontsize=6, color=COLOR_TEXTO,
+        )
+
+    handles = [patches.Patch(facecolor=(COLOR_BAT if c.startswith("BAT") else COLOR_CATEGORIA.get(c, COLOR_DEFECTO)), label=c) for c in sorted(categorias_presentes)]
+    if handles:
+        ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.05), ncol=min(len(handles), 4), fontsize=7, frameon=False)
 
     fig.tight_layout()
     return fig

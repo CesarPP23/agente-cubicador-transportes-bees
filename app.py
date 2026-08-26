@@ -4,7 +4,7 @@ from src.exportar import exportar_workbook
 from src.pipeline import ejecutar_pipeline
 from src.template import construir_template
 from src.validacion import cargar_hojas
-from visualizacion import dibujar_cama, dibujar_pallet
+from visualizacion import VISTAS_3D, dibujar_cama, dibujar_pallet, dibujar_pallet_v5_3d
 
 st.set_page_config(page_title="Agente Cubicador", layout="wide")
 
@@ -92,33 +92,60 @@ with tab_inspector:
     if not pallets:
         st.warning("No se generaron pallets.")
     else:
+        v5_por_id = {p.id: p for p in resultado.pallets_v5} if resultado.pallets_v5 else {}
+
         cds = sorted({p.cd for p in pallets})
         cd_elegido = st.selectbox("Centro de Distribución", cds)
         pallets_cd = [p for p in pallets if p.cd == cd_elegido]
         ids_pallet = [p.id for p in pallets_cd]
         id_elegido = st.selectbox("Pallet", ids_pallet)
         pallet = next(p for p in pallets_cd if p.id == id_elegido)
+        pallet_v5 = v5_por_id.get(id_elegido)
 
-        columna_pallet, columna_cama = st.columns([1, 1.4])
+        if pallet_v5 is not None:
+            columna_vista, columna_torres = st.columns([1, 1.4])
 
-        with columna_pallet:
-            st.caption("Vista apilada del pallet, por nivel de categoría (base → remate)")
-            if pallet.camas:
-                st.pyplot(dibujar_pallet(pallet))
-            else:
-                st.info("Este pallet es homogéneo o no tiene camas con geometría detallada.")
+            with columna_vista:
+                vista = st.selectbox("Vista", list(VISTAS_3D.keys()), index=0)
+                st.pyplot(dibujar_pallet_v5_3d(pallet_v5, resultado.info_sku, vista=vista))
 
-        with columna_cama:
-            if pallet.camas:
-                indices = list(range(len(pallet.camas)))
-                indice = st.selectbox(
-                    "Cama a inspeccionar",
-                    indices,
-                    format_func=lambda i: f"Cama {i + 1} — {'/'.join(pallet.camas[i].categorias)}",
-                )
-                st.pyplot(dibujar_cama(pallet.camas[indice], resultado.info_sku))
-            else:
-                st.info("Sin detalle 2D disponible para pallets homogéneos.")
+            with columna_torres:
+                st.caption(f"{len(pallet_v5.torres)} torres — ocupación XY {pallet_v5.ocupacion_xy:.0%}")
+                filas = [
+                    {
+                        "SKU": "BAT" if t.sku == "__BAT__" else t.sku,
+                        "x": t.x, "y": t.y, "cantidad": t.cantidad,
+                        "altura_torre": round(t.altura, 1),
+                        "orientación": t.orientacion,
+                        "fuente_geometría": t.fuente_geometria,
+                    }
+                    for t in pallet_v5.torres
+                ]
+                st.dataframe(filas, use_container_width=True)
+                estabilidad = pallet_v5.metadata.get("estabilidad")
+                if estabilidad is not None:
+                    st.caption(f"Estabilidad: {', '.join(estabilidad.estados)}")
+        else:
+            columna_pallet, columna_cama = st.columns([1, 1.4])
+
+            with columna_pallet:
+                st.caption("Vista apilada del pallet, por nivel de categoría (base → remate)")
+                if pallet.camas:
+                    st.pyplot(dibujar_pallet(pallet))
+                else:
+                    st.info("Este pallet es homogéneo o no tiene camas con geometría detallada.")
+
+            with columna_cama:
+                if pallet.camas:
+                    indices = list(range(len(pallet.camas)))
+                    indice = st.selectbox(
+                        "Cama a inspeccionar",
+                        indices,
+                        format_func=lambda i: f"Cama {i + 1} — {'/'.join(pallet.camas[i].categorias)}",
+                    )
+                    st.pyplot(dibujar_cama(pallet.camas[indice], resultado.info_sku))
+                else:
+                    st.info("Sin detalle 2D disponible para pallets homogéneos.")
 
 st.divider()
 buffer = exportar_workbook(resultado)

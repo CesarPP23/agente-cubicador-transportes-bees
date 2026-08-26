@@ -2,6 +2,7 @@ import pandas as pd
 
 import config
 from models import LogEntry
+from src.derivados import calcular_peso_caja
 
 
 def cargar_hojas(ruta_o_buffer):
@@ -94,7 +95,7 @@ def validar_y_limpiar(envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataF
     df = df[~(dim_invalida | alto_invalido)].copy()
 
     # V6 — peso por caja dentro de un rango sano
-    peso_caja = df["Peso bruto por unidad"] * df["Unidades por caja"]
+    peso_caja = calcular_peso_caja(df["Peso bruto por unidad"], df["Unidades por caja"])
     fuera_rango = peso_caja.isna() | (peso_caja < config.PESO_CAJA_MIN) | (peso_caja > config.PESO_CAJA_MAX)
     df["Peso_No_Validable"] = fuera_rango
     for _, fila in df[fuera_rango].iterrows():
