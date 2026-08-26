@@ -12,7 +12,7 @@ from src.packing_ph_fraccion import armar_pallets_ph_fraccion, validar_capas_ph_
 from src.validacion_v5 import validar_geometria_v5
 
 
-def _fila(sku, largo, ancho, alto, cantidad, cajas_por_ph=None, cd="BK31", nivel=None):
+def _fila(sku, largo, ancho, alto, cantidad, cajas_por_ph=None, cd="BK31", nivel=None, categoria=None):
     fila = {
         "SKU": sku, "CD": cd, "Cajas_Remanente": cantidad,
         "Largo_Efectivo": largo, "Ancho_Efectivo": ancho, "Alto_Efectivo": alto,
@@ -22,6 +22,8 @@ def _fila(sku, largo, ancho, alto, cantidad, cajas_por_ph=None, cd="BK31", nivel
         fila["Cajas por PH"] = cajas_por_ph
     if nivel is not None:
         fila["Nivel_Categoria"] = nivel
+    if categoria is not None:
+        fila["Categoria_Normalizada"] = categoria
     return fila
 
 
@@ -221,3 +223,99 @@ def test_sku_geometricamente_imposible_no_bloquea_el_resto():
     for p in pallets:
         sin_colocar.update(p.metadata.get("sin_colocar", {}))
     assert sin_colocar.get("IMPOSIBLE") == 5
+
+
+# --- llenado de huecos (pedido explícito del usuario: rellenar el espacio
+# que sobra con Comestibles/Aseo/Cigarros/NABs, acostándolos si hace falta
+# -NABs siempre de pie) --------------------------------------------------
+
+def _dataset_con_hueco_real(categoria_relleno="Aseo"):
+    """GRANDE (120x100 de huella real, footprint 35x100) deja SIEMPRE una
+    tira de 15cm de ancho (120 - 3*35) sin usar, de piso a techo -ninguna
+    de las 2 orientaciones "de pie" de RELLENO entra ahí (25x20 o 20x25,
+    ambas > 15cm de largo), pero acostada sí (10x25, con el Alto_Efectivo
+    de 20 como una de las dos dimensiones del piso)."""
+    return pd.DataFrame(
+        [
+            _fila("GRANDE", 35, 100, 20.0, 300, cajas_por_ph=30, nivel=1, categoria="Licores"),
+            _fila(
+                "RELLENO", 25, 20, 10.0, 40, cajas_por_ph=200,
+                nivel=config.nivel_de_categoria(categoria_relleno) or config.NIVEL_REMATE,
+                categoria=categoria_relleno,
+            ),
+        ]
+    )
+
+
+def test_llenado_de_huecos_coloca_relleno_acostado_donde_de_pie_no_entra():
+    df = _dataset_con_hueco_real("Aseo")
+    pallets = armar_pallets_ph_fraccion(df, "BK31")
+    torres_relleno = [t for p in pallets for t in p.torres if t.sku == "RELLENO"]
+    assert torres_relleno, "RELLENO debería entrar en la tira que GRANDE deja libre"
+    assert any("acostado" in t.orientacion for t in torres_relleno), (
+        "RELLENO solo entra en la tira angosta acostado -ninguna orientación de pie calza"
+    )
+    assert validar_geometria_v5(pallets) == []
+
+
+def test_llenado_de_huecos_reduce_pallets_totales_frente_a_no_rellenar():
+    """El hallazgo central: sin relleno, RELLENO necesitaría sus propios
+    pallets aparte; con relleno, se cuela en el espacio que ya sobraba de
+    GRANDE -el total de cajas despachadas de RELLENO tiene que salir
+    IGUAL, pero coexistiendo en los mismos pallets que GRANDE."""
+    df = _dataset_con_hueco_real("Aseo")
+    pallets = armar_pallets_ph_fraccion(df, "BK31")
+    despachado = {}
+    for p in pallets:
+        for t in p.torres:
+            despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
+    assert despachado.get("GRANDE", 0) == 300
+    assert despachado.get("RELLENO", 0) == 40
+    # RELLENO tiene que aparecer en pallets que TAMBIÉN tienen GRANDE (se
+    # coló en el hueco, no abrió pallet propio) al menos una vez.
+    mixtos = [p for p in pallets if {"GRANDE", "RELLENO"} <= {t.sku for t in p.torres}]
+    assert mixtos, "RELLENO debería compartir al menos un pallet con GRANDE"
+
+
+def test_nabs_nunca_se_coloca_acostado_en_el_llenado_de_huecos():
+    """[pedido explícito del usuario] Comestibles/Aseo/Cigarros pueden
+    acostarse para llenar huecos -NABs NUNCA, siempre de pie, aunque una
+    orientación acostada calzara mejor en el hueco disponible."""
+    df = _dataset_con_hueco_real("NABs")
+    pallets = armar_pallets_ph_fraccion(df, "BK31")
+    torres_relleno = [t for p in pallets for t in p.torres if t.sku == "RELLENO"]
+    for t in torres_relleno:
+        assert "acostado" not in t.orientacion, f"NABs (RELLENO) quedó acostado: {t.orientacion}"
+
+
+def test_llenado_de_huecos_no_afecta_categorias_fuera_de_la_lista_autorizada():
+    """Solo Comestibles/Aseo/Cigarros/NABs son relleno autorizado -un SKU
+    de Licores o Lácteos con espacio libre disponible NO debe colarse en
+    el hueco de otro pallet (eso cambiaría el orden de armado normal, que
+    ya decide dónde va cada categoría no-relleno)."""
+    df = pd.DataFrame(
+        [
+            _fila("GRANDE", 35, 100, 20.0, 300, cajas_por_ph=30, nivel=1, categoria="Licores"),
+            _fila("OTRO_LICOR", 25, 20, 10.0, 40, cajas_por_ph=200, nivel=1, categoria="Licores"),
+        ]
+    )
+    pallets = armar_pallets_ph_fraccion(df, "BK31")
+    torres_otro = [t for p in pallets for t in p.torres if t.sku == "OTRO_LICOR"]
+    assert not any("acostado" in t.orientacion for t in torres_otro), (
+        "OTRO_LICOR no es categoría de relleno autorizada, no debería acostarse"
+    )
+
+
+def test_llenado_de_huecos_respeta_tope_de_cajas_por_ph():
+    """El tope real de `Cajas por PH` sigue aplicando aunque la colocación
+    venga del llenado de huecos, no del armado principal."""
+    df = pd.DataFrame(
+        [
+            _fila("GRANDE", 35, 100, 20.0, 300, cajas_por_ph=30, nivel=1, categoria="Licores"),
+            _fila("RELLENO", 25, 20, 10.0, 500, cajas_por_ph=5, nivel=6, categoria="Aseo"),
+        ]
+    )
+    pallets = armar_pallets_ph_fraccion(df, "BK31")
+    for p in pallets:
+        cant = sum(t.cantidad for t in p.torres if t.sku == "RELLENO")
+        assert cant <= 5, f"{p.id} tiene {cant} de RELLENO, supera Cajas por PH=5"
