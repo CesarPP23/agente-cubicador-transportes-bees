@@ -77,6 +77,67 @@ def generar_torres_candidatas(
     return candidatas
 
 
+def generar_torres_candidatas_todas_orientaciones(
+    df_cd: pd.DataFrame, altura_max_producto: float
+) -> list[TorreCandidate]:
+    """[llenado de huecos -pedido explícito del usuario] Como
+    `generar_torres_candidatas`, pero para cada SKU genera las 6
+    orientaciones posibles (cualquiera de las 3 dimensiones de la caja
+    puede quedar vertical, con las otras dos en cualquier orden en el
+    plano XY) -no solo las 2 "de pie" (Alto_Efectivo siempre vertical).
+    Uso exclusivo del relleno de huecos: SKUs de Comestibles/Aseo/
+    Cigarros pueden acostarse/voltearse para aprovechar espacios
+    irregulares; NABs NUNCA usa esta función -siempre va de pie (usar
+    `generar_torres_candidatas` normal para esos)."""
+    candidatas: list[TorreCandidate] = []
+    col_cantidad = "Cajas_Remanente" if "Cajas_Remanente" in df_cd.columns else "Cajas_Teoricas_Redondeadas"
+
+    for _, row in df_cd.iterrows():
+        cantidad_disponible = int(row[col_cantidad]) if pd.notna(row[col_cantidad]) else 0
+        if cantidad_disponible <= 0:
+            continue
+
+        largo, ancho, alto = row.get("Largo_Efectivo"), row.get("Ancho_Efectivo"), row.get("Alto_Efectivo")
+        if pd.isna(largo) or pd.isna(ancho) or pd.isna(alto) or alto <= 0:
+            continue
+
+        peso_unitario = row.get("Peso_Caja") or 0.0
+        fuente = row.get("Fuente_Geometria", "")
+        sku, cd = row["SKU"], row["CD"]
+
+        combinaciones = [
+            (largo, ancho, alto, "L×A(de pie)"),
+            (ancho, largo, alto, "A×L(de pie)"),
+            (largo, alto, ancho, "L×H(acostado)"),
+            (alto, largo, ancho, "H×L(acostado)"),
+            (ancho, alto, largo, "A×H(acostado)"),
+            (alto, ancho, largo, "H×A(acostado)"),
+        ]
+        vistos: set[tuple[float, float, float]] = set()
+        for l, a, h, ori in combinaciones:
+            # cajas con dimensiones iguales entre sí (ej. cuadradas en
+            # planta, o un cubo) generan combinaciones idénticas -evita
+            # duplicar candidatas que no aportan nada nuevo.
+            clave = (round(l, 6), round(a, 6), round(h, 6))
+            if clave in vistos:
+                continue
+            vistos.add(clave)
+
+            max_vert = max(int(altura_max_producto // h), 0)
+            if max_vert <= 0:
+                continue
+
+            candidatas.append(
+                TorreCandidate(
+                    sku=sku, cd=cd, orientacion=ori, largo=l, ancho=a, alto_caja=h,
+                    max_cajas_verticales=max_vert, cantidad_disponible=cantidad_disponible,
+                    peso_unitario=peso_unitario, fuente_geometria=fuente,
+                )
+            )
+
+    return candidatas
+
+
 def crear_torre(
     candidata: TorreCandidate, x: float, y: float, cantidad: int, z: float = 0.0
 ) -> Torre:

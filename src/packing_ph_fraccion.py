@@ -63,13 +63,44 @@ Cómo se resuelve la tensión "aproximado pero sin flotar":
   como referencia en `pallet.metadata`, no como criterio de cierre. Si la
   altura se acaba antes de llegar al piso de 1.4, se cierra igual y se
   abre un pallet más (el "+1 PH" que el usuario aceptó explícitamente).
+
+[llenado de huecos -pedido explícito del usuario con foto de un pallet a
+213cm de altura con una franja entera vacía a un costado] El layout de
+estantería por capas deja huecos reales cuando el ancho de un SKU no
+divide parejo el piso de 120x100 (ej. cajas de 33cm de largo: entran 3 en
+fila, sobra una tira de 21cm que ningún SKU compatible en altura llegaba
+a usar). Después de que un pallet ya llegó a su altura óptima con el
+armado normal, `_llenar_huecos_pallet` reaprovecha el motor 3D EXACTO de
+`packing_columnar.py` (`_reconstruir_en_construccion`, el mismo MaxRects
+verificado libre de cajas flotando) para encontrar esos huecos REALES
+-ya no aproximados por área, sino la geometría exacta reconstruida desde
+las torres que ya existen- y rellenarlos con SKUs de Comestibles/Aseo/
+Cigarros/NABs. Los primeros tres pueden acostarse/voltearse en cualquiera
+de sus 6 orientaciones (`torres.generar_torres_candidatas_todas_
+orientaciones`) para aprovechar huecos irregulares -NABs SIEMPRE va de
+pie (2 orientaciones nomás, igual que el resto del armado), pedido
+explícito del usuario. Reusa `packing_bloques._mejor_cuboide_para_sku`
+(mismo chequeo de tope por capa y de orden de categoría que ya está
+probado) -no se reimplementa esa lógica.
 """
 import pandas as pd
 
 import config
 from models import PalletV5, Torre
-from src.packing_columnar import _altura_presupuesto, _area_union_xy
-from src.torres import TorreCandidate, crear_torre, generar_torres_candidatas
+from src.packing_bloques import _mejor_cuboide_para_sku
+from src.packing_columnar import _altura_presupuesto, _area_union_xy, _reconstruir_en_construccion
+from src.torres import (
+    TorreCandidate,
+    crear_torre,
+    generar_torres_candidatas,
+    generar_torres_candidatas_todas_orientaciones,
+)
+
+# [llenado de huecos] Categorías que el usuario autorizó explícitamente
+# como relleno de espacios sobrantes -no todas las categorías, solo estas
+# 4. NABs siempre de pie; las otras 3 pueden usar cualquier orientación.
+CATEGORIAS_RELLENO_HUECOS = {"Comestibles", "Aseo", "Cigarros", "NABs"}
+CATEGORIAS_RELLENO_FLEXIBLE = CATEGORIAS_RELLENO_HUECOS - {"NABs"}
 
 TOL = 1e-6
 
@@ -287,6 +318,74 @@ def _armar_capa(
     return colocado_algo, ph_capa, altura_real_capa, cobertura_suficiente, nivel_max_capa
 
 
+def _llenar_huecos_pallet(
+    pallet: PalletV5,
+    pendientes: dict[str, int],
+    por_sku_flexible: dict[str, list[TorreCandidate]],
+    por_sku_de_pie: dict[str, list[TorreCandidate]],
+    categoria_por_sku: dict[str, str],
+    nivel_por_sku: dict[str, int],
+    capacidad_cama_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    colocado_en_pallet: dict[str, int],
+    ph_por_caja: dict[str, float],
+) -> float:
+    """[llenado de huecos, ver docstring del módulo] Un pallet YA armado
+    (llegó a su altura óptima con el barrido normal) puede tener huecos
+    reales -el layout de estantería no siempre tesela perfecto. Acá se
+    reconstruye el espacio libre EXACTO (no aproximado) a partir de las
+    torres que ya existen, y se rellena con SKUs de `CATEGORIAS_RELLENO_
+    HUECOS` -NABs solo de pie, el resto en cualquier orientación- hasta que
+    no entre nada más. Nunca cambia lo que ya estaba colocado, solo agrega.
+
+    Devuelve la fracción de PH agregada (referencia, no afecta ninguna
+    decisión -el pallet ya está "cerrado" cuando se llama a esto)."""
+    pc = _reconstruir_en_construccion(pallet)
+    ph_extra = 0.0
+
+    guard = 0
+    while True:
+        guard += 1
+        if guard > 20_000:
+            break
+        mejor = None  # (clave, sku, cand, idx_libre)
+        for sku, categoria in categoria_por_sku.items():
+            if categoria not in CATEGORIAS_RELLENO_HUECOS:
+                continue
+            if pendientes.get(sku, 0) <= 0:
+                continue
+            if colocado_en_pallet.get(sku, 0) >= tope_pallet_por_sku.get(sku, float("inf")):
+                continue
+            candidatas = por_sku_de_pie.get(sku) if categoria == "NABs" else por_sku_flexible.get(sku)
+            if not candidatas:
+                continue
+            nivel_sku = nivel_por_sku.get(sku, 0)
+            tope_capa = capacidad_cama_por_sku.get(sku)
+            for cand in candidatas:
+                idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
+                if idx_libre is None:
+                    continue
+                # [mismo criterio que "desempate por huella grande" del
+                # armado principal] el hueco más grande primero -si un SKU
+                # chico lo llena, otro más grande que hubiera cabido ahí
+                # se queda sin espacio después.
+                volumen_cand = cand.largo * cand.ancho * cand.alto_caja
+                clave = -volumen_cand
+                if mejor is None or clave < mejor[0]:
+                    mejor = (clave, sku, cand, idx_libre)
+
+        if mejor is None:
+            break
+
+        _, sku, cand, idx_libre = mejor
+        pc.colocar(cand, 1, idx_libre)
+        pendientes[sku] -= 1
+        colocado_en_pallet[sku] = colocado_en_pallet.get(sku, 0) + 1
+        ph_extra += ph_por_caja.get(sku, 0.0)
+
+    return ph_extra
+
+
 def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None) -> list[PalletV5]:
     """[PH_FRACCION] Punto de entrada. Reemplaza a `armar_pallets_bloques`
     (packing_bloques.py, motor geométrico exacto) para acercarse a la
@@ -332,6 +431,27 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
             nivel_por_sku[sku] = int(nivel) if pd.notna(nivel) else config.NIVEL_REMATE
     for sku in por_sku:
         nivel_por_sku.setdefault(sku, config.NIVEL_REMATE)
+
+    # [llenado de huecos] Categoría real (no el Nivel_Categoria numérico)
+    # de cada SKU -para saber cuáles son candidatas a rellenar huecos
+    # (Comestibles/Aseo/Cigarros/NABs, `CATEGORIAS_RELLENO_HUECOS`) y
+    # cuáles de esas pueden acostarse/voltearse (todas menos NABs).
+    categoria_por_sku: dict[str, str] = {}
+    if "Categoria_Normalizada" in df_cd.columns:
+        for _, fila in df_cd.drop_duplicates(subset="SKU").iterrows():
+            sku = fila["SKU"]
+            if sku not in por_sku:
+                continue
+            categoria = fila.get("Categoria_Normalizada")
+            if pd.notna(categoria):
+                categoria_por_sku[sku] = categoria
+
+    df_flexible = df_cd[df_cd["SKU"].isin(
+        [s for s, c in categoria_por_sku.items() if c in CATEGORIAS_RELLENO_FLEXIBLE]
+    )] if "Categoria_Normalizada" in df_cd.columns else df_cd.iloc[0:0]
+    por_sku_flexible: dict[str, list[TorreCandidate]] = {}
+    for c in generar_torres_candidatas_todas_orientaciones(df_flexible, config.ALTURA_PRODUCTO_MAX):
+        por_sku_flexible.setdefault(c.sku, []).append(c)
 
     # [sección "PH real"] Fracción de un PH que representa CADA caja de un
     # SKU -`Cajas por PH` real del Maestro, "comprobado físicamente
@@ -441,6 +561,19 @@ def armar_pallets_ph_fraccion(df_cd: pd.DataFrame, cd: str, contador: list[int] 
 
         if not avanzo_en_este_pallet:
             break  # nada entró en un pallet fresco -evitar loop infinito
+
+        # [llenado de huecos, ver docstring del módulo] El pallet ya llegó
+        # a su altura óptima con el barrido normal -antes de darlo por
+        # terminado, se reaprovecha el motor 3D exacto para encontrar los
+        # huecos reales que hayan quedado (el layout de estantería no
+        # tesela perfecto) y rellenarlos con Comestibles/Aseo/Cigarros/
+        # NABs. Reduce `pendientes` en el proceso -menos demanda para los
+        # pallets siguientes de este mismo CD.
+        ph_acumulado += _llenar_huecos_pallet(
+            pallet, pendientes, por_sku_flexible, por_sku, categoria_por_sku,
+            nivel_por_sku, capacidad_cama_por_sku, tope_pallet_por_sku, colocado_en_pallet, ph_por_caja,
+        )
+
         pallet.metadata["ph_acumulado"] = round(ph_acumulado, 3)
         pallets.append(pallet)
 
