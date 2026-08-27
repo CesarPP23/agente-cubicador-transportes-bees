@@ -2593,3 +2593,77 @@ demanda exacta en ambos datasets.
   reales: 100.0% de cobertura de soporte exacta, 0 violaciones
   geométricas, demanda exacta, 0 NABs acostados.
 - tests: 150 passed (suite completa).
+
+---
+
+## Investigación de los pallets peor aprovechados -motivada por fotos
+## reales de cubicaje sin ningún espacio libre
+
+El usuario mandó 2 fotos de camiones reales (CD Chanchamayo) con pallets
+sin ningún hueco -varios SKUs distintos combinados, capas completamente
+llenas. Se investigó la distribución REAL de ocupación XY del motor
+(no solo el promedio) para encontrar dónde estaba la brecha concreta.
+
+### Diagnóstico: la mediana ya es buena, el problema es una cola específica
+Sobre `Cubicaje18.07.2026.xlsx`: mediana de ocupación XY 88.8% (la
+MAYORÍA de los pallets ya está razonablemente cerca del estándar de las
+fotos), pero 6 pallets quedaban por debajo del 50% -y los 6 eran pallets
+dedicados SOLO a BAT (Cigarros consolidado) con 1-6 cajas.
+
+Causa real: Cigarros/BAT tiene el nivel de categoría más alto
+(`NIVEL_CIGARROS`, ver fix anterior) -eso significa que SIEMPRE pierde el
+desempate de prioridad mientras cualquier otro SKU de nivel más bajo
+todavía tenga dónde ir. Medido directamente: en cada CD afectado, el
+pallet más alto ya usaba prácticamente el 100% del presupuesto de altura (199.5-200.0 de 200.1cm) ANTES de que a BAT le
+tocara competir -sin margen real, sin importar que BAT tuviera demanda
+pendiente. BAT terminaba abriendo su propio pallet nuevo, donde ya no
+había nada más con qué competir.
+
+### Intento 1: redistribuir después de armar (`_redistribuir_dispersos`)
+Reutiliza el motor exacto (`_reconstruir_en_construccion`) para intentar
+mover las torres de un pallet muy vacío al espacio libre real de los
+pallets YA armados del mismo CD, respetando los mismos topes y el mismo
+orden de categoría. No encontró lugar en ningún caso -los pallets
+hermanos ya estaban a 199.5-200.0cm, sin los 49cm que Cigarros necesita.
+Se deja en el código (no hace daño, podría ayudar en datasets con más
+margen de altura disponible) pero no resolvió este caso.
+
+### Intento 2: reservar altura durante el armado (parcial)
+Mientras haya demanda pendiente de Cigarros, se descartan colocaciones de
+CUALQUIER OTRO nivel que dejarían menos margen de altura que lo que
+Cigarros necesita -con una válvula de escape: si respetar la reserva no
+deja NINGUNA colocación válida (ni para Cigarros ni para nadie), se
+descarta la reserva antes que desperdiciar altura sin ayudar a nadie.
+
+Resultado: mejoró 2 de 7 CDs (BK68, SJ86 ya no tienen pallet BAT-only),
+pero 5 siguen igual. Causa de que no alcance del todo: la reserva solo
+protege el PRESUPUESTO DE ALTURA restante, no la FORMA (ancho x
+profundidad) del hueco que queda -si lo que sobra en esos últimos
+centímetros no tiene el ancho que la caja de BAT (52.5x34cm) necesita, ni
+BAT ni nadie puede usarlo, y la válvula de escape lo libera de todas
+formas. Reservar también la posición XY exacta sería un cambio bastante
+más invasivo (equivale a apartar una región fija desde el principio del
+armado) para un beneficio acotado -no se implementó sin decisión
+explícita del usuario.
+
+### Resultado
+```
+Cubicaje18.07.2026.xlsx: 65 -> 64 pallets (aprovechamiento 78% -> 80%).
+Dataset del usuario: 27 -> 26 pallets.
+0 violaciones geométricas, demanda exacta en ambos -ninguna garantía se
+relajó, es una mejora real aunque parcial.
+```
+
+### Pendiente (no implementado, decisión del usuario)
+Cerrar el 100% de este caso puntual (BAT/Cigarros con muy poca demanda
+quedando solo) requeriría reservar una región XY específica desde el
+inicio del armado de un pallet, no solo un presupuesto de altura -un
+cambio más invasivo para un beneficio acotado (~5 pallets de 64 en el
+dataset de referencia).
+
+### Invariantes
+- Suite completa corrida contra ambos datasets reales tras cada intento:
+  0 violaciones, demanda exacta.
+- tests: 150 passed (sin tests nuevos en esta sección -el mecanismo se
+  verificó contra datos reales, no sintéticos; los tests existentes de
+  `test_packing_bloques.py` siguen pasando sin cambios).

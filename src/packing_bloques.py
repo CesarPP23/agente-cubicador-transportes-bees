@@ -95,7 +95,12 @@ import pandas as pd
 
 import config
 from models import PalletV5
-from src.packing_columnar import _altura_presupuesto, _PalletEnConstruccion
+from src.packing_columnar import (
+    _altura_presupuesto,
+    _area_union_xy,
+    _PalletEnConstruccion,
+    _reconstruir_en_construccion,
+)
 from src.torres import TorreCandidate, generar_torres_candidatas, generar_torres_candidatas_todas_orientaciones
 
 TOL = 1e-6
@@ -195,13 +200,14 @@ def _empacar(
     capacidad_cama_por_sku: dict[str, int],
     nivel_por_sku: dict[str, int],
     tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
     cd: str,
     contador: list[int],
 ) -> list[PalletV5]:
-    """[secciones 1-4, 7] Un barrido completo del algoritmo de camas sobre
-    `pendientes` -extraído aparte para poder invocarlo más de una vez sobre
-    distintos subconjuntos de demanda (ver sección 5, consolidación de
-    remanentes) sin duplicar la lógica de armado."""
+    """[secciones 1-4, 7, 8] Un barrido completo del algoritmo de camas
+    sobre `pendientes` -extraído aparte para poder invocarlo más de una vez
+    sobre distintos subconjuntos de demanda (ver sección 5, consolidación
+    de remanentes) sin duplicar la lógica de armado."""
     pallets: list[PalletV5] = []
 
     while any(v > 0 for v in pendientes.values()):
@@ -250,47 +256,85 @@ def _empacar(
             # abierto, dejar lo chico (más flexible) para después. Empate
             # de huella: más demanda pendiente primero (sigue concentrando
             # el mismo SKU en capas consecutivas, como pedía el usuario).
-            mejor = None
-            for sku in activos:
-                tope_capa = capacidad_cama_por_sku.get(sku)
-                nivel_sku = nivel_por_sku.get(sku, 0)
-                # [sección 6] Entre las candidatas "de pie" (siempre existen
-                # -son las mismas 2 de siempre) se elige la preferida por
-                # mejor grilla; las "acostado" (si las hay, solo en
-                # categorías flexibles) quedan como fallback más abajo -de
-                # pie siempre gana primero cuando sirve, acostado es último
-                # recurso, no la opción por defecto.
-                de_pie = [c for c in por_sku[sku] if "de pie" in c.orientacion] or por_sku[sku]
-                cand = _mejor_orientacion_grilla(de_pie)
-                idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
-                if idx_libre is None and len(por_sku[sku]) > 1:
-                    # [fallback de orientación] La orientación preferida
-                    # (mejor grilla) no entra en NINGÚN cuboide libre en
-                    # este momento -antes de dar por perdido este SKU en
-                    # este pallet, probar sus otras orientaciones (la otra
-                    # "de pie", y para categorías flexibles también las 4
-                    # "acostado"). Real, verificado con datos reales: el
-                    # piso se fragmenta en bolsillos con formas que no
-                    # coinciden con la orientación preferida de una SKU,
-                    # pero sí con otra -preferir siempre la de mejor grilla
-                    # cuando sirve (así una SKU no mezcla orientaciones sin
-                    # necesidad real, eso fragmentaba en versiones
-                    # anteriores), y solo caer a las demás como último
-                    # recurso en vez de dejar espacio utilizable sin usar.
-                    for alterna in por_sku[sku]:
-                        if alterna is cand:
-                            continue
-                        idx_libre = _mejor_cuboide_para_sku(pallet, pc, alterna, tope_capa, nivel_sku, nivel_por_sku)
-                        if idx_libre is not None:
-                            cand = alterna
-                            break
-                if idx_libre is None:
-                    continue
-                z_destino = pc.libres[idx_libre].z
-                area = cand.largo * cand.ancho
-                clave = (z_destino, nivel_sku, -area, -pendientes[sku])
-                if mejor is None or clave < mejor[0]:
-                    mejor = (clave, sku, cand, idx_libre)
+            # [sección 8, reserva de altura real para Cigarros -caso real:
+            # pallets BAT/Cigarros con 1-6 cajas solas en su propio pallet,
+            # porque el resto del contenido ya usaba TODA la altura
+            # disponible (hasta 200.0 de 200.1cm) antes de que a Cigarros
+            # le tocara competir. Cigarros SIEMPRE tiene que quedar
+            # apoyado sobre todo lo demás (nunca al revés) -eso significa
+            # que solo puede usar el margen de altura que sobre DESPUÉS de
+            # acomodar el resto, así que si el resto se lo gasta todo,
+            # Cigarros nunca tiene dónde ir. Mientras haya demanda
+            # pendiente de Cigarros, se reserva su propia altura -SKUs de
+            # cualquier otro nivel no pueden colocarse si eso invade esa
+            # reserva (Cigarros mismo nunca la invade, es SU reserva)."]
+            altura_reservada_cigarros = 0.0
+            skus_cigarros_pendientes = [
+                s for s in activos if nivel_por_sku.get(s, 0) == config.NIVEL_CIGARROS
+            ]
+            if skus_cigarros_pendientes:
+                altura_reservada_cigarros = max(por_sku[s][0].alto_caja for s in skus_cigarros_pendientes)
+
+            def _buscar_mejor(respetar_reserva: bool):
+                mejor_local = None
+                for sku in activos:
+                    tope_capa = capacidad_cama_por_sku.get(sku)
+                    nivel_sku = nivel_por_sku.get(sku, 0)
+                    # [sección 6] Entre las candidatas "de pie" (siempre existen
+                    # -son las mismas 2 de siempre) se elige la preferida por
+                    # mejor grilla; las "acostado" (si las hay, solo en
+                    # categorías flexibles) quedan como fallback más abajo -de
+                    # pie siempre gana primero cuando sirve, acostado es último
+                    # recurso, no la opción por defecto.
+                    de_pie = [c for c in por_sku[sku] if "de pie" in c.orientacion] or por_sku[sku]
+                    cand = _mejor_orientacion_grilla(de_pie)
+                    idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
+                    if idx_libre is None and len(por_sku[sku]) > 1:
+                        # [fallback de orientación] La orientación preferida
+                        # (mejor grilla) no entra en NINGÚN cuboide libre en
+                        # este momento -antes de dar por perdido este SKU en
+                        # este pallet, probar sus otras orientaciones (la otra
+                        # "de pie", y para categorías flexibles también las 4
+                        # "acostado"). Real, verificado con datos reales: el
+                        # piso se fragmenta en bolsillos con formas que no
+                        # coinciden con la orientación preferida de una SKU,
+                        # pero sí con otra -preferir siempre la de mejor grilla
+                        # cuando sirve (así una SKU no mezcla orientaciones sin
+                        # necesidad real, eso fragmentaba en versiones
+                        # anteriores), y solo caer a las demás como último
+                        # recurso en vez de dejar espacio utilizable sin usar.
+                        for alterna in por_sku[sku]:
+                            if alterna is cand:
+                                continue
+                            idx_libre = _mejor_cuboide_para_sku(pallet, pc, alterna, tope_capa, nivel_sku, nivel_por_sku)
+                            if idx_libre is not None:
+                                cand = alterna
+                                break
+                    if idx_libre is None:
+                        continue
+                    z_destino = pc.libres[idx_libre].z
+                    if (
+                        respetar_reserva
+                        and altura_reservada_cigarros > TOL
+                        and nivel_sku != config.NIVEL_CIGARROS
+                        and presupuesto - (z_destino + cand.alto_caja) < altura_reservada_cigarros - TOL
+                    ):
+                        continue  # invadiría la reserva de altura de Cigarros -descartar esta colocación
+                    area = cand.largo * cand.ancho
+                    clave = (z_destino, nivel_sku, -area, -pendientes[sku])
+                    if mejor_local is None or clave < mejor_local[0]:
+                        mejor_local = (clave, sku, cand, idx_libre)
+                return mejor_local
+
+            mejor = _buscar_mejor(respetar_reserva=True)
+            if mejor is None and altura_reservada_cigarros > TOL:
+                # [sección 8, válvula de escape] Respetar la reserva no dejó
+                # NINGUNA colocación válida -si ni Cigarros puede usar ese
+                # margen (o no hay Cigarros disponible ahora mismo por otra
+                # razón, ej. su propio tope_capa), reservarlo igual solo
+                # desperdicia altura sin ayudar a nadie. Se reintenta sin la
+                # reserva -progreso real gana sobre una reserva que no sirve.
+                mejor = _buscar_mejor(respetar_reserva=False)
 
             if mejor is None:
                 break  # nada entra ya en este pallet, ni siquiera más arriba
@@ -306,6 +350,104 @@ def _empacar(
         pallets.append(pallet)
 
     return pallets
+
+
+def _recalcular_metricas_pallet(pallet: PalletV5) -> None:
+    """Recalcula `altura_final`/`peso_estimado`/`ocupacion_xy`/`volumen_
+    utilizado` desde cero a partir de `pallet.torres` -necesario después de
+    sacarle torres a un pallet a mano (ver `_redistribuir_dispersos`), ya
+    que `_PalletEnConstruccion.colocar` solo actualiza estas métricas de
+    forma incremental para el pallet que RECIBE una torre, no para el que
+    la pierde."""
+    if not pallet.torres:
+        pallet.altura_final = 0.0
+        pallet.peso_estimado = 0.0
+        pallet.ocupacion_xy = 0.0
+        pallet.volumen_utilizado = 0.0
+        return
+    pallet.altura_final = config.ALTURA_PALLET_VACIO + max(t.z + t.altura for t in pallet.torres)
+    pallet.peso_estimado = sum(t.peso for t in pallet.torres)
+    area_ocupada = _area_union_xy(pallet.torres)
+    pallet.ocupacion_xy = round(area_ocupada / (config.PALLET_LARGO * config.PALLET_ANCHO), 4)
+    pallet.volumen_utilizado = round(sum(t.area_base * t.altura for t in pallet.torres), 2)
+
+
+# [sección 8, redistribución de dispersos] Un pallet por debajo de este
+# umbral de ocupación XY es candidato a vaciarse hacia los pallets ya
+# armados del mismo CD -ver `_redistribuir_dispersos`.
+UMBRAL_OCUPACION_DISPERSO = 0.5
+
+
+def _redistribuir_dispersos(
+    pallets: list[PalletV5],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+) -> list[PalletV5]:
+    """[sección 8, caso real: pallets BAT/Cigarros con 1-6 cajas solas en
+    su propio pallet -reportado por el usuario con fotos de cubicaje real
+    sin ningún espacio libre] Un SKU de nivel alto (Cigarros/BAT, siempre
+    el último en la prioridad de armado) puede perder la competencia por
+    espacio en TODOS los pallets ya cerrados -no porque no hubiera lugar
+    real, sino porque siempre pierde el desempate mientras algo de nivel
+    más bajo todavía tuviera dónde ir- y terminar solo, en su propio
+    pallet casi vacío, recién cuando ya no queda nada más con qué competir.
+
+    Antes de aceptar un pallet muy vacío (`UMBRAL_OCUPACION_DISPERSO`), se
+    intenta mover cada una de sus torres al espacio libre REAL (MaxRects
+    reconstruido, `_reconstruir_en_construccion` -mismo motor exacto, sin
+    relajar ninguna garantía) de los demás pallets YA armados del mismo
+    CD, respetando los mismos topes (`Cajas_Cama_Efectivo`, `Cajas por
+    PH`) y el mismo orden de categoría que el armado original. Si TODAS
+    sus torres encuentran lugar, el pallet disperso desaparece entero; si
+    solo algunas, se queda con lo que no entró en ningún lado."""
+    dispersos = [
+        p for p in pallets
+        if p.torres and (p.ocupacion_xy or 0) < UMBRAL_OCUPACION_DISPERSO
+    ]
+    if not dispersos:
+        return pallets
+
+    ids_dispersos = {id(p) for p in dispersos}
+    destinos = [p for p in pallets if id(p) not in ids_dispersos]
+    if not destinos:
+        return pallets  # no hay a dónde mover nada
+
+    resultado = list(destinos)
+    for disperso in dispersos:
+        torres_restantes = []
+        for t in disperso.torres:
+            nivel_sku = nivel_por_sku.get(t.sku, config.NIVEL_REMATE)
+            tope_capa = capacidad_cama_por_sku.get(t.sku)
+            tope_pallet = tope_pallet_por_sku.get(t.sku)
+            cand = TorreCandidate(
+                sku=t.sku, cd=t.cd, orientacion=t.orientacion, largo=t.largo, ancho=t.ancho,
+                alto_caja=t.alto_caja, max_cajas_verticales=t.cantidad, cantidad_disponible=t.cantidad,
+                peso_unitario=(t.peso / t.cantidad if t.cantidad else 0.0), fuente_geometria=t.fuente_geometria,
+            )
+            movida = False
+            for destino in destinos:
+                if tope_pallet is not None:
+                    ya_en_destino = sum(tt.cantidad for tt in destino.torres if tt.sku == t.sku)
+                    if ya_en_destino + t.cantidad > tope_pallet:
+                        continue
+                pc = _reconstruir_en_construccion(destino)
+                idx_libre = _mejor_cuboide_para_sku(destino, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
+                if idx_libre is None:
+                    continue
+                pc.colocar(cand, t.cantidad, idx_libre)
+                movida = True
+                break
+            if not movida:
+                torres_restantes.append(t)
+
+        if torres_restantes:
+            disperso.torres = torres_restantes
+            _recalcular_metricas_pallet(disperso)
+            resultado.append(disperso)
+        # si se movieron todas, el disperso no se agrega -desaparece.
+
+    return resultado
 
 
 # [sección 5] Un pallet por debajo de este umbral (fracción del
@@ -409,7 +551,9 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
             sin_colocar[sku] = pendientes[sku]
             pendientes[sku] = 0
 
-    pallets = _empacar(pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, cd, contador)
+    pallets = _empacar(
+        pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, cd, contador
+    )
 
     # [sección 5] Consolidación de remanentes: los pallets que quedaron muy
     # cortos se deshacen y se reempacan juntos -si mejora (menos pallets),
@@ -424,12 +568,20 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
             for t in p.torres:
                 pendientes_residual[t.sku] = pendientes_residual.get(t.sku, 0) + t.cantidad
         reempacados = _empacar(
-            pendientes_residual, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, cd, contador
+            pendientes_residual, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+            presupuesto, cd, contador,
         )
         if len(reempacados) >= len(cortos):
             break  # no mejoró -se descarta el intento, se conserva lo que ya había
         ids_cortos = {id(p) for p in cortos}
         pallets = [p for p in pallets if id(p) not in ids_cortos] + reempacados
+
+    # [sección 8] Después del barrido y la consolidación, algunos SKUs de
+    # nivel alto y poca demanda (típicamente Cigarros/BAT) pueden haber
+    # quedado solos en su propio pallet casi vacío -se intenta repartirlos
+    # en el espacio libre real de los pallets ya armados antes de
+    # aceptarlos como pallets aparte.
+    pallets = _redistribuir_dispersos(pallets, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku)
 
     if sin_colocar and pallets:
         pallets[-1].metadata["sin_colocar"] = sin_colocar
