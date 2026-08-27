@@ -40,41 +40,56 @@ Arquitectura (corregida):
    SKU ya existen a esa misma Z exacta en el pallet -si ya se alcanzó el
    cupo ahí, ese cuboide se descarta para ese SKU (pero sigue disponible
    para cualquier otro).
-4. [reescrito -pedido explícito del usuario: "primero todos los licores...
-   la siguiente cama deberia ser de lacteos o nabs"] Se reemplazó la
-   competencia simultánea por nivel (todas las categorías mezclándose
-   libremente, con nivel solo como desempate) por 4 BANDAS estrictamente
-   secuenciales (`_banda_de_sku`): banda 1 Licores, banda 2 Lácteos,
-   banda 3 NABs, banda 4 "remanente" (Aseo, Importados, Merch,
-   Comestibles, Cigarros -y cualquier SKU forzado a nivel remate por
-   Subcategoría RTD/Energizante, ver derivados.py- mezclados libremente
-   entre sí). La banda es el PRIMER criterio de la competencia por
-   cuboide libre (antes de la Z), así que una banda menor SIEMPRE gana
-   sobre una mayor mientras tenga algún lugar disponible, por lejano que
-   sea -eso agota Licores en la práctica antes de que Lácteos empiece a
-   colocarse, sin necesitar una pasada separada ni resetear el estado 3D.
-   Dentro de la MISMA banda (en particular banda 4, remanente) las
-   categorías compiten en igualdad de condiciones -ninguna es "más alta"
-   que otra- y SÍ pueden compartir la misma cama, incluso apiladas una
-   sobre otra. Cigarros dejó de ser un caso especial "siempre lo más
-   alto" (pedido explícito: "ya no es obligatorio que sea lo más alto");
-   es un miembro más de la banda remanente. La única restricción física
-   que sigue vigente por columna es que nada quede apoyado DIRECTAMENTE
-   encima de soporte de una banda mayor (`_soporte_viola_banda`) -en la
-   práctica esto ya casi nunca se dispara entre bandas 1-3 (el orden
-   estricto ya lo evita de por sí) y nunca se dispara dentro de la banda
-   4 (misma banda, nunca es "mayor" que sí misma).
-4b. [alto compartido en la banda remanente -pedido explícito: "categorias
-   disntinas si pueden compartir la misma cama siempre y cuando en alto
-   tambien sea compartido"] Cuando la banda 4 arma una cama mezclando
-   categorías distintas, una caja nueva solo entra en una Z donde ya hay
-   otras cajas de la banda remanente si su alto coincide (dentro de
-   `TOLERANCIA_ALTURA_CAMA_CM`) con el de TODO lo que ya está ahí -evita
-   camas con perfiles dispares (una caja bajita al lado de una alta dejan
-   un hueco que nadie más aprovecha). Las bandas 1-3 (una sola categoría
-   cada una: Licores/Lácteos/NABs) no llevan esta restricción -la regla,
-   tal como la pidió el usuario, es específica de mezclar categorías
-   distintas en el remanente.
+4. [segunda reescritura -pedido explícito del usuario tras revisar el
+   cubicaje real: "primero se tiene que acabar toda la demanda de licor
+   por sku luego pasar a las siguientes categorias y que nunca puede ir
+   una caja de licor encima de otra categoria porque pesa mucho, pero si
+   puede ir 1 caja de nabs o de importados sobre licor"] Se había
+   probado, un rato antes en la misma sesión, una versión con 4 BANDAS
+   estrictamente secuenciales donde Licores/Lácteos/NABs nunca compartían
+   cama entre sí -pero al cruzar esa regla contra un pallet real
+   (`Plan de acción 24.08 - CUBICADO - ELIAN.xlsx`, BK34 pallet 1) se
+   encontraron Licores, Comestibles, Aseo y NABs todos mezclados en el
+   MISMO pallet, y 19 de 21 SKUs con demanda menor a su propio
+   `Cajas por cama` (cada SKU ocupa como mucho un par de camas propias,
+   compartiendo piso con los demás sin que se agote una categoría antes
+   de tocar otra). Eso descartó la exclusividad de cama por banda.
+   Lo que SÍ sigue siendo cierto, y es lo que pidió el usuario, es una
+   jerarquía de PESO/soporte -no de "quién se coloca primero en el
+   tiempo", sino de "quién puede quedar apoyado sobre quién": Licores
+   (más pesado) nunca puede quedar apoyado sobre otra categoría, pero
+   categorías más livianas (NABs, Importados, etc.) sí pueden apoyarse
+   sobre Licores. Esto es exactamente `config.nivel_de_categoria`
+   (Licores=1 el más bajo/pesado, subiendo hasta Cigarros=8 -mismo mapa
+   que ya usa el resto del sistema para reportes), usado como chequeo de
+   soporte por columna (`_soporte_viola_nivel`): una caja nunca puede
+   quedar apoyada DIRECTAMENTE encima de soporte de un nivel MAYOR al
+   suyo. [corregido -bug real, ver PATCH_LOG.md] El nivel NO es el primer
+   criterio de la competencia por cuboide libre -eso le hacía ganar a
+   Licores por una Z mucho más alta (su propia columna) en vez de dejar
+   que otras categorías usaran una Z más baja real, contradiciendo "cama
+   por cama, fila por fila" y, con N pallets fijos, perdiendo hasta 30%
+   de la demanda. La Z sigue siendo el primer criterio; el nivel solo
+   desempata "por sku" cuando dos SKUs podrían usar la MISMA Z.
+   Cigarros/BAT y cualquier SKU forzado a nivel remate por Subcategoría
+   RTD/Energizante (ver derivados.py) se recortan a `config.NIVEL_REMATE`
+   acá mismo -no
+   siguen subiendo hasta `NIVEL_CIGARROS`- para que ya no sea "siempre lo
+   más alto obligatorio" (pedido explícito, sigue vigente), sino un
+   miembro más del grupo de remate, en igualdad de condiciones con
+   Comestibles.
+4b. [alto compartido entre categorías distintas -pedido explícito:
+   "categorias disntinas si pueden compartir la misma cama siempre y
+   cuando en alto tambien sea compartido"] Una caja nueva solo entra en
+   una Z donde ya hay cajas de OTRA categoría si su alto coincide (dentro
+   de `TOLERANCIA_ALTURA_CAMA_CM`) con el de TODO lo que ya está puesto
+   ahí -evita camas con perfiles dispares. Esto NO le exige a una sola
+   caja igualar la altura de otra sola caja: el motor exacto arma cada
+   columna caja por caja, así que si una SKU de 30cm de alto comparte piso
+   con otra de 15cm, la de 15cm sencillamente sigue apilando una segunda
+   caja encima de la primera (a su propia Z, no la Z compartida original)
+   hasta emparejar los 30cm -son 2 Z distintas, este chequeo nunca las ve
+   como "la misma cama" y no se dispara entre ellas.
 5. [consolidación de remanentes] El barrido de arriba es voraz: abre un
    pallet nuevo apenas queda algo pendiente, así que SKUs de baja demanda
    que se van agotando de a poco (su tope por capa, o su compatibilidad de
@@ -131,11 +146,7 @@ que PH_FRACCION perseguía sin sacrificar la garantía exacta, se le agregan
    mismo CD. `_redistribuir_dispersos` intenta, después del barrido
    principal, mover cada torre de un pallet muy vacío al espacio libre
    real de los demás pallets del CD antes de aceptarlo como pallet
-   aparte. [se retiró acá la reserva de altura dedicada para Cigarros que
-   existió en una versión anterior de este archivo: dejó de tener sentido
-   en cuanto Cigarros pasó a ser un miembro más de la banda remanente
-   (sección 4) en vez del único SKU que siempre pierde la competencia por
-   nivel -ver PATCH_LOG.md, sección "reescritura de bandas".]
+   aparte.
 """
 import pandas as pd
 
@@ -156,47 +167,13 @@ TOL = 1e-6
 # entra acá: siempre de pie (mismas 2 orientaciones que el resto).
 CATEGORIAS_ORIENTACION_FLEXIBLE = {"Comestibles", "Aseo", "Cigarros"}
 
-# [sección 4] Bandas estrictamente secuenciales -concepto propio de este
-# armador, DISTINTO de `config.Nivel_Categoria` (que sigue existiendo tal
-# cual para reportes/exports). 1-3 son de una sola categoría cada una; 4
-# agrupa todo lo que antes competía "por nivel" al final (Aseo,
-# Importados, Merch, Comestibles, Cigarros, y cualquier SKU forzado a
-# nivel remate por Subcategoría RTD/Energizante -ver derivados.py).
-BANDA_LICORES = 1
-BANDA_LACTEOS = 2
-BANDA_NABS = 3
-BANDA_REMANENTE = 4
-
-_BANDA_POR_CATEGORIA_ESTRICTA = {
-    "Licores": BANDA_LICORES,
-    "Lácteos": BANDA_LACTEOS,
-    "NABs": BANDA_NABS,
-}
-
 # [sección 4b] Tolerancia de alto entre cajas de categorías distintas que
-# comparten una misma cama dentro de la banda remanente -pedido explícito
-# del usuario ("categorias disntinas si pueden compartir la misma cama
-# siempre y cuando en alto tambien sea compartido"). Mismo valor (8cm) ya
-# calibrado contra datos reales en una versión anterior de este armador
-# (con 3cm, ~91% de pallets quedaban parciales; con 8cm, ~76%).
+# comparten una misma cama -pedido explícito del usuario ("categorias
+# disntinas si pueden compartir la misma cama siempre y cuando en alto
+# tambien sea compartido"). Mismo valor (8cm) ya calibrado contra datos
+# reales en una versión anterior de este armador (con 3cm, ~91% de
+# pallets quedaban parciales; con 8cm, ~76%).
 TOLERANCIA_ALTURA_CAMA_CM = 8.0
-
-
-def _banda_de_sku(categoria: str | None, nivel_categoria_original: float | None) -> int:
-    """[sección 4] Deriva la banda de armado a partir de la categoría real
-    del SKU y su `Nivel_Categoria` original (calculado por
-    `config.nivel_de_categoria`/`derivados.py`, que YA sabe distinguir un
-    SKU forzado a nivel remate por Subcategoría RTD/Energizante -ej. Four
-    Loko, que es categoría Licores pero remate por regla de negocio- de
-    uno que es remate por ser Comestibles/Cigarros de verdad). Cualquier
-    SKU cuyo nivel original ya sea "remate o más" (`config.NIVEL_REMATE`,
-    o `config.NIVEL_CIGARROS` para Cigarros/BAT) cae en la banda remanente
-    sin importar su categoría textual -así Four Loko no vuelve a colarse
-    en la banda de Licores solo porque su Categoria_Normalizada diga
-    "Licores"."""
-    if nivel_categoria_original is not None and nivel_categoria_original >= config.NIVEL_REMATE:
-        return BANDA_REMANENTE
-    return _BANDA_POR_CATEGORIA_ESTRICTA.get(categoria, BANDA_REMANENTE)
 
 
 def _cabe_en_pallet(cand: TorreCandidate, presupuesto: float) -> bool:
@@ -208,20 +185,21 @@ def _cabe_en_pallet(cand: TorreCandidate, presupuesto: float) -> bool:
     return cols > 0 and filas > 0 and cand.alto_caja <= presupuesto + TOL
 
 
-def _soporte_viola_banda(
+def _soporte_viola_nivel(
     pallet: PalletV5, x: float, y: float, largo: float, ancho: float, z: float,
-    banda_sku: int, banda_por_sku: dict[str, int],
+    nivel_sku: int, nivel_por_sku: dict[str, int],
 ) -> bool:
     """[sección 4] Por columna física: una caja nunca puede quedar apoyada
-    DIRECTAMENTE encima de otra de una banda mayor (ej. Licores sobre
-    NABs). En z=0 (piso del pallet) no hay restricción. Para z>0, se
-    identifican las torres que son el soporte real e inmediato de esta
+    DIRECTAMENTE encima de otra de un nivel MAYOR (ej. Licores, nivel 1,
+    nunca sobre NABs, nivel 6) -pedido explícito: "nunca puede ir una caja
+    de licor encima de otra categoria porque pesa mucho, pero si puede ir
+    1 caja de nabs o de importados sobre licor". En z=0 (piso del pallet)
+    no hay restricción -cualquier categoría puede arrancar ahí. Para z>0,
+    se identifican las torres que son el soporte real e inmediato de esta
     huella (mismo criterio que la validación anti-flotación: tope de esas
     torres exactamente en `z`, huella que se solapa) -si CUALQUIERA de esas
-    torres de soporte pertenece a una banda mayor a la que se está por
-    colocar, es una violación. Dentro de la banda remanente (4) esto nunca
-    se dispara entre sí mismas (4 > 4 es falso) -ahí la única restricción
-    de mezcla es `_altura_compatible_con_cama`."""
+    torres de soporte pertenece a un nivel MAYOR al que se está por
+    colocar, es una violación."""
     if z <= TOL:
         return False
     for t in pallet.torres:
@@ -231,25 +209,28 @@ def _soporte_viola_banda(
             continue
         if t.y + t.ancho <= y + TOL or y + ancho <= t.y + TOL:
             continue
-        if banda_por_sku.get(t.sku, 0) > banda_sku:
+        if nivel_por_sku.get(t.sku, 0) > nivel_sku:
             return True
     return False
 
 
-def _altura_compatible_con_cama(pallet: PalletV5, z: float, alto_caja: float, banda_sku: int) -> bool:
-    """[sección 4b] Solo restringe la banda remanente (4), y solo por
-    ENCIMA del piso del pallet (z>0): distintas categorías SI pueden
-    compartir una misma cama, pero solo si sus altos coinciden (dentro de
-    `TOLERANCIA_ALTURA_CAMA_CM`) con TODO lo que ya hay puesto exactamente
-    en esa Z. En el piso (z=0) no se restringe -mezclar ahí SKUs de alturas
-    bien distintas es exactamente lo que el fix de "huella grande gana el
-    empate" (ver PATCH_LOG.md) ya demostró que hace falta con datos reales
-    (una SKU grande tipo BAT, 49cm, compartiendo piso con SKUs chicas de
-    18-24cm) -y coincide con las fotos de cubicaje real del usuario, donde
-    botellas de alturas distintas conviven en la misma base sin ningún
-    problema. Bandas 1-3 (una sola categoría cada una) tampoco llevan esta
-    restricción en ningún caso."""
-    if banda_sku != BANDA_REMANENTE or z <= TOL:
+def _altura_compatible_con_cama(pallet: PalletV5, z: float, alto_caja: float) -> bool:
+    """[sección 4b] Por encima del piso del pallet (z>0): una caja nueva
+    solo entra en una Z donde ya hay otras cajas si su alto coincide
+    (dentro de `TOLERANCIA_ALTURA_CAMA_CM`) con TODO lo que ya está puesto
+    exactamente ahí -evita camas con perfiles dispares. En el piso (z=0)
+    no se restringe -mezclar ahí SKUs de alturas bien distintas es
+    exactamente lo que el fix de "huella grande gana el empate" (ver
+    PATCH_LOG.md) ya demostró que hace falta con datos reales (una SKU
+    grande tipo BAT, 49cm, compartiendo piso con SKUs chicas de 18-24cm)
+    -y coincide con las fotos de cubicaje real del usuario, donde botellas
+    de alturas distintas conviven en la misma base sin ningún problema.
+    No exige que UNA caja iguale la altura de OTRA -si una SKU de 15cm de
+    alto comparte piso con otra de 30cm, la de 15cm simplemente apila una
+    segunda caja encima de la primera para emparejar los 30cm; esa segunda
+    caja queda en su PROPIA Z (no la compartida original), así que este
+    chequeo nunca se dispara entre ellas."""
+    if z <= TOL:
         return True
     for t in pallet.torres:
         if abs(t.z - z) <= TOL and abs(t.alto_caja - alto_caja) > TOLERANCIA_ALTURA_CAMA_CM + TOL:
@@ -257,27 +238,9 @@ def _altura_compatible_con_cama(pallet: PalletV5, z: float, alto_caja: float, ba
     return True
 
 
-def _cama_es_de_otra_banda_estricta(pallet: PalletV5, z: float, banda_sku: int, banda_por_sku: dict[str, int]) -> bool:
-    """[sección 4] Bandas 1-3 (Licores/Lácteos/NABs) nunca comparten cama
-    (misma Z) entre sí -pedido explícito: "si la demanda pide 1 cama de
-    licores la siguiente cama deberia ser de lacteos o nabs" implica que
-    cada cama de estas 3 bandas pertenece a UNA sola banda, nunca mezclada
-    con otra de las 3. La banda remanente (4) queda afuera por completo de
-    esta restricción: puede compartir cualquier cama (con bandas 1-3 o
-    consigo misma) -es, por diseño, el grupo que rellena lo que quede."""
-    if banda_sku == BANDA_REMANENTE:
-        return False
-    for t in pallet.torres:
-        if abs(t.z - z) <= TOL:
-            otra_banda = banda_por_sku.get(t.sku, BANDA_REMANENTE)
-            if otra_banda != BANDA_REMANENTE and otra_banda != banda_sku:
-                return True
-    return False
-
-
 def _mejor_cuboide_para_sku(
     pallet: PalletV5, pc: _PalletEnConstruccion, cand: TorreCandidate, tope_capa: int | None,
-    banda_sku: int, banda_por_sku: dict[str, int],
+    nivel_sku: int, nivel_por_sku: dict[str, int],
 ) -> int | None:
     """[sección 2, 4, 4b] Entre los cuboides libres que reciban 1 caja de
     `cand`, el de menor Z (más bajo) -así se llena SIEMPRE la capa más
@@ -285,10 +248,9 @@ def _mejor_cuboide_para_sku(
     sitio abajo (row-first, nunca columnas). Descarta un cuboide si: (a)
     `tope_capa` (Cajas_Cama_Efectivo real del Maestro) ya se alcanzó para
     este SKU en la Z exacta de ese cuboide, (b) colocar ahí violaría el
-    orden de banda por columna (`_soporte_viola_banda`), (c) esa cama ya
-    es de otra banda estricta distinta (`_cama_es_de_otra_banda_estricta`),
-    o (d) -solo en la banda remanente- su alto no es compatible con lo que
-    ya hay puesto en esa misma cama (`_altura_compatible_con_cama`)."""
+    orden de nivel/peso por columna (`_soporte_viola_nivel`), o (c) su
+    alto no es compatible con lo que ya hay puesto en esa misma cama
+    (`_altura_compatible_con_cama`)."""
     mejor_idx, mejor_clave = None, None
     for idx, c in enumerate(pc.libres):
         if cand.largo > c.w + TOL or cand.ancho > c.h + TOL or cand.alto_caja > c.d + TOL:
@@ -299,11 +261,9 @@ def _mejor_cuboide_para_sku(
             )
             if ya_en_esta_capa >= tope_capa:
                 continue
-        if _cama_es_de_otra_banda_estricta(pallet, c.z, banda_sku, banda_por_sku):
+        if _soporte_viola_nivel(pallet, c.x, c.y, cand.largo, cand.ancho, c.z, nivel_sku, nivel_por_sku):
             continue
-        if _soporte_viola_banda(pallet, c.x, c.y, cand.largo, cand.ancho, c.z, banda_sku, banda_por_sku):
-            continue
-        if not _altura_compatible_con_cama(pallet, c.z, cand.alto_caja, banda_sku):
+        if not _altura_compatible_con_cama(pallet, c.z, cand.alto_caja):
             continue
         clave = (c.z, c.volumen)
         if mejor_clave is None or clave < mejor_clave:
@@ -315,7 +275,7 @@ def _empacar(
     pendientes: dict[str, int],
     por_sku: dict[str, list[TorreCandidate]],
     capacidad_cama_por_sku: dict[str, int],
-    banda_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
     tope_pallet_por_sku: dict[str, int],
     presupuesto: float,
     cd: str,
@@ -350,27 +310,39 @@ def _empacar(
             if not activos:
                 break
 
-            # [sección 4] Entre TODOS los SKUs pendientes, cuál -colocado
-            # en su mejor cuboide propio- gana. La BANDA es el primer
-            # criterio: una banda menor SIEMPRE gana sobre una mayor
-            # mientras tenga algún cuboide disponible, por lejano que sea
-            # -así se agota Licores antes de que Lácteos empiece, Lácteos
-            # antes que NABs, y NABs antes que la banda remanente, sin
-            # necesitar una pasada separada. Dentro de la MISMA banda, Z
-            # más baja primero (row-first), y dentro de esa Z, MAYOR
-            # huella primero -no más demanda primero. Verificado con datos
-            # reales (BK31, PATCH_LOG.md): priorizar demanda dejaba que
-            # SKUs chicas de mucha demanda acapararan el piso mientras
-            # estaba abierto, fragmentándolo en bolsillos angostos -las
-            # SKUs grandes (con menos margen para encajar en cualquier
-            # lado) terminaban esperando y se quedaban sin sitio. "Piezas
+            # [sección 4, corregido -bug real: con nivel como PRIMER
+            # criterio, Licores le ganaba a Comestibles/NABs/Aseo por una Z
+            # mucho más ALTA (apilando en su propia columna) en vez de
+            # dejarlos usar una Z más baja en el piso -eso contradice
+            # "cama por cama, fila por fila" (sección 2) y, con N pallets
+            # fijos, causaba que hasta 30% de la demanda se quedara sin
+            # colocar (verificado contra datos reales) por columnas
+            # desparejas: Licores construía torres altas mientras el piso
+            # seguía con hueco real disponible para otras categorías] La Z
+            # es SIEMPRE el primer criterio -la cama más baja disponible
+            # gana, sin importar la categoría. El NIVEL de categoría
+            # (config.nivel_de_categoria: Licores=1 el más pesado/bajo,
+            # subiendo hasta Cigarros=8) solo desempata cuando dos SKUs
+            # podrían usar la MISMA Z -ahí sí gana Licores primero (pedido
+            # explícito del usuario: "primero se tiene que acabar toda la
+            # demanda de licor"), pero nunca a costa de saltarse una Z más
+            # baja real. La restricción DURA de peso (nada más pesado
+            # apoyado sobre algo menos pesado) sigue intacta y aparte, en
+            # `_soporte_viola_nivel` -no depende de este orden de
+            # competencia. Dentro del mismo (Z, nivel), MAYOR huella
+            # primero -no más demanda primero. Verificado con datos reales
+            # (BK31, PATCH_LOG.md): priorizar demanda dejaba que SKUs
+            # chicas de mucha demanda acapararan el piso mientras estaba
+            # abierto, fragmentándolo en bolsillos angostos -las SKUs
+            # grandes (con menos margen para encajar en cualquier lado)
+            # terminaban esperando y se quedaban sin sitio. "Piezas
             # grandes primero" es la heurística estándar de bin-packing.
             # Empate de huella: más demanda pendiente primero (sigue
             # concentrando el mismo SKU en capas consecutivas).
             mejor = None
             for sku in activos:
                 tope_capa = capacidad_cama_por_sku.get(sku)
-                banda_sku = banda_por_sku.get(sku, BANDA_REMANENTE)
+                nivel_sku = nivel_por_sku.get(sku, config.NIVEL_REMATE)
                 # [sección 6, reescrito -caso real: columnas de altura
                 # despareja] Se prueban TODAS las orientaciones de este SKU
                 # (para Licores/Lácteos/NABs, siempre de pie, son solo 2;
@@ -390,7 +362,7 @@ def _empacar(
                 # de antemano.
                 mejor_para_sku = None
                 for cand_op in por_sku[sku]:
-                    idx_libre_op = _mejor_cuboide_para_sku(pallet, pc, cand_op, tope_capa, banda_sku, banda_por_sku)
+                    idx_libre_op = _mejor_cuboide_para_sku(pallet, pc, cand_op, tope_capa, nivel_sku, nivel_por_sku)
                     if idx_libre_op is None:
                         continue
                     libre_op = pc.libres[idx_libre_op]
@@ -402,7 +374,7 @@ def _empacar(
                 _, cand, idx_libre = mejor_para_sku
                 z_destino = pc.libres[idx_libre].z
                 area = cand.largo * cand.ancho
-                clave = (banda_sku, z_destino, -area, -pendientes[sku])
+                clave = (z_destino, nivel_sku, -area, -pendientes[sku])
                 if mejor is None or clave < mejor[0]:
                     mejor = (clave, sku, cand, idx_libre)
 
@@ -420,6 +392,98 @@ def _empacar(
         pallets.append(pallet)
 
     return pallets
+
+
+def _empacar_n_pallets(
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    cd: str,
+    contador: list[int],
+    n_pallets: int,
+) -> tuple[list[PalletV5], dict[str, int]]:
+    """[reparto en N pallets fijos -pedido explícito del usuario: "esa
+    cantidad de pallet total no puede variar siempre tiene que ser la que
+    dice en la planificacion... nosotros lo que tenemos que hacer es
+    cubicar de la mejor forma cada pallet"] A diferencia de `_empacar`
+    (que abre un pallet nuevo apenas hace falta, hasta agotar la
+    demanda), acá se abren los `n_pallets` DESDE EL INICIO -ninguno más,
+    ninguno menos- y se reparte TODA la demanda entre ellos. En cada
+    intento de colocación se compara la mejor posición de cada SKU
+    pendiente en CADA uno de los N pallets (no solo "el pallet actual"),
+    así que el barrido llena naturalmente primero los que tengan más
+    espacio libre a menor Z -reparte la densidad de forma pareja entre
+    los N, sin abrir un pallet N+1 aunque la demanda sea mucha. Reusa
+    exactamente el mismo motor exacto (`_mejor_cuboide_para_sku`, mismas
+    garantías de soporte real y de orden de nivel) por cada (SKU, pallet)
+    candidato -no es un motor aproximado nuevo, es el mismo con un lazo
+    exterior más ancho.
+
+    Devuelve `(pallets, sin_colocar)` -si algún SKU no encuentra lugar en
+    NINGUNO de los N pallets ni siquiera en el límite de altura (los N
+    pallets están genuinamente llenos), su demanda restante se reporta en
+    `sin_colocar` en vez de forzar un pallet extra o exceder la altura
+    máxima -nunca se relaja la garantía de altura para cumplir el
+    conteo."""
+    pallets: list[PalletV5] = []
+    construcciones: list[_PalletEnConstruccion] = []
+    colocados_por_pallet: list[dict[str, int]] = []
+    for _ in range(n_pallets):
+        contador[0] += 1
+        pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
+        pallets.append(pallet)
+        construcciones.append(_PalletEnConstruccion(pallet=pallet))
+        colocados_por_pallet.append({})
+
+    guard = 0
+    guard_max = 200_000
+    while any(v > 0 for v in pendientes.values()):
+        guard += 1
+        if guard > guard_max:
+            break
+
+        mejor = None  # (clave, pallet_idx, sku, cand, idx_libre)
+        for sku, cantidad_pendiente in pendientes.items():
+            if cantidad_pendiente <= 0:
+                continue
+            tope_capa = capacidad_cama_por_sku.get(sku)
+            nivel_sku = nivel_por_sku.get(sku, config.NIVEL_REMATE)
+            tope_pallet = tope_pallet_por_sku.get(sku, float("inf"))
+            for pidx in range(n_pallets):
+                if colocados_por_pallet[pidx].get(sku, 0) >= tope_pallet:
+                    continue
+                pallet = pallets[pidx]
+                pc = construcciones[pidx]
+                mejor_para_sku_pallet = None
+                for cand_op in por_sku[sku]:
+                    idx_libre_op = _mejor_cuboide_para_sku(pallet, pc, cand_op, tope_capa, nivel_sku, nivel_por_sku)
+                    if idx_libre_op is None:
+                        continue
+                    libre_op = pc.libres[idx_libre_op]
+                    clave_op = (libre_op.z, libre_op.volumen)
+                    if mejor_para_sku_pallet is None or clave_op < mejor_para_sku_pallet[0]:
+                        mejor_para_sku_pallet = (clave_op, cand_op, idx_libre_op)
+                if mejor_para_sku_pallet is None:
+                    continue
+                _, cand, idx_libre = mejor_para_sku_pallet
+                z_destino = pc.libres[idx_libre].z
+                area = cand.largo * cand.ancho
+                clave = (z_destino, nivel_sku, -area, -cantidad_pendiente)
+                if mejor is None or clave < mejor[0]:
+                    mejor = (clave, pidx, sku, cand, idx_libre)
+
+        if mejor is None:
+            break  # ninguno de los N pallets tiene lugar ya para nada pendiente
+
+        _, pidx, sku, cand, idx_libre = mejor
+        construcciones[pidx].colocar(cand, 1, idx_libre)
+        pendientes[sku] -= 1
+        colocados_por_pallet[pidx][sku] = colocados_por_pallet[pidx].get(sku, 0) + 1
+
+    sin_colocar = {sku: cant for sku, cant in pendientes.items() if cant > 0}
+    return pallets, sin_colocar
 
 
 def _recalcular_metricas_pallet(pallet: PalletV5) -> None:
@@ -451,7 +515,7 @@ UMBRAL_OCUPACION_DISPERSO = 0.5
 def _redistribuir_dispersos(
     pallets: list[PalletV5],
     capacidad_cama_por_sku: dict[str, int],
-    banda_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
     tope_pallet_por_sku: dict[str, int],
 ) -> list[PalletV5]:
     """[sección 8] Un SKU de poca demanda puede perder la competencia por
@@ -484,7 +548,7 @@ def _redistribuir_dispersos(
     for disperso in dispersos:
         torres_restantes = []
         for t in disperso.torres:
-            banda_sku = banda_por_sku.get(t.sku, BANDA_REMANENTE)
+            nivel_sku = nivel_por_sku.get(t.sku, config.NIVEL_REMATE)
             tope_capa = capacidad_cama_por_sku.get(t.sku)
             tope_pallet = tope_pallet_por_sku.get(t.sku)
             cand = TorreCandidate(
@@ -499,7 +563,7 @@ def _redistribuir_dispersos(
                     if ya_en_destino + t.cantidad > tope_pallet:
                         continue
                 pc = _reconstruir_en_construccion(destino)
-                idx_libre = _mejor_cuboide_para_sku(destino, pc, cand, tope_capa, banda_sku, banda_por_sku)
+                idx_libre = _mejor_cuboide_para_sku(destino, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
                 if idx_libre is None:
                     continue
                 pc.colocar(cand, t.cantidad, idx_libre)
@@ -526,12 +590,25 @@ UMBRAL_CONSOLIDACION_FRACCION = 0.6
 MAX_INTENTOS_CONSOLIDACION = 3
 
 
-def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None) -> list[PalletV5]:
+def armar_pallets_bloques(
+    df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None, pallets_objetivo: int | None = None,
+) -> list[PalletV5]:
     """[V-SKU_BLOQUE, camas] Punto de entrada. `df_cd` debe traer demanda
     pendiente (`Cajas_Remanente` o `Cajas_Teoricas_Redondeadas`), geometría
     efectiva reconciliada y, si está disponible, `Cajas_Cama_Efectivo`
     (derivados.py) -sin esa columna, una capa no tiene tope propio más que
-    la huella/orientación elegida."""
+    la huella/orientación elegida.
+
+    `pallets_objetivo` -pedido explícito del usuario: "esa cantidad de
+    pallet total no puede variar siempre tiene que ser la que dice en la
+    planificacion... nosotros lo que tenemos que hacer es cubicar de la
+    mejor forma cada pallet"- es la cifra FIJA de pallets que ya viene
+    decidida por la planificación externa (factor de PH físicas), subida
+    por el usuario -el agente NO la calcula ni la ajusta. Si se pasa, el
+    armado usa `_empacar_n_pallets` (reparte TODA la demanda del CD entre
+    exactamente esa cantidad de pallets, sin abrir ni cerrar ninguno de
+    más) en vez de `_empacar` (que abre pallets hasta agotar la demanda,
+    el comportamiento de siempre si no se pasa este parámetro)."""
     contador = contador if contador is not None else [0]
 
     # [sección 6, orientación flexible] Comestibles/Aseo/Cigarros pueden
@@ -573,26 +650,27 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
             if pd.notna(cap) and cap > 0:
                 capacidad_cama_por_sku[sku] = int(cap)
 
-    # [sección 4, bandas] Licores/Lácteos/NABs (bandas 1-3) cada una su
-    # propia banda estrictamente secuencial; todo lo demás (Aseo,
-    # Importados, Merch, Comestibles, Cigarros, y cualquier SKU forzado a
-    # nivel remate por Subcategoría RTD/Energizante -Four Loko, ver
-    # derivados.py-) cae en la banda remanente (4). Sin dato de categoría
-    # (ej. la pseudo-fila BAT, que trae Categoria_Normalizada="Cigarros" y
-    # Nivel_Categoria=NIVEL_CIGARROS explícitos -ver bat.py-) también cae
-    # en remanente vía `_banda_de_sku`.
-    banda_por_sku: dict[str, int] = {}
-    if "Categoria_Normalizada" in df_cd.columns or "Nivel_Categoria" in df_cd.columns:
+    # [sección 4, nivel por peso/soporte] Licores (nivel 1, el más pesado)
+    # nunca queda apoyado sobre nada de nivel mayor -pero SÍ puede compartir
+    # cama con otras categorías (ver `_soporte_viola_nivel`, sin
+    # exclusividad de cama). Se recorta cualquier nivel >= NIVEL_REMATE
+    # (incluye NIVEL_CIGARROS de la pseudo-fila BAT, ver bat.py, y
+    # cualquier SKU forzado a remate por Subcategoría RTD/Energizante -
+    # Four Loko, ver derivados.py) a exactamente NIVEL_REMATE -así Cigarros
+    # ya no es "siempre lo más alto obligatorio" (pedido explícito del
+    # usuario), es un miembro más del grupo de remate, en igualdad de
+    # condiciones con Comestibles.
+    nivel_por_sku: dict[str, int] = {}
+    if "Nivel_Categoria" in df_cd.columns:
         for _, fila in df_cd.drop_duplicates(subset="SKU").iterrows():
             sku = fila["SKU"]
             if sku not in por_sku:
                 continue
-            categoria = fila.get("Categoria_Normalizada")
             nivel = fila.get("Nivel_Categoria")
-            nivel_val = float(nivel) if pd.notna(nivel) else None
-            banda_por_sku[sku] = _banda_de_sku(categoria, nivel_val)
+            nivel_val = int(nivel) if pd.notna(nivel) else config.NIVEL_REMATE
+            nivel_por_sku[sku] = min(nivel_val, config.NIVEL_REMATE)
     for sku in por_sku:
-        banda_por_sku.setdefault(sku, BANDA_REMANENTE)
+        nivel_por_sku.setdefault(sku, config.NIVEL_REMATE)
 
     # [sección 7] `Cajas por PH` real del Maestro -tope físico de cuántas
     # cajas de un SKU pueden ir en UN pallet (homogéneo o mezclado).
@@ -623,36 +701,51 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
             sin_colocar[sku] = pendientes[sku]
             pendientes[sku] = 0
 
-    pallets = _empacar(
-        pendientes, por_sku, capacidad_cama_por_sku, banda_por_sku, tope_pallet_por_sku, presupuesto, cd, contador
-    )
-
-    # [sección 5] Consolidación de remanentes: los pallets que quedaron muy
-    # cortos se deshacen y se reempacan juntos -si mejora (menos pallets),
-    # se queda con el resultado nuevo; si no, se descarta sin tocar nada.
-    umbral = presupuesto * UMBRAL_CONSOLIDACION_FRACCION
-    for _intento in range(MAX_INTENTOS_CONSOLIDACION):
-        cortos = [p for p in pallets if (p.altura_final - config.ALTURA_PALLET_VACIO) < umbral]
-        if len(cortos) < 2:
-            break
-        pendientes_residual: dict[str, int] = {}
-        for p in cortos:
-            for t in p.torres:
-                pendientes_residual[t.sku] = pendientes_residual.get(t.sku, 0) + t.cantidad
-        reempacados = _empacar(
-            pendientes_residual, por_sku, capacidad_cama_por_sku, banda_por_sku, tope_pallet_por_sku,
-            presupuesto, cd, contador,
+    if pallets_objetivo is not None and pallets_objetivo > 0:
+        # [reparto en N pallets fijos] Sin abrir-hasta-agotar ni
+        # consolidación de remanentes -esos mecanismos existen para
+        # decidir CUÁNTOS pallets hacen falta, pregunta que acá ya está
+        # respondida desde afuera. Tampoco se corre `_redistribuir_
+        # dispersos`: mover contenido de un pallet a otro podría dejar
+        # alguno vacío y reducir el conteo por debajo de lo pedido.
+        pallets, sin_colocar_barrido = _empacar_n_pallets(
+            pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+            cd, contador, pallets_objetivo,
         )
-        if len(reempacados) >= len(cortos):
-            break  # no mejoró -se descarta el intento, se conserva lo que ya había
-        ids_cortos = {id(p) for p in cortos}
-        pallets = [p for p in pallets if id(p) not in ids_cortos] + reempacados
+        for sku, cant in sin_colocar_barrido.items():
+            sin_colocar[sku] = sin_colocar.get(sku, 0) + cant
+    else:
+        pallets = _empacar(
+            pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, cd, contador
+        )
 
-    # [sección 8] Después del barrido y la consolidación, algunos SKUs de
-    # poca demanda pueden haber quedado solos en su propio pallet casi
-    # vacío -se intenta repartirlos en el espacio libre real de los
-    # pallets ya armados antes de aceptarlos como pallets aparte.
-    pallets = _redistribuir_dispersos(pallets, capacidad_cama_por_sku, banda_por_sku, tope_pallet_por_sku)
+        # [sección 5] Consolidación de remanentes: los pallets que quedaron
+        # muy cortos se deshacen y se reempacan juntos -si mejora (menos
+        # pallets), se queda con el resultado nuevo; si no, se descarta sin
+        # tocar nada.
+        umbral = presupuesto * UMBRAL_CONSOLIDACION_FRACCION
+        for _intento in range(MAX_INTENTOS_CONSOLIDACION):
+            cortos = [p for p in pallets if (p.altura_final - config.ALTURA_PALLET_VACIO) < umbral]
+            if len(cortos) < 2:
+                break
+            pendientes_residual: dict[str, int] = {}
+            for p in cortos:
+                for t in p.torres:
+                    pendientes_residual[t.sku] = pendientes_residual.get(t.sku, 0) + t.cantidad
+            reempacados = _empacar(
+                pendientes_residual, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+                presupuesto, cd, contador,
+            )
+            if len(reempacados) >= len(cortos):
+                break  # no mejoró -se descarta el intento, se conserva lo que ya había
+            ids_cortos = {id(p) for p in cortos}
+            pallets = [p for p in pallets if id(p) not in ids_cortos] + reempacados
+
+        # [sección 8] Después del barrido y la consolidación, algunos SKUs
+        # de poca demanda pueden haber quedado solos en su propio pallet
+        # casi vacío -se intenta repartirlos en el espacio libre real de
+        # los pallets ya armados antes de aceptarlos como pallets aparte.
+        pallets = _redistribuir_dispersos(pallets, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku)
 
     if sin_colocar and pallets:
         pallets[-1].metadata["sin_colocar"] = sin_colocar

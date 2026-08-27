@@ -2876,3 +2876,132 @@ cajas heterogéneas tiene.
   términos del nuevo mecanismo "probar todas, quedarse con la mejor" en
   vez de "preferida + fallback solo si falla en todos lados".
 - Suite completa: 152 passed.
+
+## N pallets fijos por CD -pedido explícito del usuario, análisis de datos reales
+
+Contexto que originó este trabajo: el usuario compartió el cubicaje MANUAL
+real de un envío completo -`Plan de acción 24.08 - CUBICADO.xlsx` (hoja
+`BD`, el plan teórico) y `Plan de acción 24.08 - CUBICADO - ELIAN.xlsx`
+(hoja `PLAN 24,08,26`, lo que realmente armaron y subieron los operarios)-
+más una tabla de "PHs Físicas" por CD que define cuántos pallets debe
+llevar cada camión. Regla de negocio explícita: **"esa cantidad de pallet
+total no puede variar siempre tiene que ser la que dice en la
+planificacion"** -los camiones se programan en base a ese número, así que
+el agente tiene que repartir la demanda en EXACTAMENTE esa cantidad de
+pallets, ni más ni menos, cubicando cada uno lo mejor posible.
+
+### Validación del dato real
+- Crucé la tabla "PHs Físicas" contra la columna `PALET` de la hoja `BD`
+  agrupada por CD: coinciden EXACTO en los 9 CDs (Callao=5, Cono Norte=7,
+  Cono Sur=7, Rímac=5, Chanchamayo=5, Huánuco=4, Satipo=3, Tingo María=5,
+  Pucallpa=9).
+- La columna `PH` de ELIAN es exactamente `CJS / (CJ x PH)` -mismo dato
+  que ya usamos como `Cajas por PH` del Maestro, no requiere ningún input
+  nuevo para calcularse. Sumado por CD y dividido entre su cantidad de
+  pallets real: ~1.2 a 1.5 PH por pallet (promedio ~1.35), consistente
+  con lo que `packing_ph_fraccion.py` (el motor aproximado, abandonado)
+  ya había calibrado antes en la sesión contra otro dataset real distinto
+  (`OBJETIVO_PH_PALLET=1.4`).
+- El usuario decidió explícitamente que el N objetivo por CD sea un
+  **input que él sube** (no algo que el agente calcule con el factor
+  1.4) -pendiente: diseñar el mecanismo de carga (nueva hoja/columna en
+  la plantilla).
+
+### Bandas estrictas -revertidas, evidencia real en contra
+Inspeccioné línea por línea el Pallet 1 de BK34 en `PLAN 24,08,26`:
+Licores, Comestibles, Aseo y NABs aparecen TODOS mezclados en el mismo
+pallet, y 19 de 21 SKUs tienen demanda MENOR a su propio `Cajas por
+cama` (cada SKU ocupa como mucho 1-2 camas propias, compartiendo piso
+con los demás sin agotar una categoría antes de tocar otra). Esto
+contradice directamente la reescritura de bandas estrictamente
+secuenciales de la sección anterior -se revirtió (ver commit) a un
+esquema de NIVEL/peso (Licores=1 el más pesado, nunca apoyado sobre
+otra categoría; categorías más livianas SÍ pueden apoyarse sobre
+Licores), usando `config.nivel_de_categoria` para el chequeo de soporte
+por columna, SIN exclusividad de cama -pedido explícito del usuario
+tras confirmarle esta lectura de los datos.
+
+### Bug real encontrado y corregido: nivel como primer criterio de la cola
+Al implementar el nivel como PRIMER criterio del desempate (antes que la
+Z), Licores le ganaba a Comestibles/NABs/Aseo por una Z mucho más ALTA
+(seguía apilando en su propia columna) en vez de dejarlos usar una Z más
+baja real disponible en el piso -contradice "cama por cama, fila por
+fila" (el principio fundacional de todo este archivo) y, verificado con
+`pallets_objetivo` fijo, causaba que hasta 30% de la demanda de un CD se
+quedara sin colocar aunque hubiera piso libre. Corregido: la Z es
+SIEMPRE el primer criterio; el nivel solo desempata cuando dos SKUs
+podrían usar la MISMA Z (pedido original del usuario: "primero se tiene
+que acabar toda la demanda de licor" se cumple así, por desempate, no
+por prioridad absoluta). La restricción DURA de peso
+(`_soporte_viola_nivel`) es independiente de este orden y no cambió.
+
+### `_empacar_n_pallets` -mecanismo nuevo, funciona perfecto para el conteo
+`armar_pallets_bloques(..., pallets_objetivo=N)` abre los N pallets desde
+el inicio (no uno a la vez hasta agotar demanda) y en cada intento
+compara la mejor posición de cada SKU pendiente en CADA uno de los N
+pallets -reusa exactamente el mismo motor exacto (`_mejor_cuboide_para_
+sku`), solo con un lazo exterior más ancho. Verificado contra los 9 CDs
+reales:
+```
+Conteo de pallets: EXACTO en los 9 CDs (5,7,7,5,3,5,4,5,9 = 50 total).
+0 violaciones geométricas.
+```
+
+### Problema NO resuelto: fill rate ~65-70% (necesario: ~99%)
+El cubicaje real de ELIAN colocó 5,499 de 5,574 cajas (98.7%) en esos 50
+pallets. `_empacar_n_pallets`, con la misma demanda real, solo coloca
+~65-70% -deja hasta 30-45% de la demanda sin colocar por CD, muy por
+encima del "±2% de fill rate" que el usuario dijo que es la tolerancia
+real del negocio.
+
+**Causa raíz diagnosticada** (no es un bug de conteo -verificado:
+demanda = colocado + sin_colocar exacto en cada CD): inspeccionando los
+cuboides libres que quedan cuando el motor se atasca, aparecen tiras de
+piso de 2-9cm de ancho con la altura COMPLETA del pallet disponible
+(~200cm) -nunca reclamadas desde z=0 porque ningún SKU de la demanda
+restante (en ninguna de sus orientaciones) es tan angosto. El volumen
+total SÍ alcanza (SJ86: la demanda ocupa solo 69.5% del volumen bruto de
+sus 3 pallets) -el problema es la FORMA en que los anchos de las cajas
+se combinan sobre el piso de 120x100cm, no la cantidad de espacio.
+
+**4 intentos de arreglo, todos descartados** (con datos reales del
+mismo dataset, `Plantilla_Ejemplo_Agente_Cubicador (2).xlsx`):
+1. Nivel como primer criterio de la cola -sin efecto en este problema
+   puntual (aunque el fix en sí era necesario, ver arriba).
+2. Preferir huella más CHICA en vez de más grande al desempatar -mucho
+   peor (SJ86: 72% -> 36%). Confirma que "huella grande primero" (ya
+   validado antes en la sesión con datos reales de BK31) sigue siendo
+   correcto.
+3. Penalizar, en el desempate, elegir una orientación cuyo resto de
+   ancho/profundidad dentro del cuboide específico quede por debajo de
+   un umbral (probado con 15cm y con 8cm) -mejoró SJ86 (72% -> 80%) pero
+   empeoró gravemente SJ97 (78% -> 53%). Inestable: ayuda en CDs con
+   muchos SKUs chicos distintos, perjudica en CDs con demanda muy
+   concentrada en pocos SKUs (interrumpe una grilla ya bien aprovechada
+   del mismo SKU repitiéndose).
+4. Igual que (3) pero limitado a cuboides todavía "frescos" (≥60cm en
+   ambas dimensiones, para no tocar columnas ya en construcción) -mismo
+   problema, sigue empeorando SJ97 (78% -> 70%) y ahora también SJ90
+   (59% -> 55%), sin siquiera preservar la mejora de SJ86.
+
+**Diagnóstico final:** un ajuste de prioridad/desempate no alcanza. Hace
+falta decidir, al abrir una fila nueva de piso, qué COMBINACIÓN de SKUs
+pendientes la completa con el menor resto -un problema de tipo
+subset-sum/knapsack por fila- calculado ANTES de colocar la primera
+caja, no colocación voraz caja por caja con distintos criterios de
+desempate. Es un algoritmo distinto, no una variante más del actual.
+
+### Pendiente para la próxima sesión
+1. Diseñar e implementar el algoritmo de "combinación por fila" (probado
+   contra los 9 CDs reales de este mismo dataset -guardado en Downloads,
+   `Plantilla_Ejemplo_Agente_Cubicador (2).xlsx` + los 2 archivos
+   `Plan de acción 24.08...`- como benchmark de fill rate real: objetivo
+   ~99%, no solo "más que 70%").
+2. Diseñar el mecanismo de carga del `pallets_objetivo` por CD (nueva
+   hoja/columna en la plantilla -el usuario decidió que sea un input que
+   él sube, no algo calculado con el factor 1.4) y conectarlo end-to-end
+   (`validacion.cargar_hojas` -> `pipeline_sku_bloque.py` ->
+   `armar_pallets_bloques`).
+3. Los 4 intentos descartados (arriba) no deben repetirse sin una razón
+   nueva -ya están probados y devuelven peor resultado en al menos un CD
+   real cada uno.

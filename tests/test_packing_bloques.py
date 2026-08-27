@@ -140,73 +140,105 @@ def test_demanda_grande_ocupa_varias_camas_del_mismo_pallet():
     assert despachado == 370
 
 
+def _apoyado_directo(pallets, sku_arriba, sku_abajo) -> bool:
+    """[segunda reescritura de bandas] Busca, en cualquier pallet, alguna
+    torre de `sku_arriba` cuya base quede exactamente sobre el tope de una
+    torre de `sku_abajo` con huella solapada -mismo criterio de soporte
+    real que usa `_soporte_viola_nivel`. Sirve para verificar la jerarquía
+    de peso desde afuera del packer, sin asumir ninguna estructura de
+    "cama" ni de "banda"."""
+    for p in pallets:
+        for t in p.torres:
+            if t.sku != sku_arriba:
+                continue
+            for o in p.torres:
+                if o.sku != sku_abajo:
+                    continue
+                if abs((o.z + o.altura) - t.z) > 1e-6:
+                    continue
+                if o.x + o.largo <= t.x + 1e-6 or t.x + t.largo <= o.x + 1e-6:
+                    continue
+                if o.y + o.ancho <= t.y + 1e-6 or t.y + t.ancho <= o.y + 1e-6:
+                    continue
+                return True
+    return False
+
+
 def test_licores_nunca_queda_arriba_de_nabs():
-    """[reescritura de bandas] Licores (banda 1) y NABs (banda 3) son
-    bandas ESTRICTAMENTE secuenciales -Licores se agota primero en el
-    pallet, así que NABs nunca puede terminar en una cama más baja que
-    Licores en el mismo pallet, ni aunque tenga mucha más demanda
-    pendiente (que antes hubiera ganado el ancla de la primera cama por
-    peso/huella puro)."""
+    """[segunda reescritura de bandas -pedido explícito: "nunca puede ir
+    una caja de licor encima de otra categoria porque pesa mucho"] Aunque
+    NABs tenga mucha más demanda pendiente (que antes hubiera ganado el
+    ancla de la primera cama por peso/huella puro), ninguna torre de
+    LICOR puede terminar apoyada DIRECTAMENTE sobre una torre de NABS."""
     df = pd.DataFrame(
         [
-            _fila("NABS", 30, 20, 20.0, 100, cajas_cama=30, categoria="NABs"),  # mucha demanda
-            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, categoria="Licores"),
+            _fila(
+                "NABS", 30, 20, 20.0, 100, cajas_cama=30, categoria="NABs",
+                nivel=config.nivel_de_categoria("NABs"),
+            ),  # mucha demanda
+            _fila(
+                "LICOR", 30, 20, 20.0, 20, cajas_cama=30, categoria="Licores",
+                nivel=config.nivel_de_categoria("Licores"),
+            ),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
-    torres_por_cama = _torres_por_z(pallets)
-
-    for (pallet_id, z), torres in torres_por_cama.items():
-        skus_en_cama = {t.sku for t in torres}
-        if "NABS" in skus_en_cama:
-            # cualquier cama de LICOR en el MISMO pallet tiene que estar a
-            # una z MENOR (más abajo) que esta cama de NABS.
-            for (otro_pallet, otro_z), otras_torres in torres_por_cama.items():
-                if otro_pallet != pallet_id:
-                    continue
-                if any(t.sku == "LICOR" for t in otras_torres):
-                    assert otro_z < z, "LICOR quedó en una cama igual o más alta que NABS en el mismo pallet"
+    assert not _apoyado_directo(pallets, sku_arriba="LICOR", sku_abajo="NABS")
 
 
 def test_licores_si_puede_quedar_debajo_de_nabs():
+    """[pedido explícito: "si puede ir 1 caja de nabs o de importados sobre
+    licor"] Con demanda pareja, NABs SÍ debe poder terminar apoyado
+    directamente sobre Licores en algún caso -no hace falta exclusividad
+    de cama para lograrlo, alcanza con que el chequeo de soporte lo
+    permita en esa dirección."""
     df = pd.DataFrame(
         [
-            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, categoria="Licores"),
-            _fila("NABS", 30, 20, 20.0, 20, cajas_cama=30, categoria="NABs"),
+            _fila(
+                "LICOR", 30, 20, 20.0, 20, cajas_cama=30, categoria="Licores",
+                nivel=config.nivel_de_categoria("Licores"),
+            ),
+            _fila(
+                "NABS", 30, 20, 20.0, 20, cajas_cama=30, categoria="NABs",
+                nivel=config.nivel_de_categoria("NABs"),
+            ),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
-    torres_por_cama = _torres_por_z(pallets)
-    zs_licor = [z for (_pid, z), torres in torres_por_cama.items() if any(t.sku == "LICOR" for t in torres)]
-    zs_nabs = [z for (_pid, z), torres in torres_por_cama.items() if any(t.sku == "NABS" for t in torres)]
-    assert zs_licor and zs_nabs
-    assert max(zs_licor) < min(zs_nabs)
+    assert _apoyado_directo(pallets, sku_arriba="NABS", sku_abajo="LICOR")
+    assert not _apoyado_directo(pallets, sku_arriba="LICOR", sku_abajo="NABS")
 
 
-def test_bandas_se_agotan_en_orden_licores_lacteos_nabs():
-    """[reescritura de bandas -pedido explícito: "primero todos los
-    licores... la siguiente cama deberia ser de lacteos o nabs"] Con
-    demanda pendiente de las 3 bandas estrictas, el pallet arma TODO
-    Licores antes de tocar Lácteos, y todo Lácteos antes que NABs -no se
-    interfoliuan aunque la geometría permitiría mezclarlas."""
+def test_licores_lacteos_nabs_pueden_compartir_piso_del_pallet():
+    """[segunda reescritura de bandas -pedido explícito tras revisar el
+    cubicaje real: distintas categorías SÍ comparten pallet, incluso la
+    misma Z, sin agotar una entera antes de tocar la siguiente] Con poca
+    demanda de cada una (mucho menos que su propia `Cajas por cama`), las
+    3 categorías deben poder coexistir en el mismo pallet, en el piso
+    (z=0) -la jerarquía de peso solo restringe QUÉ puede quedar apoyado
+    sobre QUÉ, no impide que compartan la base."""
     df = pd.DataFrame(
         [
-            _fila("NABS", 30, 20, 20.0, 6, cajas_cama=30, categoria="NABs"),
-            _fila("LACTEO", 30, 20, 20.0, 6, cajas_cama=30, categoria="Lácteos"),
-            _fila("LICOR", 30, 20, 20.0, 6, cajas_cama=30, categoria="Licores"),
+            _fila(
+                "NABS", 30, 20, 20.0, 2, cajas_cama=30, categoria="NABs",
+                nivel=config.nivel_de_categoria("NABs"),
+            ),
+            _fila(
+                "LACTEO", 30, 20, 20.0, 2, cajas_cama=30, categoria="Lácteos",
+                nivel=config.nivel_de_categoria("Lácteos"),
+            ),
+            _fila(
+                "LICOR", 30, 20, 20.0, 2, cajas_cama=30, categoria="Licores",
+                nivel=config.nivel_de_categoria("Licores"),
+            ),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
-    torres_por_cama = _torres_por_z(pallets)
     assert len(pallets) == 1
-    zs = {
-        sku: sorted(z for (_pid, z), torres in torres_por_cama.items() if any(t.sku == sku for t in torres))
-        for sku in ("LICOR", "LACTEO", "NABS")
-    }
-    assert max(zs["LICOR"]) < min(zs["LACTEO"])
-    assert max(zs["LACTEO"]) < min(zs["NABS"])
-
-
+    torres_en_piso = {t.sku for t in pallets[0].torres if t.z <= 1e-6}
+    assert torres_en_piso == {"LICOR", "LACTEO", "NABS"}, (
+        f"se esperaba que las 3 categorías compartieran el piso del pallet, quedó: {torres_en_piso}"
+    )
 
 
 def test_four_loko_queda_en_banda_remanente_no_en_licores():
