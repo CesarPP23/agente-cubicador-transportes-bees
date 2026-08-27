@@ -2794,3 +2794,85 @@ ocupación (antes 6 de 65, todos BAT-puros -ahora 0 BAT-puros).
   `_altura_compatible_con_cama` no regresionó este fix anterior.
 - Suite completa: 151 passed (22 en `test_packing_bloques.py`, 15 en
   `test_packing_ph_fraccion.py` tras el desacople, resto sin tocar).
+
+## Columnas de altura despareja -orientación elegida por hueco real, no fija por SKU
+
+> "lo corri denuevo con una nueva demanda y mira el primer pallet de la
+> parte defrente se ve todos esos huecos y no deberia haber huecos, estas
+> apiladondo columnas por columnas lo que deberia ser cama por cama... si
+> es de un solo sku la demanada mejor"
+
+Foto real de un pallet con 3 "columnas" de Licores de altura visiblemente
+distinta, con aire de fondo visible por encima de las columnas más
+cortas. Investigado contra un pallet real equivalente
+(`Cubicaje18.07.2026.xlsx`, `PV5-BK65-021`): **no era flotación** (0
+violaciones, `validar_geometria_v5` limpio) ni huecos horizontales dentro
+de una misma cama (ocupación XY de piso: 96%) -era **aprovechamiento
+volumétrico bajo (67%)** porque distintos SKUs de Licores tienen alturas
+de caja distintas, así que cuando la demanda de un SKU en una zona X,Y se
+agota, esa "columna" deja de crecer mientras otras siguen subiendo -el
+aire queda por encima de la columna corta, hasta la altura de la más
+alta.
+
+Se le preguntó al usuario si autorizaba que Licores/Lácteos también
+pudieran acostarse/voltearse (como ya hacen Comestibles/Aseo/Cigarros)
+para cerrar estos huecos -**respondió que no, mantener ambos siempre de
+pie**, y pidió buscar otra forma.
+
+### Causa raíz real (más específica de lo que parecía)
+No era que faltara una orientación -Licores/Lácteos ya tienen 2
+orientaciones "de pie" (`L×A`/`A×L`)- sino que `_mejor_orientacion_grilla`
+fijaba UNA sola orientación por SKU para TODO el pallet (elegida por
+capacidad de grilla en un pallet VACÍO), y esa elección nunca se
+reconsideraba mientras la orientación preferida siguiera encontrando
+dónde ir (aunque fuera solo en su propia columna, cada vez más arriba).
+La orientación alternativa solo se probaba como último recurso si la
+preferida no entraba en NINGÚN cuboide libre de todo el pallet -pero si
+la preferida SÍ colocaba en otro lado (su propia columna), nunca se
+comparaba contra la alternativa, así que un hueco angosto que dejaba OTRA
+columna ya agotada quedaba sin usar aunque la alternativa calzara justo
+ahí.
+
+### Fix
+`_mejor_cuboide_para_sku` ya existía y no cambió -el cambio es en
+`_empacar`: para CADA SKU, en CADA intento de colocación, se prueban
+TODAS sus orientaciones disponibles (2 para Licores/Lácteos/NABs, hasta 6
+para las categorías flexibles) y se usa la que le da la Z más baja en ese
+momento -no una fija elegida de antemano. `_mejor_orientacion_grilla` quedó
+sin uso en este archivo y se eliminó (`packing_ph_fraccion.py` tiene su
+propia copia independiente, sin tocar).
+
+Riesgo considerado: una versión anterior de este archivo documentaba que
+mezclar orientaciones por SKU "fragmentaba el espacio" -pero esa nota se
+refería a una variante extendida con sobresaliente que ya no existe en el
+generador de candidatas actual (`torres.py` solo genera `L×A`/`A×L`
+simples, o las 6 completas para categorías flexibles). Verificado
+empíricamente contra los 4 datasets reales: ninguna regresión, mejora en
+todos.
+
+### Resultado (`Cubicaje18.07.2026.xlsx`, mismo dataset de la sección
+anterior)
+```
+58 pallets (antes 61 con la reescritura de bandas, 65 antes de eso).
+0 violaciones geométricas en los 4 datasets reales disponibles.
+Ocupación XY media: 86% (antes 84%). Aprovechamiento de altura: 85%
+(antes 83%). Pallets parciales: 16 de 58 -28%- (antes 19 de 61 -31%-).
+```
+Un residual de huecos angostos (unos ~10-15cm) sigue existiendo en
+algunos pallets -es geométricamente inevitable dado que Licores/Lácteos
+no pueden acostarse (decisión explícita del usuario) y las dimensiones de
+caja reales no dividen 120x100 parejo; ya no es un defecto de "columnas
+vs camas", es el mismo tipo de residual que cualquier cubicaje real con
+cajas heterogéneas tiene.
+
+### Tests
+- `test_orientacion_por_intento_cierra_columna_de_altura_pareja` (NUEVO):
+  reproduce el escenario sintético (SKU A agota su columna angosta, SKU B
+  tiene mucha demanda y su orientación preferida no calza en el hueco que
+  dejó A, pero la rotada sí) y confirma que B rellena ese hueco usando la
+  rotada.
+- `test_orientacion_cae_a_la_rotada_si_la_preferida_no_entra_en_nada`
+  (existente, docstring actualizado): seguía pasando, ahora explicado en
+  términos del nuevo mecanismo "probar todas, quedarse con la mejor" en
+  vez de "preferida + fallback solo si falla en todos lados".
+- Suite completa: 152 passed.

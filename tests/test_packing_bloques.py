@@ -350,9 +350,11 @@ def test_huella_grande_gana_el_empate_de_z_sobre_mas_demanda():
 def test_orientacion_cae_a_la_rotada_si_la_preferida_no_entra_en_nada():
     """[bug real, encontrado con datos reales del usuario -Plan_Picking_
     Optimizado (10).xlsx, CD BK31: 5 pallets, ninguno pasaba los 170cm]
-    `_mejor_orientacion_grilla` fija la orientación de mejor grilla sobre
-    el pallet VACÍO -pero una vez que el piso se fragmenta, esa orientación
-    puede no entrar en NINGÚN hueco que quede, aunque la rotada sí. Acá se
+    Cada SKU prueba TODAS sus orientaciones disponibles en cada intento de
+    colocación y usa la que le da la mejor Z (ver sección 6 del docstring
+    del módulo) -así que una vez que el piso se fragmenta, si la
+    orientación "preferida" (mejor grilla en un pallet vacío) no entra en
+    ningún hueco que quede pero la rotada sí, se usa la rotada. Acá se
     fuerza ese escenario: GRANDE ocupa casi toda la altura del pallet
     dejando solo una tira lateral angosta (20cm) -B (30x12) en su
     orientación preferida (30cm de largo) no entra en la tira, pero rotada
@@ -374,6 +376,38 @@ def test_orientacion_cae_a_la_rotada_si_la_preferida_no_entra_en_nada():
             despachado[t.sku] = despachado.get(t.sku, 0) + t.cantidad
     assert despachado.get("B", 0) == 2, "B debería entrar rotado en la tira lateral, no quedar sin colocar"
     assert validar_geometria_v5(pallets) == []
+
+
+def test_orientacion_por_intento_cierra_columna_de_altura_pareja():
+    """[caso real reportado por el usuario con foto: "columnas" de altura
+    despareja, aire visible sobre la columna más corta] A (huella 45x100)
+    tiene poca demanda -su columna se agota rápido, dejando un tramo de
+    piso de 45cm de ancho libre desde su tope hacia arriba. B tiene mucha
+    demanda: su orientación "preferida" (55x18, mejor grilla en un pallet
+    vacío) no entra en esa tira de 45cm (55 > 45), pero su otra
+    orientación "de pie" (18x55) sí. Antes de este fix, la orientación de
+    B quedaba fija en la preferida para todo el pallet -mientras siguiera
+    encontrando dónde ir en SU PROPIA columna (75cm de ancho), nunca se
+    comparaba contra la rotada, así que el tramo que dejó A libre se
+    quedaba vacío aunque B tuviera de sobra demanda y la rotada calzara
+    ahí. Ahora cada intento de B compara ambas orientaciones y usa la que
+    da la Z más baja -por lo tanto, una vez que la columna de A queda más
+    baja que seguir subiendo en la propia columna de B, alguna torre de B
+    debe aparecer usando la rotada (18 de largo) exactamente sobre la
+    columna de A (x=0), no solo en su propia columna."""
+    df = pd.DataFrame(
+        [
+            _fila("A", 45, 100, 30.0, 2, cajas_cama=1, categoria="Licores"),
+            _fila("B", 55, 18, 18.0, 25, cajas_cama=5, categoria="Licores"),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    assert validar_geometria_v5(pallets) == []
+    torres_b_sobre_a = [
+        t for p in pallets for t in p.torres
+        if t.sku == "B" and t.x < 45 - 1e-6 and t.z >= 60 - 1e-6 and t.largo < 55
+    ]
+    assert torres_b_sobre_a, "B debería rellenar, con su orientación rotada, el tramo que A dejó libre"
 
 
 def test_no_viola_geometria():

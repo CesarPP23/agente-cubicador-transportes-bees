@@ -96,15 +96,30 @@ debe esta puesta sobre otra caja"] Este archivo (el motor 3D exacto,
 el pipeline -ver `pipeline_sku_bloque.py`. Para recuperar la densidad real
 que PH_FRACCION perseguía sin sacrificar la garantía exacta, se le agregan
 2 ingredientes que esa versión aproximada sí demostró que funcionan:
-6. [orientación flexible] Comestibles/Aseo/Cigarros pueden acostarse o
-   voltearse en cualquiera de sus 6 orientaciones (`torres.generar_torres_
-   candidatas_todas_orientaciones`) para aprovechar huecos irregulares que
-   ninguna orientación "de pie" calza -NABs y el resto de las categorías
-   siguen con las 2 orientaciones de siempre (pedido explícito: "nabs es
-   el unico que siempre tiene que ir de pie"). Como el motor sigue siendo
-   el mismo MaxRects exacto, esto no relaja NADA de la garantía de soporte
-   -solo le da más formas candidatas para probar en cada cuboide libre
-   real.
+6. [orientación flexible + elegida por hueco real, no fija por SKU]
+   Comestibles/Aseo/Cigarros pueden acostarse o voltearse en cualquiera de
+   sus 6 orientaciones (`torres.generar_torres_candidatas_todas_
+   orientaciones`) para aprovechar huecos irregulares que ninguna
+   orientación "de pie" calza -NABs y el resto de las categorías siguen
+   con las 2 orientaciones de siempre (pedido explícito: "nabs es el unico
+   que siempre tiene que ir de pie"). [reescrito -caso real reportado por
+   el usuario con fotos: "columnas" de altura despareja] Para CADA SKU, en
+   CADA intento de colocación, se prueban TODAS sus orientaciones
+   disponibles y se usa la que le da la Z más baja en ese momento -no una
+   orientación fija elegida de antemano por capacidad de grilla en un
+   pallet vacío. Antes, una orientación fija por SKU significaba que, si
+   esa orientación seguía encontrando dónde ir (aunque fuera solo
+   siguiendo su propia columna, cada vez más arriba), nunca se comparaba
+   contra la otra orientación "de pie" -así, un hueco angosto que dejaba
+   OTRA columna ya agotada (footprint más chico que el de la columna
+   vecina) se quedaba sin usar aunque la otra orientación calzara justo
+   ahí, aunque hubiera piso libre. Probar todas cada vez sigue sin acostar
+   nada para Licores/Lácteos/NABs (pedido explícito del usuario: mantener
+   siempre de pie, ver PATCH_LOG.md) -solo elige, de las orientaciones que
+   YA tenía permitidas, la más útil para el cuboide libre real disponible
+   en ese momento. Como el motor sigue siendo el mismo MaxRects exacto,
+   esto no relaja NADA de la garantía de soporte -solo evalúa más
+   candidatas por cuboide libre real.
 7. [tope real por SKU] `Cajas por PH` del Maestro es el máximo físico de
    cuántas cajas de un SKU pueden ir en UN pallet (sea homogéneo o
    mezclado) -se aplica como tope duro por pallet (`tope_pallet_por_sku` +
@@ -182,22 +197,6 @@ def _banda_de_sku(categoria: str | None, nivel_categoria_original: float | None)
     if nivel_categoria_original is not None and nivel_categoria_original >= config.NIVEL_REMATE:
         return BANDA_REMANENTE
     return _BANDA_POR_CATEGORIA_ESTRICTA.get(categoria, BANDA_REMANENTE)
-
-
-def _mejor_orientacion_grilla(candidatas: list[TorreCandidate]) -> TorreCandidate:
-    """Fija UNA sola orientación por SKU para todo el pallet (base estricta
-    120x100) -nunca mezclada, eso fragmentaba el espacio de formas que
-    después ninguna orientación podía volver a aprovechar bien. Base
-    estricta (no la extendida con sobresaliente): una capa puede terminar
-    compartida por varios SKUs, y mezclar sobresalientes de SKUs distintos
-    en direcciones distintas da un perfil irregular -ver PATCH_LOG.md,
-    sección sobresaliente."""
-    def _capacidad_grilla(c: TorreCandidate) -> int:
-        cols = int(config.PALLET_LARGO // c.largo)
-        filas = int(config.PALLET_ANCHO // c.ancho)
-        return cols * filas
-
-    return max(candidatas, key=_capacidad_grilla)
 
 
 def _cabe_en_pallet(cand: TorreCandidate, presupuesto: float) -> bool:
@@ -372,38 +371,35 @@ def _empacar(
             for sku in activos:
                 tope_capa = capacidad_cama_por_sku.get(sku)
                 banda_sku = banda_por_sku.get(sku, BANDA_REMANENTE)
-                # [sección 6] Entre las candidatas "de pie" (siempre existen
-                # -son las mismas 2 de siempre) se elige la preferida por
-                # mejor grilla; las "acostado" (si las hay, solo en
-                # categorías flexibles) quedan como fallback más abajo -de
-                # pie siempre gana primero cuando sirve, acostado es último
-                # recurso, no la opción por defecto.
-                de_pie = [c for c in por_sku[sku] if "de pie" in c.orientacion] or por_sku[sku]
-                cand = _mejor_orientacion_grilla(de_pie)
-                idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa, banda_sku, banda_por_sku)
-                if idx_libre is None and len(por_sku[sku]) > 1:
-                    # [fallback de orientación] La orientación preferida
-                    # (mejor grilla) no entra en NINGÚN cuboide libre en
-                    # este momento -antes de dar por perdido este SKU en
-                    # este pallet, probar sus otras orientaciones (la otra
-                    # "de pie", y para categorías flexibles también las 4
-                    # "acostado"). Real, verificado con datos reales: el
-                    # piso se fragmenta en bolsillos con formas que no
-                    # coinciden con la orientación preferida de una SKU,
-                    # pero sí con otra -preferir siempre la de mejor grilla
-                    # cuando sirve (así una SKU no mezcla orientaciones sin
-                    # necesidad real, eso fragmentaba en versiones
-                    # anteriores), y solo caer a las demás como último
-                    # recurso en vez de dejar espacio utilizable sin usar.
-                    for alterna in por_sku[sku]:
-                        if alterna is cand:
-                            continue
-                        idx_libre = _mejor_cuboide_para_sku(pallet, pc, alterna, tope_capa, banda_sku, banda_por_sku)
-                        if idx_libre is not None:
-                            cand = alterna
-                            break
-                if idx_libre is None:
+                # [sección 6, reescrito -caso real: columnas de altura
+                # despareja] Se prueban TODAS las orientaciones de este SKU
+                # (para Licores/Lácteos/NABs, siempre de pie, son solo 2;
+                # para las categorías flexibles, hasta 6) y se usa la que
+                # le da la Z más baja a ESTE SKU -no una orientación fija
+                # "preferida" elegida de antemano por capacidad de grilla
+                # en un pallet vacío. Antes, una orientación fija por SKU
+                # significaba que si esa orientación seguía encontrando
+                # dónde ir (aunque fuera en SU PROPIA columna, más arriba),
+                # nunca se comparaba contra la otra orientación "de pie" -
+                # así, un hueco angosto que dejaba OTRA columna ya agotada
+                # se quedaba sin usar aunque la otra orientación calzara
+                # justo ahí (columnas de altura pareja según el SKU, no
+                # según el hueco real disponible). Probar todas cada vez
+                # sigue sin acostar nada para Licores/Lácteos/NABs -esas
+                # solo tienen las 2 "de pie"- y elige la MEJOR, no una fija
+                # de antemano.
+                mejor_para_sku = None
+                for cand_op in por_sku[sku]:
+                    idx_libre_op = _mejor_cuboide_para_sku(pallet, pc, cand_op, tope_capa, banda_sku, banda_por_sku)
+                    if idx_libre_op is None:
+                        continue
+                    libre_op = pc.libres[idx_libre_op]
+                    clave_op = (libre_op.z, libre_op.volumen)
+                    if mejor_para_sku is None or clave_op < mejor_para_sku[0]:
+                        mejor_para_sku = (clave_op, cand_op, idx_libre_op)
+                if mejor_para_sku is None:
                     continue
+                _, cand, idx_libre = mejor_para_sku
                 z_destino = pc.libres[idx_libre].z
                 area = cand.largo * cand.ancho
                 clave = (banda_sku, z_destino, -area, -pendientes[sku])
