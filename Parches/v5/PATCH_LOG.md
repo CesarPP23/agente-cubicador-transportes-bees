@@ -2667,3 +2667,130 @@ dataset de referencia).
 - tests: 150 passed (sin tests nuevos en esta sección -el mecanismo se
   verificó contra datos reales, no sintéticos; los tests existentes de
   `test_packing_bloques.py` siguen pasando sin cambios).
+
+## Reescritura de bandas -pedido explícito del usuario
+
+> "reescribamos el orden, se arman las camas no las columnas primero
+> todos los licores si la demanda pide 1 cama de licores la siguiente
+> cama deberia ser de lacteos o nabs, y los remantes pueden ser
+> importados, comestibles, merch, cigarros que se mantenga la regla de se
+> consolifa hasta 500 unidaes por cd en las cajas y medidas que ya te di,
+> categorias disntinas si pueden compartir la misma cama siempre y cuando
+> en alto tambien sea compartido"
+
+Después de ver fotos de un camión real cargado (CD Chanchamayo) con
+pallets densos, sin ningún espacio libre, mezclando varios SKUs/marcas
+distintos por cama -el usuario pidió reemplazar la competencia
+simultánea "por nivel" (sección 4 de `packing_bloques.py` hasta acá, 8
+niveles de categoría, todos mezclándose libremente con el nivel solo como
+desempate) por 4 BANDAS estrictamente secuenciales: Licores → Lácteos →
+NABs → remanente (Aseo, Importados, Merch, Comestibles, Cigarros -y
+cualquier SKU forzado a nivel remate por Subcategoría RTD/Energizante,
+ver Four Loko). Aclarado en 3 preguntas de seguimiento:
+- Aseo entra en el grupo remanente ("Es parte del grupo remanente").
+- Cigarros YA NO tiene que ser lo más alto obligatorio ("Ya no es
+  obligatorio que sea lo más alto") -deja de ser un caso especial, es un
+  miembro más de la banda remanente.
+- Entre Lácteos y NABs (banda 2 y 3), Lácteos va primero cuando ambas
+  tienen demanda pendiente ("Lácteos primero, NABs después").
+- "hasta 500 unidades" fue un lapsus del usuario, confirmado 1000
+  (`CAJA_BAT_CAPACIDAD_UNIDADES`, sin cambios -dejar como está).
+
+### Diseño
+- **Banda como concepto NUEVO, propio de `packing_bloques.py`**
+  (`_banda_de_sku`), separado de `config.Nivel_Categoria` (que sigue
+  existiendo tal cual para reportes/exports, sin tocar `config.py` ni
+  `derivados.py`). 1=Licores, 2=Lácteos, 3=NABs, 4=remanente. Cualquier
+  SKU cuyo `Nivel_Categoria` original ya sea "remate o más" (incluye
+  Comestibles/Cigarros reales Y cualquier SKU forzado por Subcategoría
+  RTD/Energizante) cae en banda 4 sin importar su categoría textual -así
+  Four Loko (Categoria_Normalizada="Licores") no se cuela en la banda 1.
+- **La banda es el PRIMER criterio de la competencia por cuboide libre**
+  (antes que la Z): `clave = (banda_sku, z_destino, -area, -demanda)` en
+  vez de `(z_destino, nivel_sku, ...)`. Una banda menor SIEMPRE gana
+  sobre una mayor mientras tenga algún cuboide disponible, por lejano que
+  sea -eso agota Licores en la práctica antes de que Lácteos empiece,
+  sin necesitar una pasada separada ni resetear el estado 3D persistente
+  (la garantía de 0% de flotación no se toca).
+- **Exclusividad de cama entre bandas 1-3** (`_cama_es_de_otra_banda_
+  estricta`, NUEVO): a diferencia del esquema anterior, Licores/Lácteos/
+  NABs NUNCA comparten una misma Z entre sí, aunque la geometría dejara
+  hueco -"la siguiente cama debería ser de lácteos o nabs" se lee
+  literal: cada cama de estas 3 bandas es de una sola banda. La banda
+  remanente (4) queda AFUERA de esta restricción -puede aparecer en
+  cualquier cama, con cualquier banda, rellenando lo que sobre (es, por
+  diseño, el grupo remanente).
+- **Alto compartido dentro de la banda remanente** (`_altura_compatible_
+  con_cama`, NUEVO): al mezclar categorías distintas en una cama de la
+  banda 4, una caja nueva solo entra en una Z donde ya hay otras cajas de
+  esa banda si su alto coincide (±`TOLERANCIA_ALTURA_CAMA_CM=8.0`, mismo
+  valor ya calibrado en `packing_ph_fraccion.py`) con TODO lo que ya está
+  ahí -pedido explícito ("categorias disntinas si pueden compartir la
+  misma cama siempre y cuando en alto tambien sea compartido"). Exento en
+  el PISO del pallet (z=0): mezclar SKUs de alturas muy distintas ahí es
+  exactamente lo que el fix anterior de "huella grande gana el empate"
+  (ver sección previa) ya había demostrado que hace falta con datos
+  reales, y lo que muestran las fotos de cubicaje real del usuario
+  (botellas de alturas distintas conviviendo en la misma base). Bandas
+  1-3 no llevan esta restricción en ningún caso (son de una sola
+  categoría cada una).
+- **Se retiró la reserva de altura dedicada para Cigarros** (sección 8 de
+  una versión anterior de este archivo): dejó de tener sentido en cuanto
+  Cigarros pasó a ser un miembro más de la banda remanente en vez del
+  único SKU que siempre pierde la competencia por nivel. `_redistribuir_
+  dispersos` (mover pallets muy vacíos al espacio libre real de otros ya
+  armados) se mantiene, ahora parametrizado por banda en vez de nivel.
+
+### Efecto colateral (positivo, no buscado): resuelve el stranding de BAT
+El bug que quedaba PARCIALMENTE resuelto en la sección anterior (BAT/
+Cigarros stranded en pallets casi vacíos, 5 de 7 CDs sin resolver porque
+la reserva de altura solo protegía el presupuesto, no la forma XY) se
+resolvió ENTERO como efecto colateral de este rediseño: Cigarros ya no
+compite en desventaja estructural contra TODOS los demás niveles (era
+siempre el último de 8) -ahora comparte la banda 4 en igualdad de
+condiciones con Aseo/Importados/Merch/Comestibles, así que puede ganar la
+competencia por espacio como cualquier otro. Verificado contra
+`Cubicaje18.07.2026.xlsx`: **0 pallets BAT-puros** (antes 6), y SKUs de
+Comestibles/Aseo ahora sí quedan apoyados sobre Cigarros/BAT en varios
+pallets reales (ej. PV5-BK31-003, PV5-BK68-031, PV5-SJ97-060).
+
+### Desacoplamiento de `packing_ph_fraccion.py`
+Ese módulo (motor aproximado, abandonado, no usado por el pipeline)
+reusaba `packing_bloques._mejor_cuboide_para_sku` pasándole `nivel_por_
+sku` (escala 1-8) donde esta reescritura ahora espera una banda (escala
+1-4) -las 2 verificaciones nuevas (`_cama_es_de_otra_banda_estricta`,
+`_altura_compatible_con_cama`) interpretaban mal esos valores y rompían 2
+tests de `test_packing_ph_fraccion.py` (relleno de huecos). Se le dio a
+`packing_ph_fraccion.py` su propia copia local de la función (idéntica a
+la versión pre-reescritura, sin las 2 verificaciones nuevas) en vez de
+seguir importando la de `packing_bloques.py` -ese módulo queda congelado
+tal como estaba antes de esta reescritura, no recibe el concepto de
+bandas.
+
+### Resultado (`Cubicaje18.07.2026.xlsx`, 183 SKUs, 9 CDs)
+```
+61 pallets (antes 65 con el esquema por nivel). 0 violaciones
+geométricas. Demanda exacta (5049.99 cajas, 183 SKUs, igual que antes).
+Ocupación XY: media 84% (antes ~83%), solo 3 de 61 pallets <50% de
+ocupación (antes 6 de 65, todos BAT-puros -ahora 0 BAT-puros).
+```
+
+### Tests
+- `test_licores_nunca_queda_arriba_de_nabs` / `test_licores_si_puede_
+  quedar_debajo_de_nabs`: reescritos para pasar `categoria="Licores"`/
+  `"NABs"` explícito -bajo el esquema anterior alcanzaba con el nivel
+  numérico, ahora la banda se deriva de la categoría real.
+- `test_bandas_se_agotan_en_orden_licores_lacteos_nabs` (NUEVO): con las
+  3 bandas estrictas pendientes en un solo pallet, se agotan en orden
+  Licores → Lácteos → NABs, sin interfoliarse.
+- `test_four_loko_queda_en_banda_remanente_no_en_licores` (reescrito de
+  `test_four_loko_queda_arriba_de_todo_por_nivel_remate`): Four Loko cae
+  en banda remanente aunque su categoría textual sea "Licores", así que
+  queda por encima de Licores regulares en el mismo pallet -no porque
+  tenga una regla especial de "siempre lo más alto", sino por
+  construcción de bandas secuenciales.
+- `test_huella_grande_gana_el_empate_de_z_sobre_mas_demanda` (existente,
+  sin cambios): seguía pasando -confirma que la exención de piso (z=0) en
+  `_altura_compatible_con_cama` no regresionó este fix anterior.
+- Suite completa: 151 passed (22 en `test_packing_bloques.py`, 15 en
+  `test_packing_ph_fraccion.py` tras el desacople, resto sin tocar).

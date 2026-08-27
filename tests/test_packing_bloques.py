@@ -141,14 +141,16 @@ def test_demanda_grande_ocupa_varias_camas_del_mismo_pallet():
 
 
 def test_licores_nunca_queda_arriba_de_nabs():
-    """NABs (nivel 6) nunca puede quedar en una cama de altura MENOR (más
-    abajo) que una cama de Licores (nivel 1) del mismo pallet -aunque NABs
-    tenga más demanda pendiente, que antes hubiera ganado el ancla de la
-    primera cama por peso puro."""
+    """[reescritura de bandas] Licores (banda 1) y NABs (banda 3) son
+    bandas ESTRICTAMENTE secuenciales -Licores se agota primero en el
+    pallet, así que NABs nunca puede terminar en una cama más baja que
+    Licores en el mismo pallet, ni aunque tenga mucha más demanda
+    pendiente (que antes hubiera ganado el ancla de la primera cama por
+    peso/huella puro)."""
     df = pd.DataFrame(
         [
-            _fila("NABS", 30, 20, 20.0, 100, cajas_cama=30, nivel=6),  # mucha demanda, ganaría por peso puro
-            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, nivel=1),
+            _fila("NABS", 30, 20, 20.0, 100, cajas_cama=30, categoria="NABs"),  # mucha demanda
+            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, categoria="Licores"),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
@@ -169,8 +171,8 @@ def test_licores_nunca_queda_arriba_de_nabs():
 def test_licores_si_puede_quedar_debajo_de_nabs():
     df = pd.DataFrame(
         [
-            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, nivel=1),
-            _fila("NABS", 30, 20, 20.0, 20, cajas_cama=30, nivel=6),
+            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, categoria="Licores"),
+            _fila("NABS", 30, 20, 20.0, 20, cajas_cama=30, categoria="NABs"),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")
@@ -181,18 +183,48 @@ def test_licores_si_puede_quedar_debajo_de_nabs():
     assert max(zs_licor) < min(zs_nabs)
 
 
-def test_four_loko_queda_arriba_de_todo_por_nivel_remate():
-    """[Four Loko] Se identifica por Nivel_Categoria ya resuelto a
-    NIVEL_REMATE (config.NIVEL_REMATE) -acá se prueba el efecto en el
-    packer, no la detección por texto (eso es derivados.py). Con nivel de
-    remate, ninguna otra SKU puede quedar en una cama más alta -Four Loko
-    siempre es la última."""
+def test_bandas_se_agotan_en_orden_licores_lacteos_nabs():
+    """[reescritura de bandas -pedido explícito: "primero todos los
+    licores... la siguiente cama deberia ser de lacteos o nabs"] Con
+    demanda pendiente de las 3 bandas estrictas, el pallet arma TODO
+    Licores antes de tocar Lácteos, y todo Lácteos antes que NABs -no se
+    interfoliuan aunque la geometría permitiría mezclarlas."""
+    df = pd.DataFrame(
+        [
+            _fila("NABS", 30, 20, 20.0, 6, cajas_cama=30, categoria="NABs"),
+            _fila("LACTEO", 30, 20, 20.0, 6, cajas_cama=30, categoria="Lácteos"),
+            _fila("LICOR", 30, 20, 20.0, 6, cajas_cama=30, categoria="Licores"),
+        ]
+    )
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_por_cama = _torres_por_z(pallets)
+    assert len(pallets) == 1
+    zs = {
+        sku: sorted(z for (_pid, z), torres in torres_por_cama.items() if any(t.sku == sku for t in torres))
+        for sku in ("LICOR", "LACTEO", "NABS")
+    }
+    assert max(zs["LICOR"]) < min(zs["LACTEO"])
+    assert max(zs["LACTEO"]) < min(zs["NABS"])
+
+
+
+
+def test_four_loko_queda_en_banda_remanente_no_en_licores():
+    """[Four Loko, reescritura de bandas -pedido explícito: "ya no es
+    obligatorio que sea lo más alto"] Se identifica por Nivel_Categoria ya
+    resuelto a NIVEL_REMATE (config.NIVEL_REMATE) por derivados.py -acá se
+    prueba el efecto en el packer, no la detección por texto. Aunque su
+    Categoria_Normalizada diga "Licores", Four Loko cae en la banda
+    remanente (4), NO en la banda 1 (Licores regulares) -por construcción
+    de bandas estrictamente secuenciales, eso alcanza para que quede
+    siempre por encima de Licores de verdad en el mismo pallet, sin
+    necesitar ninguna regla "Cigarros/remate siempre lo más alto"."""
     import config
 
     df = pd.DataFrame(
         [
-            _fila("FOURLOKO", 20, 20, 20.0, 5, cajas_cama=20, nivel=config.NIVEL_REMATE),
-            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, nivel=1),
+            _fila("FOURLOKO", 20, 20, 20.0, 5, cajas_cama=20, categoria="Licores", nivel=config.NIVEL_REMATE),
+            _fila("LICOR", 30, 20, 20.0, 20, cajas_cama=30, categoria="Licores", nivel=1),
         ]
     )
     pallets = armar_pallets_bloques(df, "BK31")

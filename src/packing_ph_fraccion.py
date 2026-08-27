@@ -79,15 +79,25 @@ Cigarros/NABs. Los primeros tres pueden acostarse/voltearse en cualquiera
 de sus 6 orientaciones (`torres.generar_torres_candidatas_todas_
 orientaciones`) para aprovechar huecos irregulares -NABs SIEMPRE va de
 pie (2 orientaciones nomás, igual que el resto del armado), pedido
-explícito del usuario. Reusa `packing_bloques._mejor_cuboide_para_sku`
-(mismo chequeo de tope por capa y de orden de categoría que ya está
-probado) -no se reimplementa esa lógica.
+explícito del usuario.
+
+[desacoplado de `packing_bloques.py` -reescritura de bandas] Este módulo
+tenía su propio `_mejor_cuboide_para_sku`/`_soporte_viola_nivel` acá abajo,
+una copia exacta de la versión que en su momento tenía `packing_bloques.py`
+(mismo chequeo de tope por capa y de orden de categoría por NIVEL, 1-8).
+Cuando `packing_bloques.py` reescribió su ordenamiento a 4 "bandas"
+estrictamente secuenciales (ver su docstring, sección 4), esa función
+compartida cambió de semántica -pasó a esperar una banda 1-4, no un nivel
+1-8- así que reusarla acá ya no era seguro (dos escalas distintas
+entendidas como si fueran la misma). Este módulo quedó igual como estaba
+ANTES de esa reescritura -sigue siendo el motor aproximado abandonado, no
+recibe la actualización de bandas- por eso mantiene su propia copia
+independiente en vez de importar la de `packing_bloques.py`.
 """
 import pandas as pd
 
 import config
 from models import PalletV5, Torre
-from src.packing_bloques import _mejor_cuboide_para_sku
 from src.packing_columnar import _altura_presupuesto, _area_union_xy, _reconstruir_en_construccion
 from src.torres import (
     TorreCandidate,
@@ -158,6 +168,53 @@ def _cabe_en_pallet(cand: TorreCandidate, presupuesto: float) -> bool:
     cols = int(config.PALLET_LARGO // cand.largo)
     filas = int(config.PALLET_ANCHO // cand.ancho)
     return cols > 0 and filas > 0 and cand.alto_caja <= presupuesto + TOL
+
+
+def _soporte_viola_nivel(
+    pallet: PalletV5, x: float, y: float, largo: float, ancho: float, z: float,
+    nivel_sku: int, nivel_por_sku: dict[str, int],
+) -> bool:
+    """[copia propia, ver docstring del módulo] Una caja nunca puede quedar
+    apoyada DIRECTAMENTE encima de otra de un nivel de categoría mayor. En
+    z=0 no hay restricción."""
+    if z <= TOL:
+        return False
+    for t in pallet.torres:
+        if abs((t.z + t.altura) - z) > TOL:
+            continue
+        if t.x + t.largo <= x + TOL or x + largo <= t.x + TOL:
+            continue
+        if t.y + t.ancho <= y + TOL or y + ancho <= t.y + TOL:
+            continue
+        if nivel_por_sku.get(t.sku, 0) > nivel_sku:
+            return True
+    return False
+
+
+def _mejor_cuboide_para_sku(
+    pallet: PalletV5, pc, cand: TorreCandidate, tope_capa: int | None,
+    nivel_sku: int, nivel_por_sku: dict[str, int],
+) -> int | None:
+    """[copia propia, ver docstring del módulo] Entre los cuboides libres
+    que reciban 1 caja de `cand`, el de menor Z. Descarta un cuboide si (a)
+    `tope_capa` ya se alcanzó para este SKU en esa Z exacta, o (b) colocar
+    ahí violaría el orden de categoría por columna (`_soporte_viola_nivel`)."""
+    mejor_idx, mejor_clave = None, None
+    for idx, c in enumerate(pc.libres):
+        if cand.largo > c.w + TOL or cand.ancho > c.h + TOL or cand.alto_caja > c.d + TOL:
+            continue
+        if tope_capa is not None:
+            ya_en_esta_capa = sum(
+                t.cantidad for t in pallet.torres if t.sku == cand.sku and abs(t.z - c.z) <= TOL
+            )
+            if ya_en_esta_capa >= tope_capa:
+                continue
+        if _soporte_viola_nivel(pallet, c.x, c.y, cand.largo, cand.ancho, c.z, nivel_sku, nivel_por_sku):
+            continue
+        clave = (c.z, c.volumen)
+        if mejor_clave is None or clave < mejor_clave:
+            mejor_idx, mejor_clave = idx, clave
+    return mejor_idx
 
 
 def _colocar_torre(pallet: PalletV5, candidata: TorreCandidate, x: float, y: float, z: float) -> Torre:
