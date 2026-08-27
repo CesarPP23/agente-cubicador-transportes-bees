@@ -2506,3 +2506,90 @@ demanda exacta.
   huecos ajenos, y el tope de `Cajas por PH` sigue aplicando aunque la
   colocación venga del llenado de huecos.
 - tests: 146 passed (suite completa).
+
+---
+
+## Cigarros no es lo mismo que Comestibles, y vuelta al motor exacto
+## -reportado por el usuario con fotos reales de la app
+
+El usuario corrió la app conectada con su dataset y mandó 2 fotos de
+pallets reales con dos problemas:
+1. Un pallet con Comestibles (categoría) apilado ENCIMA de Cigarros/BAT
+   -"esa caja es cigarros y siempre tiene que ir encima". Comestibles y
+   Cigarros compartían el mismo `NIVEL_REMATE` (7), así que podían quedar
+   en cualquier orden entre sí.
+2. Camas con espacio vacío grande Y ADEMÁS cajas visiblemente sin apoyo
+   real debajo -"eso no puede pasar... tiene que llenar la cama en su
+   dimension volumetrica completa y luego pasar a la siguiente".
+
+### Fix 1: `config.NIVEL_CIGARROS`
+Cigarros ya no comparte nivel con Comestibles -tiene el suyo propio, uno
+más alto (`NIVEL_REMATE + 1` = 8), así que por la misma regla de orden de
+categoría que ya existía (nunca decrece de piso a techo), Comestibles NUNCA
+puede quedar apoyado encima de Cigarros. El pseudo-SKU de BAT (consolidado
+de Cigarros/vapes) también se declara explícitamente con `Categoria_
+Normalizada="Cigarros"` y `Nivel_Categoria=NIVEL_CIGARROS` en `bat.py`
+-antes no declaraba categoría propia y cabía en el fallback genérico
+`NIVEL_REMATE`, quedando al mismo nivel que Comestibles.
+
+### Fix 2: se retiró `packing_ph_fraccion.py` del pipeline
+Se midió la magnitud real del problema de flotación antes de decidir:
+sobre `Cubicaje18.07.2026.xlsx`, de 4350 torres que no arrancan en el
+piso, la cobertura de soporte real promedio era del 79% -742 torres (17%)
+con menos del 50% de apoyo real, muchas con 0% (literalmente flotando).
+No era un caso límite raro, era sistemático -consecuencia directa de que
+cada capa arma su propio layout de estantería desde cero (x=0,y=0) sin
+mirar qué hay exactamente debajo; el % de cobertura por capa nunca
+garantizaba que CADA caja individual tuviera apoyo real en su posición
+exacta.
+
+Decisión del usuario, con el trade-off explicado (más pallets a cambio de
+garantía real caja por caja): volver a `src/packing_bloques.py` (el motor
+MaxRects exacto, ya con 0% de flotación verificado desde el fix original
+de esta sesión) como motor activo del pipeline. Se le agregaron 2
+ingredientes que `packing_ph_fraccion.py` sí había demostrado que ayudan a
+recuperar densidad sin sacrificar la garantía exacta:
+- **Orientación flexible** (`CATEGORIAS_ORIENTACION_FLEXIBLE = {"Comestibles",
+  "Aseo", "Cigarros"}`): estos SKUs generan las 6 orientaciones posibles
+  (`torres.generar_torres_candidatas_todas_orientaciones`, ya existía para
+  el llenado de huecos del motor retirado) en vez de las 2 "de pie" -de
+  pie sigue siendo la preferida cuando sirve (se calcula la mejor grilla
+  solo entre las "de pie"), acostado es el último recurso del fallback de
+  orientación que ya existía. NABs y el resto de las categorías siguen con
+  2 orientaciones nomás -pedido explícito: "nabs es el unico que siempre
+  tiene que ir de pie".
+- **Tope real de `Cajas por PH`** por pallet (`tope_pallet_por_sku` +
+  `colocado_en_pallet`, mismo mecanismo que ya se había probado en
+  `packing_ph_fraccion.py`).
+
+`packing_ph_fraccion.py` queda en el repo, probado, pero ya no es el motor
+del pipeline (`pipeline_sku_bloque.py` volvió a importar `armar_pallets_
+bloques` de `packing_bloques.py`).
+
+### Resultado -verificado con el pipeline real, ambos datasets
+```
+                    ANTES (PH_FRACCION)   AHORA (motor exacto + flexible)
+Cubicaje18.07.2026:  49 pallets            65 pallets
+  cobertura soporte:  79.0% promedio        100.0% (exacto, 0 flotando)
+  torres <50% apoyo:  742                   0
+
+Dataset del usuario: 19 pallets            27 pallets
+  5 CDs dentro de margen ±1: 4 de 5         1 de 5 (solo BK36)
+```
+Sube bastante el conteo de pallets -es el costo real de garantizar apoyo
+exacto caja por caja en vez de una aproximación por % de cobertura. Se
+reporta tal cual, sin ajustar nada para disimularlo: la brecha contra el
+cubicaje real (que ya se había cerrado con PH_FRACCION) se vuelve a abrir.
+0 solapamientos, 0 excesos de altura, 0 SKUs sobre su Cajas por PH,
+demanda exacta en ambos datasets.
+
+### Invariantes
+- `tests/test_packing_bloques.py`: 4 tests nuevos -categoría flexible
+  entra acostada donde de pie no calza (y el motor sigue en 0% de
+  flotación con esto activo), NABs nunca se acuesta, categoría no
+  flexible (ej. otro Licor) tampoco se acuesta, tope de Cajas por PH por
+  pallet.
+- Verificado manualmente (no solo tests sintéticos) contra ambos datasets
+  reales: 100.0% de cobertura de soporte exacta, 0 violaciones
+  geométricas, demanda exacta, 0 NABs acostados.
+- tests: 150 passed (suite completa).

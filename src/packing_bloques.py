@@ -66,15 +66,44 @@ Arquitectura (corregida):
    se reempacan juntos con el mismo motor -si el reempaque no mejora
    (mismo número de pallets o más), se descarta y se conserva el
    resultado original; nunca se acepta un reempaque peor.
+
+[reconstruido sobre el motor exacto -pedido explícito del usuario tras ver
+fotos de un pallet con ~21% de cobertura de soporte faltante en promedio
+(motor aproximado PH_FRACCION, retirado): "tiene que llenar la cama en su
+dimension volumetrica completa y luego pasar a la siguiente", "toda caja
+debe esta puesta sobre otra caja"] Este archivo (el motor 3D exacto,
+0% de flotación verificado desde el fix original) vuelve a ser el que usa
+el pipeline -ver `pipeline_sku_bloque.py`. Para recuperar la densidad real
+que PH_FRACCION perseguía sin sacrificar la garantía exacta, se le agregan
+2 ingredientes que esa versión aproximada sí demostró que funcionan:
+6. [orientación flexible] Comestibles/Aseo/Cigarros pueden acostarse o
+   voltearse en cualquiera de sus 6 orientaciones (`torres.generar_torres_
+   candidatas_todas_orientaciones`) para aprovechar huecos irregulares que
+   ninguna orientación "de pie" calza -NABs y el resto de las categorías
+   siguen con las 2 orientaciones de siempre (pedido explícito: "nabs es
+   el unico que siempre tiene que ir de pie"). Como el motor sigue siendo
+   el mismo MaxRects exacto, esto no relaja NADA de la garantía de soporte
+   -solo le da más formas candidatas para probar en cada cuboide libre
+   real.
+7. [tope real por SKU] `Cajas por PH` del Maestro es el máximo físico de
+   cuántas cajas de un SKU pueden ir en UN pallet (sea homogéneo o
+   mezclado) -se aplica como tope duro por pallet (`tope_pallet_por_sku` +
+   `colocado_en_pallet`, reseteado en cada pallet nuevo), igual mecanismo
+   que ya se había probado en PH_FRACCION.
 """
 import pandas as pd
 
 import config
 from models import PalletV5
 from src.packing_columnar import _altura_presupuesto, _PalletEnConstruccion
-from src.torres import TorreCandidate, generar_torres_candidatas
+from src.torres import TorreCandidate, generar_torres_candidatas, generar_torres_candidatas_todas_orientaciones
 
 TOL = 1e-6
+
+# [sección 6] Categorías que pueden acostarse/voltearse libremente para
+# aprovechar huecos irregulares -pedido explícito del usuario. NABs NUNCA
+# entra acá: siempre de pie (mismas 2 orientaciones que el resto).
+CATEGORIAS_ORIENTACION_FLEXIBLE = {"Comestibles", "Aseo", "Cigarros"}
 
 
 def _mejor_orientacion_grilla(candidatas: list[TorreCandidate]) -> TorreCandidate:
@@ -165,10 +194,11 @@ def _empacar(
     por_sku: dict[str, list[TorreCandidate]],
     capacidad_cama_por_sku: dict[str, int],
     nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
     cd: str,
     contador: list[int],
 ) -> list[PalletV5]:
-    """[secciones 1-4] Un barrido completo del algoritmo de camas sobre
+    """[secciones 1-4, 7] Un barrido completo del algoritmo de camas sobre
     `pendientes` -extraído aparte para poder invocarlo más de una vez sobre
     distintos subconjuntos de demanda (ver sección 5, consolidación de
     remanentes) sin duplicar la lógica de armado."""
@@ -179,6 +209,9 @@ def _empacar(
         pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
         pc = _PalletEnConstruccion(pallet=pallet)
         avanzo_en_este_pallet = False
+        # [sección 7] Cajas por PH es un tope por PALLET, no global -se
+        # resetea acá, en cada pallet nuevo.
+        colocado_en_pallet: dict[str, int] = {}
 
         # [sección 4] TODOS los SKUs de TODOS los niveles compiten juntos
         # por el cuboide libre más bajo disponible -no se procesa "primero
@@ -191,7 +224,12 @@ def _empacar(
             guard += 1
             if guard > 100_000:
                 break
-            activos = [s for s in pendientes if pendientes[s] > 0]
+            activos = [
+                s
+                for s in pendientes
+                if pendientes[s] > 0
+                and colocado_en_pallet.get(s, 0) < tope_pallet_por_sku.get(s, float("inf"))
+            ]
             if not activos:
                 break
 
@@ -216,22 +254,29 @@ def _empacar(
             for sku in activos:
                 tope_capa = capacidad_cama_por_sku.get(sku)
                 nivel_sku = nivel_por_sku.get(sku, 0)
-                cand = _mejor_orientacion_grilla(por_sku[sku])
+                # [sección 6] Entre las candidatas "de pie" (siempre existen
+                # -son las mismas 2 de siempre) se elige la preferida por
+                # mejor grilla; las "acostado" (si las hay, solo en
+                # categorías flexibles) quedan como fallback más abajo -de
+                # pie siempre gana primero cuando sirve, acostado es último
+                # recurso, no la opción por defecto.
+                de_pie = [c for c in por_sku[sku] if "de pie" in c.orientacion] or por_sku[sku]
+                cand = _mejor_orientacion_grilla(de_pie)
                 idx_libre = _mejor_cuboide_para_sku(pallet, pc, cand, tope_capa, nivel_sku, nivel_por_sku)
                 if idx_libre is None and len(por_sku[sku]) > 1:
                     # [fallback de orientación] La orientación preferida
                     # (mejor grilla) no entra en NINGÚN cuboide libre en
                     # este momento -antes de dar por perdido este SKU en
-                    # este pallet, probar su otra orientación. Real,
-                    # verificado con datos reales: el piso se fragmenta en
-                    # bolsillos con formas que no coinciden con la
-                    # orientación preferida de una SKU, pero sí con la
-                    # rotada -preferir siempre la orientación de mejor
-                    # grilla cuando sirve (así una SKU no mezcla
-                    # orientaciones sin necesidad real, eso fragmentaba en
-                    # versiones anteriores), y solo caer a la rotada como
-                    # último recurso en vez de dejar espacio utilizable sin
-                    # usar.
+                    # este pallet, probar sus otras orientaciones (la otra
+                    # "de pie", y para categorías flexibles también las 4
+                    # "acostado"). Real, verificado con datos reales: el
+                    # piso se fragmenta en bolsillos con formas que no
+                    # coinciden con la orientación preferida de una SKU,
+                    # pero sí con otra -preferir siempre la de mejor grilla
+                    # cuando sirve (así una SKU no mezcla orientaciones sin
+                    # necesidad real, eso fragmentaba en versiones
+                    # anteriores), y solo caer a las demás como último
+                    # recurso en vez de dejar espacio utilizable sin usar.
                     for alterna in por_sku[sku]:
                         if alterna is cand:
                             continue
@@ -253,6 +298,7 @@ def _empacar(
             _, sku, cand, idx_libre = mejor
             pc.colocar(cand, 1, idx_libre)
             pendientes[sku] -= 1
+            colocado_en_pallet[sku] = colocado_en_pallet.get(sku, 0) + 1
             avanzo_en_este_pallet = True
 
         if not avanzo_en_este_pallet:
@@ -278,7 +324,20 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
     (derivados.py) -sin esa columna, una capa no tiene tope propio más que
     la huella/orientación elegida."""
     contador = contador if contador is not None else [0]
-    candidatas = generar_torres_candidatas(df_cd, config.ALTURA_PRODUCTO_MAX)
+
+    # [sección 6, orientación flexible] Comestibles/Aseo/Cigarros pueden
+    # acostarse/voltearse -se les genera el set COMPLETO de 6 orientaciones
+    # en vez de las 2 "de pie" de siempre. El resto de las categorías
+    # (NABs incluido, pedido explícito: "nabs es el unico que siempre
+    # tiene que ir de pie") sigue con `generar_torres_candidatas` normal.
+    if "Categoria_Normalizada" in df_cd.columns:
+        es_flexible = df_cd["Categoria_Normalizada"].isin(CATEGORIAS_ORIENTACION_FLEXIBLE)
+        df_flexible, df_normal = df_cd[es_flexible], df_cd[~es_flexible]
+    else:
+        df_flexible, df_normal = df_cd.iloc[0:0], df_cd
+
+    candidatas = generar_torres_candidatas(df_normal, config.ALTURA_PRODUCTO_MAX)
+    candidatas += generar_torres_candidatas_todas_orientaciones(df_flexible, config.ALTURA_PRODUCTO_MAX)
     if not candidatas:
         return []
 
@@ -321,6 +380,18 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
     for sku in por_sku:
         nivel_por_sku.setdefault(sku, config.NIVEL_REMATE)
 
+    # [sección 7] `Cajas por PH` real del Maestro -tope físico de cuántas
+    # cajas de un SKU pueden ir en UN pallet (homogéneo o mezclado).
+    tope_pallet_por_sku: dict[str, int] = {}
+    if "Cajas por PH" in df_cd.columns:
+        for _, fila in df_cd.drop_duplicates(subset="SKU").iterrows():
+            sku = fila["SKU"]
+            if sku not in por_sku:
+                continue
+            cph = fila.get("Cajas por PH")
+            if pd.notna(cph) and cph > 0:
+                tope_pallet_por_sku[sku] = int(cph)
+
     presupuesto = _altura_presupuesto()
 
     # [chequeo previo] Un SKU que ni siquiera entra en un pallet VACÍO en
@@ -338,7 +409,7 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
             sin_colocar[sku] = pendientes[sku]
             pendientes[sku] = 0
 
-    pallets = _empacar(pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, cd, contador)
+    pallets = _empacar(pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, cd, contador)
 
     # [sección 5] Consolidación de remanentes: los pallets que quedaron muy
     # cortos se deshacen y se reempacan juntos -si mejora (menos pallets),
@@ -352,7 +423,9 @@ def armar_pallets_bloques(df_cd: pd.DataFrame, cd: str, contador: list[int] | No
         for p in cortos:
             for t in p.torres:
                 pendientes_residual[t.sku] = pendientes_residual.get(t.sku, 0) + t.cantidad
-        reempacados = _empacar(pendientes_residual, por_sku, capacidad_cama_por_sku, nivel_por_sku, cd, contador)
+        reempacados = _empacar(
+            pendientes_residual, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, cd, contador
+        )
         if len(reempacados) >= len(cortos):
             break  # no mejoró -se descarta el intento, se conserva lo que ya había
         ids_cortos = {id(p) for p in cortos}

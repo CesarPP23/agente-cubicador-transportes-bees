@@ -1,14 +1,17 @@
 """[SKU_BLOQUE] Pipeline para la lógica de bloques.
 
-[PH_FRACCION -ver PATCH_LOG.md] El motor de armado activo es
-`src/packing_ph_fraccion.py::armar_pallets_ph_fraccion` (importado acá
-como `armar_pallets_bloques` para no tocar el resto de este archivo) -
-calibrado contra un cubicaje real armado a mano, arma por fracción de PH
-en vez de geometría exacta caja por caja. `src/packing_bloques.py` (el
-motor geométrico exacto, MaxRects 3D con verificación caja por caja) sigue
-en el repo y probado, pero ya no es el que usa el pipeline -se puede volver
-a él cambiando el import de acá si hace falta la verificación exacta en
-vez de la densidad real.
+[vuelta al motor exacto -ver PATCH_LOG.md] Se probó `packing_ph_fraccion.py`
+(armado aproximado por fracción de PH, calibrado contra un cubicaje real)
+pero el usuario, viendo el resultado real en la app, encontró camas con
+hasta 21% de cobertura de soporte faltante en promedio (742 torres con
+menos del 50% de apoyo real, muchas con 0%) -"eso no puede pasar". Se
+volvió a `src/packing_bloques.py` (el motor geométrico exacto, MaxRects 3D,
+0% de flotación verificado), ahora con 2 agregados que sí demostró
+`packing_ph_fraccion.py` que ayudan a recuperar densidad sin sacrificar la
+garantía exacta: orientación flexible (Comestibles/Aseo/Cigarros pueden
+acostarse, NABs siempre de pie) y el tope real de `Cajas por PH` por
+pallet. `packing_ph_fraccion.py` queda en el repo, probado, pero no es el
+que usa el pipeline.
 
 Reutiliza VAL/DEM/GEO/DER/SPLIT/PESO/EXP tal cual el resto de los motores
 -esa infraestructura no depende de la estrategia de armado."""
@@ -28,7 +31,7 @@ from src import (
     validacion,
     validacion_peso,
 )
-from src.packing_ph_fraccion import armar_pallets_ph_fraccion as armar_pallets_bloques
+from src.packing_bloques import armar_pallets_bloques
 from src.pipeline import (
     _construir_info_sku,
     _construir_pallets_geometria_insuficiente,

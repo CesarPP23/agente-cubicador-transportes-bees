@@ -12,11 +12,12 @@ más bajo primero) nunca produce esa violación, vía `validar_geometria_v5`
 (que ahora incluye el chequeo anti-flotación)."""
 import pandas as pd
 
+import config
 from src.packing_bloques import armar_pallets_bloques
 from src.validacion_v5 import validar_geometria_v5
 
 
-def _fila(sku, largo, ancho, alto, cantidad, cajas_cama=None, cd="BK31", nivel=None):
+def _fila(sku, largo, ancho, alto, cantidad, cajas_cama=None, cd="BK31", nivel=None, categoria=None, cajas_por_ph=None):
     fila = {
         "SKU": sku, "CD": cd, "Cajas_Remanente": cantidad,
         "Largo_Efectivo": largo, "Ancho_Efectivo": ancho, "Alto_Efectivo": alto,
@@ -26,6 +27,10 @@ def _fila(sku, largo, ancho, alto, cantidad, cajas_cama=None, cd="BK31", nivel=N
         fila["Cajas_Cama_Efectivo"] = cajas_cama
     if nivel is not None:
         fila["Nivel_Categoria"] = nivel
+    if categoria is not None:
+        fila["Categoria_Normalizada"] = categoria
+    if cajas_por_ph is not None:
+        fila["Cajas por PH"] = cajas_por_ph
     return fila
 
 
@@ -367,3 +372,73 @@ def test_sin_cajas_cama_efectivo_igual_arma_algo():
     pallets = armar_pallets_bloques(df, "BK31")
     despachado = sum(t.cantidad for p in pallets for t in p.torres if t.sku == "SIN_CAMA")
     assert despachado == 8
+
+
+# --- orientación flexible (Comestibles/Aseo/Cigarros) + tope real de
+# Cajas por PH -pedido explícito del usuario tras ver fotos de camas
+# flotando en el motor aproximado PH_FRACCION, que se retiró; este motor
+# exacto (0% de flotación) es el que quedó conectado al pipeline de
+# nuevo, con estos 2 agregados -----------------------------------------
+
+def _dataset_con_hueco_real(categoria_relleno="Aseo"):
+    """GRANDE (footprint 35x100) deja siempre una tira de 15cm de ancho
+    (120 - 3*35) sin usar -ninguna de las 2 orientaciones "de pie" de
+    RELLENO entra ahí (25x20 o 20x25, ambas > 15cm de largo), pero
+    acostada sí (10x25, usando el Alto_Efectivo de 20 como una de las
+    dimensiones del piso)."""
+    return pd.DataFrame(
+        [
+            _fila("GRANDE", 35, 100, 20.0, 300, cajas_cama=3, nivel=1, categoria="Licores"),
+            _fila(
+                "RELLENO", 25, 20, 10.0, 40, cajas_cama=200,
+                nivel=config.nivel_de_categoria(categoria_relleno),
+                categoria=categoria_relleno,
+            ),
+        ]
+    )
+
+
+def test_categoria_flexible_entra_acostada_donde_de_pie_no_calza():
+    df = _dataset_con_hueco_real("Aseo")
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_relleno = [t for p in pallets for t in p.torres if t.sku == "RELLENO"]
+    assert torres_relleno, "RELLENO debería entrar en la tira que GRANDE deja libre"
+    assert any("acostado" in t.orientacion for t in torres_relleno), (
+        "RELLENO solo entra en la tira angosta acostado -ninguna orientación de pie calza"
+    )
+    assert validar_geometria_v5(pallets) == [], "el motor exacto debe seguir en 0% de flotación con orientación flexible"
+
+
+def test_nabs_nunca_se_coloca_acostado():
+    """[pedido explícito del usuario] "nabs es el unico que siempre tiene
+    que ir de pie" -aunque acostado calzara mejor en un hueco angosto,
+    NABs no tiene esa opción disponible."""
+    df = _dataset_con_hueco_real("NABs")
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_relleno = [t for p in pallets for t in p.torres if t.sku == "RELLENO"]
+    for t in torres_relleno:
+        assert "acostado" not in t.orientacion, f"NABs (RELLENO) quedó acostado: {t.orientacion}"
+
+
+def test_categoria_no_flexible_no_se_acuesta():
+    """Licores (u otra categoría fuera de Comestibles/Aseo/Cigarros) no
+    tiene orientaciones "acostado" disponibles en absoluto."""
+    df = _dataset_con_hueco_real("Licores")
+    pallets = armar_pallets_bloques(df, "BK31")
+    torres_relleno = [t for p in pallets for t in p.torres if t.sku == "RELLENO"]
+    for t in torres_relleno:
+        assert "acostado" not in t.orientacion
+
+
+def test_ningun_sku_supera_cajas_por_ph_en_un_solo_pallet():
+    """[bug real, reportado por el usuario con captura del Excel: SKU
+    22443 con 98 cajas en UN pallet, cuando el Maestro dice `Cajas por
+    PH`=75] Con demanda mucho mayor a `Cajas por PH`, ningún pallet debe
+    superar ese tope para ese SKU."""
+    df = pd.DataFrame([_fila("22443", 32.5, 24, 27.0, 302, cajas_cama=15, cajas_por_ph=75, nivel=6)])
+    pallets = armar_pallets_bloques(df, "BK36")
+    for p in pallets:
+        cant = sum(t.cantidad for t in p.torres if t.sku == "22443")
+        assert cant <= 75, f"{p.id} tiene {cant} cajas de 22443, supera Cajas por PH=75"
+    despachado = sum(t.cantidad for p in pallets for t in p.torres)
+    assert despachado == 302

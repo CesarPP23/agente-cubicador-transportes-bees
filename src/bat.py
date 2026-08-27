@@ -126,6 +126,17 @@ def construir_filas_bat_pseudo_sku(cajas_bat_por_cd: dict[str, list[CajaBAT]], i
                 "Peso_Caja": peso_unitario,
                 "Fuente_Geometria": "BAT",
                 "Cajas_Cama_Efectivo": capacidad_cama,
+                # [fix real: Cigarros/BAT apareció con algo apilado
+                # encima] BAT es la caja física de consolidación de
+                # Cigarros/vapes -mismo nivel estrictamente-último que
+                # cualquier otro SKU de Categoría Cigarros, nunca el
+                # NIVEL_REMATE genérico (eso permitiría Comestibles
+                # encima). Categoria_Normalizada también se declara acá
+                # -sin esto quedaba NaN y "Cigarros" no calificaba para
+                # el llenado de huecos ni para ningún reporte por
+                # categoría.
+                "Categoria_Normalizada": "Cigarros",
+                "Nivel_Categoria": config.NIVEL_CIGARROS,
             }
         )
     return pd.DataFrame(filas)

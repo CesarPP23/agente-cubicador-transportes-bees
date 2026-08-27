@@ -168,9 +168,20 @@ CATEGORIAS_CONOCIDAS = ORDEN_CATEGORIAS + CATEGORIAS_REMATE
 # Nivel de estabilidad: 1 (base, más pesado) .. 6 (NABs) .. 7 (remate).
 NIVEL_REMATE = len(ORDEN_CATEGORIAS) + 1  # 7
 
+# [fix real, reportado por el usuario con foto: Cigarros apareció con
+# Comestibles apilado ENCIMA] Cigarros y Comestibles comparten
+# CATEGORIAS_REMATE (para Es_Categoria_Remate y otros usos informativos),
+# pero Cigarros necesita ser estrictamente el ÚLTIMO -nunca puede quedar
+# nada, ni siquiera Comestibles, apoyado encima. Un nivel propio, uno más
+# alto que NIVEL_REMATE, garantiza eso con el mismo mecanismo de orden de
+# categoría que ya existe (nunca decrece de piso a techo).
+NIVEL_CIGARROS = NIVEL_REMATE + 1  # 8
+
 
 def nivel_de_categoria(categoria: str | None) -> int | None:
     """Nivel de estabilidad de una categoría ya normalizada, o None si no clasifica."""
+    if categoria == "Cigarros":
+        return NIVEL_CIGARROS
     if categoria in CATEGORIAS_REMATE:
         return NIVEL_REMATE
     if categoria in ORDEN_CATEGORIAS:
