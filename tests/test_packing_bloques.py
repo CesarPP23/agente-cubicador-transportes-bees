@@ -13,7 +13,8 @@ más bajo primero) nunca produce esa violación, vía `validar_geometria_v5`
 import pandas as pd
 
 import config
-from src.packing_bloques import armar_pallets_bloques
+from models import PalletV5, Torre
+from src.packing_bloques import _capacidad_instalada, _necesita_columna_nueva, armar_pallets_bloques
 from src.validacion_v5 import validar_geometria_v5
 
 
@@ -540,3 +541,56 @@ def test_ningun_sku_supera_cajas_por_ph_en_un_solo_pallet():
         assert cant <= 75, f"{p.id} tiene {cant} cajas de 22443, supera Cajas por PH=75"
     despachado = sum(t.cantidad for p in pallets for t in p.torres)
     assert despachado == 302
+
+
+def _torre_test(sku, x, y, z, alto_caja, cantidad):
+    return Torre(
+        sku=sku, cd="BK31", x=x, y=y, largo=30, ancho=20, alto_caja=alto_caja,
+        cantidad=cantidad, peso=0.0, orientacion="L×A", fuente_geometria="TEST", z=z,
+    )
+
+
+def test_capacidad_instalada_suma_el_resto_de_todas_las_columnas():
+    """[combinación por fila, caso real Pallet 1 CD Callao] `_capacidad_
+    instalada` debe sumar, sobre TODAS las columnas ya existentes de un
+    SKU, cuánto más cabe verticalmente en CADA una antes del presupuesto
+    de altura -no solo mirar la más alta ni una sola columna."""
+    presupuesto = 200.0
+    pallet = PalletV5(
+        id="P1", cd="BK31",
+        torres=[_torre_test("A", 0, 0, 0, 20, 3), _torre_test("A", 30, 0, 0, 20, 5)],
+    )
+    # columna en (0,0): tope=60 -> resto floor((200-60)/20)=7
+    # columna en (30,0): tope=100 -> resto floor((200-100)/20)=5
+    assert _capacidad_instalada(pallet, "A", presupuesto) == 12
+    assert _capacidad_instalada(pallet, "B", presupuesto) == 0  # sin columnas propias
+
+
+def test_necesita_columna_nueva_cede_solo_cuando_hay_capacidad_de_sobra():
+    """[combinación por fila] Un SKU con una columna que ya tiene sitio de
+    sobra (capacidad instalada >= demanda pendiente) NO necesita una celda
+    NUEVA -pero SÍ sigue necesitando si su demanda pendiente supera esa
+    capacidad, y una celda que ya es SU PROPIA columna nunca cuenta como
+    "nueva" (eso lo decide el llamador aparte, ver `_empacar`)."""
+    presupuesto = 200.0
+    pallet = PalletV5(id="P1", cd="BK31", torres=[_torre_test("A", 0, 0, 0, 20, 3)])  # capacidad restante: 7
+    assert _necesita_columna_nueva(pallet, "A", 5, 1, 30, 0, 0.0, presupuesto) is False  # 5 <= 7
+    assert _necesita_columna_nueva(pallet, "A", 20, 1, 30, 0, 0.0, presupuesto) is True  # 20 > 7
+    # celda que ya es propia (0,0): nunca es "nueva", sin importar la demanda
+    assert _necesita_columna_nueva(pallet, "A", 20, 1, 0, 0, 60.0, presupuesto) is False
+    # sin ninguna columna propia todavía: SIEMPRE necesita (no hay capacidad instalada)
+    vacio = PalletV5(id="P2", cd="BK31", torres=[])
+    assert _necesita_columna_nueva(vacio, "A", 5, 1, 0, 0, 0.0, presupuesto) is True
+
+
+def test_necesita_columna_nueva_excepcion_remate_en_el_piso():
+    """[excepción de remate, ver test_four_loko_queda_en_banda_remanente_
+    no_en_licores] Una categoría de remate (Four Loko/Cigarros incluidos)
+    nunca "necesita" -a los efectos de desplazar al ganador normal- una
+    celda en el PISO del pallet (z=0), sin importar su demanda -ese piso
+    sigue siendo dominio exclusivo de Licores reales. Por encima del piso
+    (z>0) sí puede necesitarla, como cualquier otra categoría."""
+    presupuesto = 200.0
+    vacio = PalletV5(id="P1", cd="BK31", torres=[])
+    assert _necesita_columna_nueva(vacio, "FOURLOKO", 20, config.NIVEL_REMATE, 0, 0, 0.0, presupuesto) is False
+    assert _necesita_columna_nueva(vacio, "FOURLOKO", 20, config.NIVEL_REMATE, 0, 0, 25.0, presupuesto) is True

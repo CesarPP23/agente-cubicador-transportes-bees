@@ -175,6 +175,77 @@ CATEGORIAS_ORIENTACION_FLEXIBLE = {"Comestibles", "Aseo", "Cigarros"}
 # pallets quedaban parciales; con 8cm, ~76%).
 TOLERANCIA_ALTURA_CAMA_CM = 8.0
 
+# [combinación por fila, caso real: Pallet 1 CD Callao, fotos del usuario]
+# El desempate de `_empacar` (sección 4) hace ganar siempre a Licores toda
+# celda que también le sirva a él -pedido explícito y probado con datos
+# reales ("primero se tiene que acabar toda la demanda de licor por sku").
+# Pero con datos reales de Pallet 1 (93 cajas, ~49 de Licores) eso deja a
+# un SKU de footprint chico y mucha demanda (Electrolight, NABs) atado a
+# UNA sola columna durante todo el armado -confirmado con trazas paso a
+# paso: nunca hay un error de cálculo, la celda simplemente la gana Licores
+# cada vez que también entra ahí, incluso cuando Licores YA tiene columnas
+# de sobra para cubrir el resto de su propia demanda.
+#
+# Se probaron 3 variantes antes de esta (ver PATCH_LOG.md): un umbral de
+# "demanda por columna" (mejoraba Pallet 1 pero rompía SJ87 del dataset de
+# referencia en cascada), y una cesión por "capacidad instalada" sin
+# restricción (mejoraba fuerte pero dejaba a Four Loko compartir el piso
+# del pallet con Licores reales, algo que
+# `test_four_loko_queda_en_banda_remanente_no_en_licores` prohíbe
+# explícitamente) y esa misma restringida a z>0 en general (arregla ese
+# test pero regresiona BK65 del dataset de referencia). Esta versión -
+# cesión por capacidad instalada, con la excepción de remate solo en el
+# piso- es la única de las 4 que pasa la suite completa Y mejora el
+# dataset de referencia (56->54 pallets, ningún CD peor) Y Pallet 1
+# (58->67 cajas, Electrolight 7->18) a la vez.
+def _columnas_actuales_pos(pallet: PalletV5, sku: str) -> set[tuple[float, float]]:
+    """Posiciones (x, y) DISTINTAS que ya tiene este SKU en el pallet -una
+    torre más alta en la misma columna no cuenta dos veces."""
+    return {(round(t.x, 4), round(t.y, 4)) for t in pallet.torres if t.sku == sku}
+
+
+def _capacidad_instalada(pallet: PalletV5, sku: str, presupuesto: float) -> int:
+    """Cuántas cajas MÁS de este SKU caben, sumando sobre TODAS sus
+    columnas ya existentes, antes de llegar al presupuesto de altura -sin
+    contar ninguna columna nueva. Si esto ya alcanza para su demanda
+    pendiente, no necesita ganar una celda más -puede cederla."""
+    por_columna: dict[tuple[float, float], tuple[float, float]] = {}
+    for t in pallet.torres:
+        if t.sku != sku:
+            continue
+        pos = (round(t.x, 4), round(t.y, 4))
+        tope = t.z + t.altura
+        actual = por_columna.get(pos)
+        if actual is None or tope > actual[0]:
+            por_columna[pos] = (tope, t.alto_caja)
+    total = 0
+    for tope, alto_caja in por_columna.values():
+        total += max(0, int((presupuesto - tope + TOL) // alto_caja))
+    return total
+
+
+def _necesita_columna_nueva(
+    pallet: PalletV5, sku: str, pendiente: int, nivel_sku: int, x: float, y: float, z: float, presupuesto: float,
+) -> bool:
+    """True si `sku` genuinamente necesita la celda (x, y, z) como columna
+    NUEVA: no es continuación de una columna propia, su demanda pendiente
+    supera lo que sus columnas YA existentes pueden cubrir subiendo -no es
+    solo "más espacio por las dudas"-, y -excepción de remate- no es una
+    categoría de remate (Four Loko/Cigarros incluidos,
+    `nivel >= config.NIVEL_REMATE`) compitiendo por el PISO del pallet
+    (z=0) -ese piso sigue siendo dominio exclusivo de Licores reales
+    mientras compitan ahí, tal como prueba
+    `test_four_loko_queda_en_banda_remanente_no_en_licores`. Esta función
+    se usa para decidir si un candidato ENTRA a competir por desplazar al
+    ganador normal -si un SKU de remate en el piso nunca llega a
+    considerarse acá, nunca puede desplazar a nadie, sin necesidad de un
+    chequeo aparte más adelante."""
+    if (round(x, 4), round(y, 4)) in _columnas_actuales_pos(pallet, sku):
+        return False
+    if nivel_sku >= config.NIVEL_REMATE and z <= TOL:
+        return False
+    return pendiente > _capacidad_instalada(pallet, sku, presupuesto)
+
 
 def _cabe_en_pallet(cand: TorreCandidate, presupuesto: float) -> bool:
     """Chequeo de geometría pura contra un pallet VACÍO -si ni siquiera acá
@@ -340,6 +411,7 @@ def _empacar(
             # Empate de huella: más demanda pendiente primero (sigue
             # concentrando el mismo SKU en capas consecutivas).
             mejor = None
+            mejor_necesitado = None
             for sku in activos:
                 tope_capa = capacidad_cama_por_sku.get(sku)
                 nivel_sku = nivel_por_sku.get(sku, config.NIVEL_REMATE)
@@ -372,16 +444,40 @@ def _empacar(
                 if mejor_para_sku is None:
                     continue
                 _, cand, idx_libre = mejor_para_sku
-                z_destino = pc.libres[idx_libre].z
+                libre = pc.libres[idx_libre]
+                z_destino = libre.z
                 area = cand.largo * cand.ancho
                 clave = (z_destino, nivel_sku, -area, -pendientes[sku])
                 if mejor is None or clave < mejor[0]:
                     mejor = (clave, sku, cand, idx_libre)
+                # [combinación por fila, ver comentario arriba] Candidato
+                # que SÍ necesita esta celda como columna nueva (footprint
+                # chico, mucha demanda, ninguna columna propia le alcanza)
+                # -se guarda aparte, sin nivel en la clave, para competir
+                # en pie de igualdad.
+                if _necesita_columna_nueva(pallet, sku, pendientes[sku], nivel_sku, libre.x, libre.y, z_destino, presupuesto):
+                    clave_necesitado = (z_destino, -area, -pendientes[sku])
+                    if mejor_necesitado is None or clave_necesitado < mejor_necesitado[0]:
+                        mejor_necesitado = (clave_necesitado, sku, cand, idx_libre)
 
             if mejor is None:
                 break  # nada entra ya en este pallet, ni siquiera más arriba
 
             _, sku, cand, idx_libre = mejor
+            # [combinación por fila] Si el ganador normal ya no necesita ESTA
+            # celda concreta (empate real: mismo índice de cuboide libre),
+            # se la damos a quien sí la necesita. OJO: si esta celda es
+            # continuación de la PROPIA columna del ganador, nunca se cede
+            # -eso no es "columna nueva" para él, sin importar cuánta
+            # capacidad instalada tenga en otro lado (la excepción de
+            # remate ya se aplicó al construir `mejor_necesitado` arriba,
+            # así que si llegó hasta acá es porque es un candidato legítimo).
+            if mejor_necesitado is not None and mejor_necesitado[1] != sku and mejor_necesitado[3] == idx_libre:
+                libre_ganador = pc.libres[idx_libre]
+                pos_ganador = (round(libre_ganador.x, 4), round(libre_ganador.y, 4))
+                ganador_ya_tiene_esta_columna = pos_ganador in _columnas_actuales_pos(pallet, sku)
+                if not ganador_ya_tiene_esta_columna and pendientes[sku] <= _capacidad_instalada(pallet, sku, presupuesto):
+                    _, sku, cand, idx_libre = mejor_necesitado
             pc.colocar(cand, 1, idx_libre)
             pendientes[sku] -= 1
             colocado_en_pallet[sku] = colocado_en_pallet.get(sku, 0) + 1
@@ -439,12 +535,14 @@ def _empacar_n_pallets(
 
     guard = 0
     guard_max = 200_000
+    presupuesto = _altura_presupuesto()
     while any(v > 0 for v in pendientes.values()):
         guard += 1
         if guard > guard_max:
             break
 
         mejor = None  # (clave, pallet_idx, sku, cand, idx_libre)
+        mejor_necesitado = None  # [combinación por fila] ver _empacar arriba
         for sku, cantidad_pendiente in pendientes.items():
             if cantidad_pendiente <= 0:
                 continue
@@ -468,16 +566,32 @@ def _empacar_n_pallets(
                 if mejor_para_sku_pallet is None:
                     continue
                 _, cand, idx_libre = mejor_para_sku_pallet
-                z_destino = pc.libres[idx_libre].z
+                libre = pc.libres[idx_libre]
+                z_destino = libre.z
                 area = cand.largo * cand.ancho
                 clave = (z_destino, nivel_sku, -area, -cantidad_pendiente)
                 if mejor is None or clave < mejor[0]:
                     mejor = (clave, pidx, sku, cand, idx_libre)
+                # [combinación por fila, ver _empacar arriba]
+                if _necesita_columna_nueva(pallet, sku, cantidad_pendiente, nivel_sku, libre.x, libre.y, z_destino, presupuesto):
+                    clave_necesitado = (z_destino, -area, -cantidad_pendiente)
+                    if mejor_necesitado is None or clave_necesitado < mejor_necesitado[0]:
+                        mejor_necesitado = (clave_necesitado, pidx, sku, cand, idx_libre)
 
         if mejor is None:
             break  # ninguno de los N pallets tiene lugar ya para nada pendiente
 
         _, pidx, sku, cand, idx_libre = mejor
+        # [combinación por fila] misma regla que _empacar: nunca se cede una
+        # celda que ya es continuación de la propia columna del ganador (la
+        # excepción de remate ya se aplicó al construir `mejor_necesitado`).
+        if mejor_necesitado is not None and mejor_necesitado[2] != sku and mejor_necesitado[1] == pidx and mejor_necesitado[4] == idx_libre:
+            pallet_ganador = pallets[pidx]
+            libre_ganador = construcciones[pidx].libres[idx_libre]
+            pos_ganador = (round(libre_ganador.x, 4), round(libre_ganador.y, 4))
+            ganador_ya_tiene_esta_columna = pos_ganador in _columnas_actuales_pos(pallet_ganador, sku)
+            if not ganador_ya_tiene_esta_columna and pendientes[sku] <= _capacidad_instalada(pallet_ganador, sku, presupuesto):
+                _, pidx, sku, cand, idx_libre = mejor_necesitado
         construcciones[pidx].colocar(cand, 1, idx_libre)
         pendientes[sku] -= 1
         colocados_por_pallet[pidx][sku] = colocados_por_pallet[pidx].get(sku, 0) + 1
