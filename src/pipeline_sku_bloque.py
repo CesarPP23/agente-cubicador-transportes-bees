@@ -105,7 +105,10 @@ def _construir_nombres_cd(envios: pd.DataFrame) -> dict[str, str]:
     return dict(zip(pares["CD"], pares[columna]))
 
 
-def ejecutar_core_sku_bloque(envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataFrame) -> ResultadoPipeline:
+def ejecutar_core_sku_bloque(
+    envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataFrame,
+    pallets_objetivo_por_cd: dict[str, int] | None = None,
+) -> ResultadoPipeline:
     nombres_cd = _construir_nombres_cd(envios)
     df_validado, log_df = validacion.validar_y_limpiar(envios, maestro, uma)
     df_demanda = demanda.normalizar_demanda(df_validado)
@@ -134,9 +137,12 @@ def ejecutar_core_sku_bloque(envios: pd.DataFrame, maestro: pd.DataFrame, uma: p
     pallets_v5: list = []
     contador = [0]
     cds_procesados: set[str] = set()
+    pallets_objetivo_por_cd = pallets_objetivo_por_cd or {}
     for cd, grupo in df_armado.groupby("CD"):
         cds_procesados.add(cd)
-        pallets_cd = armar_pallets_bloques(grupo, cd, contador=contador)
+        pallets_cd = armar_pallets_bloques(
+            grupo, cd, contador=contador, pallets_objetivo=pallets_objetivo_por_cd.get(cd)
+        )
         bat.renombrar_pallets_bat_puros(pallets_cd, cd)
         bat.asignar_cajas_bat_a_torres(pallets_cd, cajas_bat_por_cd.get(cd, []))
         for p in pallets_cd:

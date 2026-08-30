@@ -88,18 +88,34 @@ def _construir_pallets_geometria_insuficiente(df_insuficiente: pd.DataFrame) -> 
     return pallets
 
 
-def ejecutar_pipeline(envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataFrame) -> ResultadoPipeline:
+def ejecutar_pipeline(
+    envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataFrame,
+    pallets_objetivo_por_cd: dict[str, int] | None = None,
+) -> ResultadoPipeline:
     """Punto de entrada único: arma pallets con la lógica de bloques por SKU
     (ver src/packing_bloques.py -cada SKU se coloca entero en el menor
     número de pallets posible, combinando bloques enteros de otros SKUs
     para llegar a la altura objetivo, y partiendo uno solo como último
     recurso). Ver Parches/v5/PATCH_LOG.md para el historial de cómo se
-    llegó a esta versión."""
+    llegó a esta versión.
+
+    `pallets_objetivo_por_cd` (opcional, `{CD: cantidad}`) -pedido
+    explícito del usuario: la cantidad de pallets de un CD es un input que
+    viene de la planificación externa, no algo que el agente calcule. Un
+    CD que aparece ahí reparte TODA su demanda entre exactamente esa
+    cantidad de pallets (`_empacar_n_pallets`, backtracking + LNS -ver
+    PATCH_LOG.md) en vez del barrido abierto de siempre (`_empacar`). Un
+    CD que NO aparece sigue exactamente igual que siempre. OJO -costo real,
+    ver PATCH_LOG.md: cuando el barrido exacto no completa toda la demanda
+    de un pallet, corre además LNS (~5 minutos por pallet) -para muchos
+    pallets a la vez esto puede tardar bastante; no tiene ninguna otra
+    consecuencia si no se usa este parámetro."""
     from src import pipeline_sku_bloque
 
-    return pipeline_sku_bloque.ejecutar_core_sku_bloque(envios, maestro, uma)
+    return pipeline_sku_bloque.ejecutar_core_sku_bloque(envios, maestro, uma, pallets_objetivo_por_cd)
 
 
 def ejecutar_desde_archivo(ruta_o_buffer) -> ResultadoPipeline:
     envios, maestro, uma = validacion.cargar_hojas(ruta_o_buffer)
-    return ejecutar_pipeline(envios, maestro, uma)
+    pallets_objetivo_por_cd = validacion.cargar_pallets_objetivo(ruta_o_buffer)
+    return ejecutar_pipeline(envios, maestro, uma, pallets_objetivo_por_cd)

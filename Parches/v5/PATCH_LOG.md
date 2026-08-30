@@ -3466,3 +3466,68 @@ dato adicional como el de Piscano. Subir `COMBINACION_PALLETS_LNS_
 REINICIOS` más allá de 5, o generar más diversidad de vecindario (variar
 `SKUS_A_ROMPER` entre 1-3 en vez de fijo en 2), son las próximas perillas
 obvias si se decide seguir apretando -no probadas todavía.
+
+## `pallets_objetivo` conectado al pipeline real (end-to-end)
+[misma sesión, pedido explícito del usuario: "conectalo al pipeline real"]
+Hasta acá `pallets_objetivo` (y por lo tanto el DFS+LNS de arriba) solo se
+podía usar llamando a `armar_pallets_bloques` directamente -sin ningún
+llamador de producción. Esta sección lo conecta de punta a punta, tal
+como quedó diseñado en la sección "Pendiente para la próxima sesión" de
+más arriba en este archivo: "el usuario decidió que sea un input que él
+sube, no algo calculado con el factor 1.4".
+
+### Diseño
+Hoja OPCIONAL nueva **"Pallets_Objetivo"** (columnas `CD`, `Pallets_
+Objetivo`) en el mismo Excel de siempre -si no está, CERO cambio de
+comportamiento (mismo `_empacar` de siempre para todos los CDs). Si está,
+cada CD que lista fuerza `armar_pallets_bloques(..., pallets_objetivo=N)`
+para ESE CD -el resto de los CDs del mismo archivo sigue sin cambios.
+
+Cadena completa: `src/validacion.py::cargar_pallets_objetivo` (nuevo, lee
+la hoja opcional, devuelve `dict[CD, int] | None`) -> `src/pipeline.py::
+ejecutar_pipeline`/`ejecutar_desde_archivo` (nuevo parámetro opcional
+`pallets_objetivo_por_cd`) -> `src/pipeline_sku_bloque.py::ejecutar_core_
+sku_bloque` (mismo parámetro, se lo pasa a `armar_pallets_bloques` por CD
+vía `.get(cd)` -`None` para los CDs no listados, comportamiento idéntico
+a hoy) -> `app.py` (detecta la hoja automáticamente en el Excel
+combinado, o en `Envios_Julio` en el modo de 3 archivos separados; avisa
+en pantalla qué CDs quedaron con cantidad fija antes de procesar, porque
+el costo real -ver abajo- amerita avisar antes, no después).
+`src/template.py::construir_template()` ahora incluye esta hoja de
+ejemplo (borrable) con instrucciones.
+
+### Verificación
+- Suite completa: **164/164 pasan** (159 previos + 5 nuevos en
+  `tests/test_pallets_objetivo.py` -lectura de la hoja opcional con/sin
+  ella, no-regresión cuando no se usa, forzado real de cantidad exacta, y
+  que un CD sin cantidad fija no se ve afectado aunque otro CD del mismo
+  archivo sí la tenga. Todos usan demanda chica que el motor exacto
+  resuelve sin LNS -rápidos, no dependen del tiempo real del solver).
+- `Cubicaje18.07.2026.xlsx` (9 CDs reales, SIN hoja Pallets_Objetivo):
+  **sigue en 54 pallets, sin cambios** -confirma que la conexión es
+  puramente aditiva.
+- End-to-end real con Pallet 1 (Excel armado con las 4 hojas, incluida
+  `Pallets_Objetivo` con BK34=1, corrido con `ejecutar_desde_archivo` -no
+  llamando a `armar_pallets_bloques` a mano como en las secciones
+  anteriores): confirmado que reconstruye el mismo pallet (altura
+  212.4cm, 21 líneas, coincide con el resultado ya validado de la sección
+  de LNS) -la conexión de punta a punta funciona con el pipeline real, no
+  solo con las funciones internas.
+- Reutilizar el mismo buffer de archivo dos veces (`cargar_hojas` y
+  después `cargar_pallets_objetivo` sobre el mismo objeto, sin `seek`
+  manual entre medio -el flujo real de `app.py`) confirmado que funciona:
+  `pd.ExcelFile`/`openpyxl` hacen sus propios seeks absolutos al abrir el
+  zip, no dependen de la posición del cursor del llamador.
+
+### Costo real -avisar ANTES de correr, no descubrirlo después
+Sigue vigente el costo documentado en la sección de LNS (~5 minutos por
+pallet cuando el barrido exacto no completa toda la demanda de una). Para
+un archivo con varios CDs y varios pallets fijos cada uno, esto puede
+sumar bastante tiempo total (ej. el dataset histórico de 50 pallets
+mencionado más arriba en este archivo, si se le pusiera `pallets_
+objetivo` a los 9 CDs, podría tardar horas, no minutos) -por eso `app.py`
+ahora muestra un aviso explícito con la lista de CDs afectados ANTES de
+que el usuario apriete "Procesar", en vez de que se entere recién cuando
+ve que no termina. No se implementó ningún límite de tiempo global ni
+paralelización de CDs/semillas en esta sesión -sigue siendo la perilla
+obvia si el uso real lo pide.

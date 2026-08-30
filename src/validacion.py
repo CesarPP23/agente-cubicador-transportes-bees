@@ -13,6 +13,31 @@ def cargar_hojas(ruta_o_buffer):
     return envios, maestro, uma
 
 
+def cargar_pallets_objetivo(ruta_o_buffer) -> dict[str, int] | None:
+    """[conexión de `pallets_objetivo` al pipeline real -pedido explícito
+    del usuario: "esa cantidad de pallet total no puede variar siempre
+    tiene que ser la que dice en la planificacion... es un input que él
+    sube, no algo calculado" -ver Parches/v5/PATCH_LOG.md] Hoja OPCIONAL
+    "Pallets_Objetivo" (columnas "CD" y "Pallets_Objetivo") en el mismo
+    Excel -si no existe, devuelve `None` y el pipeline sigue exactamente
+    igual que siempre (`_empacar`, sin tope de pallets). Si existe, cada
+    CD listado ahí fuerza `armar_pallets_bloques(..., pallets_objetivo=N)`
+    -el CD reparte TODA su demanda entre exactamente N pallets en vez de
+    abrir los que hagan falta."""
+    xl = pd.ExcelFile(ruta_o_buffer)
+    if "Pallets_Objetivo" not in xl.sheet_names:
+        return None
+    df = pd.read_excel(xl, "Pallets_Objetivo")
+    if df.empty:
+        return None
+    df = df.dropna(subset=["CD", "Pallets_Objetivo"])
+    return {
+        str(fila["CD"]).strip(): int(fila["Pallets_Objetivo"])
+        for _, fila in df.iterrows()
+        if int(fila["Pallets_Objetivo"]) > 0
+    }
+
+
 def _normalizar_sku(serie: pd.Series) -> pd.Series:
     return serie.astype(str).str.strip()
 

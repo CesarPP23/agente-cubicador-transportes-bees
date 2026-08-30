@@ -3,7 +3,7 @@ import streamlit as st
 from src.exportar import exportar_workbook
 from src.pipeline import ejecutar_pipeline
 from src.template import construir_template
-from src.validacion import cargar_hojas
+from src.validacion import cargar_hojas, cargar_pallets_objetivo
 from visualizacion import VISTAS_3D, dibujar_cama, dibujar_pallet, dibujar_pallet_v5_3d
 
 st.set_page_config(page_title="Agente Cubicador", layout="wide")
@@ -35,11 +35,13 @@ modo = st.radio(
 )
 
 envios = maestro = uma = None
+pallets_objetivo_por_cd = None
 
 if modo.startswith("Un solo"):
     archivo = st.file_uploader("Excel combinado", type=["xlsx"])
     if archivo is not None:
         envios, maestro, uma = cargar_hojas(archivo)
+        pallets_objetivo_por_cd = cargar_pallets_objetivo(archivo)
 else:
     col1, col2, col3 = st.columns(3)
     archivo_envios = col1.file_uploader("Envios_Julio", type=["xlsx"])
@@ -51,10 +53,19 @@ else:
         envios = pd.read_excel(archivo_envios)
         maestro = pd.read_excel(archivo_maestro)
         uma = pd.read_excel(archivo_uma)
+        pallets_objetivo_por_cd = cargar_pallets_objetivo(archivo_envios)
+
+if pallets_objetivo_por_cd:
+    st.info(
+        f"Cantidad de pallets fija (Pallets_Objetivo) detectada para {len(pallets_objetivo_por_cd)} CD(s): "
+        f"{pallets_objetivo_por_cd}. Estos CDs pueden tardar varios minutos cada uno (el motor exacto "
+        "corre backtracking + ruina-y-reconstrucción para aprovechar cada pallet al máximo, ver "
+        "Parches/v5/PATCH_LOG.md)."
+    )
 
 if envios is not None and st.button("Procesar", type="primary"):
     with st.spinner("Ejecutando el motor de optimización..."):
-        st.session_state["resultado"] = ejecutar_pipeline(envios, maestro, uma)
+        st.session_state["resultado"] = ejecutar_pipeline(envios, maestro, uma, pallets_objetivo_por_cd)
 
 resultado = st.session_state.get("resultado")
 
