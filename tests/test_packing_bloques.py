@@ -14,7 +14,18 @@ import pandas as pd
 
 import config
 from models import PalletV5, Torre
-from src.packing_bloques import _capacidad_instalada, _necesita_columna_nueva, armar_pallets_bloques
+from src.packing_bloques import (
+    _capacidad_instalada,
+    _empacar_n_pallets,
+    _empacar_n_pallets_greedy,
+    _mejor_cuboide_para_sku,
+    _necesita_columna_nueva,
+    _restaurar_estado_pallets,
+    _snapshot_estado_pallets,
+    armar_pallets_bloques,
+)
+from src.packing_columnar import _PalletEnConstruccion
+from src.torres import generar_torres_candidatas
 from src.validacion_v5 import validar_geometria_v5
 
 
@@ -594,3 +605,125 @@ def test_necesita_columna_nueva_excepcion_remate_en_el_piso():
     vacio = PalletV5(id="P1", cd="BK31", torres=[])
     assert _necesita_columna_nueva(vacio, "FOURLOKO", 20, config.NIVEL_REMATE, 0, 0, 0.0, presupuesto) is False
     assert _necesita_columna_nueva(vacio, "FOURLOKO", 20, config.NIVEL_REMATE, 0, 0, 25.0, presupuesto) is True
+
+
+# [solver real de N pallets fijos -pedido explícito del usuario: "encaremos
+# el diseño más grande pero solo usemos como base el pallet 1... si
+# logramos replicar ese pallet a la perfección lo demás va a salir"] A
+# diferencia de `_empacar` (voraz, sin poder deshacer una mala decisión),
+# `_empacar_n_pallets` corre además un backtracking real con undo -ver
+# comentario extenso en `packing_bloques.py` justo antes de
+# `COMBINACION_PALLETS_SHORTLIST_K`. Verificado contra el caso real
+# (Pallet 1, CD Callao, 21 SKUs, 93 cajas): sube de 67 a 78 cajas
+# colocadas (Electrolight, el SKU más golpeado, pasa de 18 a 25 -completo),
+# sin ninguna violación geométrica y sin mover el dataset de referencia de
+# 9 CDs (`_empacar_n_pallets` no tiene ningún llamador en el pipeline real,
+# confirmado con `grep -rn "pallets_objetivo"` -cero riesgo de regresión
+# ahí). Estos tests no dependen del Excel real del usuario (no está en el
+# repo) -reproducen el patrón (Licor con mucha demanda vs. SKU de footprint
+# chico y mucha demanda) a escala sintética.
+def _armar_estado_dos_skus(licor_demanda: int, chica_demanda: int):
+    """Escenario sintético que reproduce el patrón real de Pallet 1: un
+    Licor de footprint grande (29x20.5, igual que "Ron Flor de Caña" real)
+    compitiendo por piso contra un SKU de footprint chico (26x19, igual
+    que "Electrolight" real) y mucha demanda. A demanda suficientemente
+    alta (92/25) el greedy deja al SKU chico muy corto (12/25) aunque el
+    Licor ya tenga toda SU demanda cubierta -mismo patrón, escala chica."""
+    df = pd.DataFrame(
+        [
+            _fila("LICOR", 29, 20.5, 30.0, licor_demanda, cajas_cama=16, nivel=1, categoria="Licores"),
+            _fila("CHICA", 26, 19, 19.0, chica_demanda, cajas_cama=20, nivel=6, categoria="NABs"),
+        ]
+    )
+    candidatas = generar_torres_candidatas(df, config.ALTURA_PRODUCTO_MAX)
+    por_sku: dict = {}
+    for c in candidatas:
+        por_sku.setdefault(c.sku, []).append(c)
+    pendientes = {"LICOR": licor_demanda, "CHICA": chica_demanda}
+    capacidad_cama_por_sku = {"LICOR": 16, "CHICA": 20}
+    nivel_por_sku = {"LICOR": 1, "CHICA": 6}
+    return df, por_sku, pendientes, capacidad_cama_por_sku, nivel_por_sku
+
+
+def test_n_pallets_backtracking_nunca_peor_que_el_greedy():
+    """[garantía central del solver] `_empacar_n_pallets` (backtracking
+    real) nunca puede colocar MENOS cajas que `_empacar_n_pallets_greedy`
+    -su primera rama explorada en cada nodo reproduce exactamente la misma
+    prioridad `(z, nivel, -área, -pendiente)` del greedy, así que el
+    incumbente inicial ya iguala el resultado de siempre; de ahí en más
+    solo puede empatar o mejorar."""
+    _, por_sku, pendientes, capacidad_cama_por_sku, nivel_por_sku = _armar_estado_dos_skus(92, 25)
+
+    pallets_greedy, _ = _empacar_n_pallets_greedy(
+        dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, {}, "BK31", [0], 1
+    )
+    total_greedy = sum(t.cantidad for p in pallets_greedy for t in p.torres)
+
+    pallets_nuevo, _ = _empacar_n_pallets(
+        dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, {}, "BK31", [0], 1
+    )
+    total_nuevo = sum(t.cantidad for p in pallets_nuevo for t in p.torres)
+
+    assert total_nuevo >= total_greedy
+    assert validar_geometria_v5(pallets_nuevo) == []
+
+
+def test_pallets_objetivo_respeta_cantidad_exacta_y_reporta_sin_colocar():
+    """[contrato de pallets_objetivo, sin tests previos que lo cubrieran -
+    verificado con grep antes de este cambio] `armar_pallets_bloques(df,
+    cd, pallets_objetivo=N)` siempre devuelve exactamente N pallets -ni
+    más ni menos- y cualquier demanda que no entró queda reportada en
+    `metadata["sin_colocar"]` del último pallet, nunca se pierde en
+    silencio (ni de más: total despachado + sin_colocar == demanda total)."""
+    df, *_ = _armar_estado_dos_skus(92, 25)
+    pallets = armar_pallets_bloques(df, "BK31", contador=[0], pallets_objetivo=1)
+    assert len(pallets) == 1
+    despachado = sum(t.cantidad for p in pallets for t in p.torres)
+    sin_colocar = pallets[-1].metadata.get("sin_colocar", {})
+    assert despachado + sum(sin_colocar.values()) == 92 + 25
+    assert validar_geometria_v5(pallets) == []
+
+
+def test_snapshot_restaurar_estado_pallets_es_identidad():
+    """[invariante de undo, base del backtracking real -bug real
+    encontrado y corregido en esta sesión] `_PalletEnConstruccion.colocar`
+    muta `pallet.torres` con `.append()` en el MISMO objeto lista (a
+    diferencia de `pc.libres`, que sí se reemplaza por una lista nueva en
+    cada colocación) -un snapshot que solo guardara la LONGITUD de
+    `torres` y después recortara la lista ACTUAL con `[:n]` fallaba en
+    cuanto se restauraba un snapshot más viejo DESPUÉS de haber hecho
+    backtrack más allá de él (la lista ya había sido truncada a algo más
+    corto por un restore intermedio). Este test fija el contrato: colocar,
+    tomar snapshot, colocar más, restaurar -el estado debe volver EXACTO
+    al punto del snapshot, sin importar cuánto se avanzó después."""
+    df = pd.DataFrame([_fila("A", 30, 20, 20.0, 20, cajas_cama=12, nivel=1)])
+    candidatas = generar_torres_candidatas(df, config.ALTURA_PRODUCTO_MAX)
+    cand = candidatas[0]
+    pallet = PalletV5(id="P1", cd="BK31")
+    pc = _PalletEnConstruccion(pallet=pallet)
+    colocados_por_pallet = [{}]
+    pendientes = {"A": 20}
+    nivel_por_sku = {"A": 1}
+
+    def _colocar_una():
+        idx = _mejor_cuboide_para_sku(pallet, pc, cand, 12, 1, nivel_por_sku)
+        pc.colocar(cand, 1, idx)
+        pendientes["A"] -= 1
+        colocados_por_pallet[0]["A"] = colocados_por_pallet[0].get("A", 0) + 1
+
+    for _ in range(3):
+        _colocar_una()
+
+    snap = _snapshot_estado_pallets([pc], colocados_por_pallet, pendientes)
+    torres_en_snapshot = len(pallet.torres)
+    altura_en_snapshot = pallet.altura_final
+
+    for _ in range(5):
+        _colocar_una()
+    assert len(pallet.torres) != torres_en_snapshot  # de verdad avanzó más allá del snapshot
+
+    _restaurar_estado_pallets([pc], colocados_por_pallet, pendientes, snap)
+    assert len(pallet.torres) == torres_en_snapshot
+    assert pallet.altura_final == altura_en_snapshot
+    assert colocados_por_pallet[0]["A"] == 3
+    assert pendientes["A"] == 17

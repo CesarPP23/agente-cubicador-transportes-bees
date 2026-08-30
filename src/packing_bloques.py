@@ -309,6 +309,34 @@ def _altura_compatible_con_cama(pallet: PalletV5, z: float, alto_caja: float) ->
     return True
 
 
+def _cuboide_admite_candidato(
+    pallet: PalletV5, c, cand: TorreCandidate, tope_capa: int | None,
+    nivel_sku: int, nivel_por_sku: dict[str, int],
+) -> bool:
+    """[extraído de _mejor_cuboide_para_sku, sin cambio de comportamiento]
+    ¿Entra 1 caja de `cand` en ESTE cuboide libre concreto? Descarta si:
+    (a) `tope_capa` (Cajas_Cama_Efectivo real del Maestro) ya se alcanzó
+    para este SKU en la Z exacta de ese cuboide, (b) colocar ahí violaría
+    el orden de nivel/peso por columna (`_soporte_viola_nivel`), o (c) su
+    alto no es compatible con lo que ya hay puesto en esa misma cama
+    (`_altura_compatible_con_cama`). Reusado por `_mejor_cuboide_para_sku`
+    (1 sola opción por SKU) y por `_candidatos_lote` del solver de N
+    pallets fijos (varias opciones por SKU, ver comentario ahí)."""
+    if cand.largo > c.w + TOL or cand.ancho > c.h + TOL or cand.alto_caja > c.d + TOL:
+        return False
+    if tope_capa is not None:
+        ya_en_esta_capa = sum(
+            t.cantidad for t in pallet.torres if t.sku == cand.sku and abs(t.z - c.z) <= TOL
+        )
+        if ya_en_esta_capa >= tope_capa:
+            return False
+    if _soporte_viola_nivel(pallet, c.x, c.y, cand.largo, cand.ancho, c.z, nivel_sku, nivel_por_sku):
+        return False
+    if not _altura_compatible_con_cama(pallet, c.z, cand.alto_caja):
+        return False
+    return True
+
+
 def _mejor_cuboide_para_sku(
     pallet: PalletV5, pc: _PalletEnConstruccion, cand: TorreCandidate, tope_capa: int | None,
     nivel_sku: int, nivel_por_sku: dict[str, int],
@@ -316,25 +344,11 @@ def _mejor_cuboide_para_sku(
     """[sección 2, 4, 4b] Entre los cuboides libres que reciban 1 caja de
     `cand`, el de menor Z (más bajo) -así se llena SIEMPRE la capa más
     baja disponible antes de subir, nunca se salta a una más alta habiendo
-    sitio abajo (row-first, nunca columnas). Descarta un cuboide si: (a)
-    `tope_capa` (Cajas_Cama_Efectivo real del Maestro) ya se alcanzó para
-    este SKU en la Z exacta de ese cuboide, (b) colocar ahí violaría el
-    orden de nivel/peso por columna (`_soporte_viola_nivel`), o (c) su
-    alto no es compatible con lo que ya hay puesto en esa misma cama
-    (`_altura_compatible_con_cama`)."""
+    sitio abajo (row-first, nunca columnas). Ver `_cuboide_admite_
+    candidato` para los descartes por tope de capa/soporte/altura."""
     mejor_idx, mejor_clave = None, None
     for idx, c in enumerate(pc.libres):
-        if cand.largo > c.w + TOL or cand.ancho > c.h + TOL or cand.alto_caja > c.d + TOL:
-            continue
-        if tope_capa is not None:
-            ya_en_esta_capa = sum(
-                t.cantidad for t in pallet.torres if t.sku == cand.sku and abs(t.z - c.z) <= TOL
-            )
-            if ya_en_esta_capa >= tope_capa:
-                continue
-        if _soporte_viola_nivel(pallet, c.x, c.y, cand.largo, cand.ancho, c.z, nivel_sku, nivel_por_sku):
-            continue
-        if not _altura_compatible_con_cama(pallet, c.z, cand.alto_caja):
+        if not _cuboide_admite_candidato(pallet, c, cand, tope_capa, nivel_sku, nivel_por_sku):
             continue
         clave = (c.z, c.volumen)
         if mejor_clave is None or clave < mejor_clave:
@@ -490,7 +504,7 @@ def _empacar(
     return pallets
 
 
-def _empacar_n_pallets(
+def _empacar_n_pallets_greedy(
     pendientes: dict[str, int],
     por_sku: dict[str, list[TorreCandidate]],
     capacidad_cama_por_sku: dict[str, int],
@@ -516,6 +530,13 @@ def _empacar_n_pallets(
     garantías de soporte real y de orden de nivel) por cada (SKU, pallet)
     candidato -no es un motor aproximado nuevo, es el mismo con un lazo
     exterior más ancho.
+
+    [BASELINE GREEDY -ver `_empacar_n_pallets` más abajo] Esta función es
+    la semilla/kill-switch del solver real: `_empacar_n_pallets` la corre
+    primero para tener un incumbente de referencia, y solo se queda con
+    el resultado del backtracking si estrictamente coloca MÁS cajas -este
+    greedy nunca se modifica, así el comportamiento de hoy sigue siendo
+    reproducible byte a byte llamando a esta función directamente.
 
     Devuelve `(pallets, sin_colocar)` -si algún SKU no encuentra lugar en
     NINGUNO de los N pallets ni siquiera en el límite de altura (los N
@@ -618,6 +639,300 @@ def _recalcular_metricas_pallet(pallet: PalletV5) -> None:
     area_ocupada = _area_union_xy(pallet.torres)
     pallet.ocupacion_xy = round(area_ocupada / (config.PALLET_LARGO * config.PALLET_ANCHO), 4)
     pallet.volumen_utilizado = round(sum(t.area_base * t.altura for t in pallet.torres), 2)
+
+
+# [solver exacto de N pallets fijos -pedido explícito del usuario tras el
+# intento fallido de "combinación por fila" sobre `_empacar`: "encaremos el
+# diseño más grande pero solo usemos como base el pallet 1... si logramos
+# replicar ese pallet a la perfección lo demás va a salir"] `_empacar_n_
+# pallets_greedy` (arriba) es el mismo motor voraz de siempre -coloca 1
+# caja del mejor candidato global por iteración, sin poder deshacer una
+# mala decisión. Verificado con `grep -rn "pallets_objetivo"` en todo el
+# repo: este camino de código NO tiene ningún llamador de producción
+# (`pipeline_sku_bloque.py` nunca pasa `pallets_objetivo`) ni ningún test
+# que lo cubra -a diferencia de `_empacar` (que si se toca arriesga el
+# dataset de referencia completo vía `_redistribuir_dispersos` +
+# consolidación de remanentes, ver el intento de combinación por fila
+# fallido documentado arriba), acá se puede construir un backtracking real
+# sin miedo a regresionar nada existente. `_empacar_n_pallets` (al final de
+# esta sección) es el wrapper nuevo: corre el greedy de siempre como
+# semilla/incumbente inicial, corre este backtracking desde cero, y se
+# queda con el que coloque MÁS cajas -nunca puede ser peor que hoy.
+COMBINACION_PALLETS_SHORTLIST_K = 8
+COMBINACION_PALLETS_MAX_NODOS = 30_000
+# [medido con datos reales, Pallet 1] Subir esto a 2 o 3 (más de una
+# columna candidata por SKU en cada nodo) se probó explícitamente y dio
+# PEOR resultado (71/93 en vez de 78/93) con el mismo o más presupuesto de
+# nodos -el árbol se diluye entre más ramas por nodo sin encontrar mejores
+# combinaciones, en vez de concentrar la búsqueda en qué SKU gana cada
+# columna. Con 1 opción por SKU (su mejor cuboide, igual que el greedy) el
+# solver ya sube Pallet 1 de 67 a 78 de 93 cajas. Queda como constante (no
+# hardcodeado en 1) por si una instancia distinta a Pallet 1 se beneficia
+# de más opciones -pero el default validado es 1.
+COMBINACION_PALLETS_OPCIONES_POR_SKU = 1
+
+
+def _capacidad_restante_en_capa(pallet: PalletV5, sku: str, z: float, tope_capa: int | None) -> float:
+    """Cuántas cajas MÁS de `sku` caben todavía en la capa exacta `z` de
+    este pallet antes de tocar `Cajas_Cama_Efectivo` -mismo conteo que ya
+    hace `_mejor_cuboide_para_sku` para decidir SI entra, pero acá hace
+    falta el número exacto para decidir CUÁNTAS entran de una vez (lote)."""
+    if tope_capa is None:
+        return float("inf")
+    ya_en_esta_capa = sum(t.cantidad for t in pallet.torres if t.sku == sku and abs(t.z - z) <= TOL)
+    return max(0, tope_capa - ya_en_esta_capa)
+
+
+def _snapshot_estado_pallets(
+    construcciones: list[_PalletEnConstruccion], colocados_por_pallet: list[dict[str, int]], pendientes: dict[str, int],
+) -> tuple[list[tuple[list, list]], list[dict[str, int]], dict[str, int]]:
+    """[undo barato, sin deepcopy] `_actualizar_libres_maxrects`
+    (`packing_columnar.py`) nunca muta un `_CuboidLibre` existente
+    in-place -siempre arma una lista `nuevos` y reasigna `pc.libres` al
+    resultado podado- así que alcanza con guardar la referencia a la lista
+    VIEJA (O(1)). `pallet.torres` es distinto: `_PalletEnConstruccion.
+    colocar` la muta con `.append()` en el mismo objeto lista, así que un
+    snapshot posterior en la MISMA rama ve la lista crecer por debajo -
+    guardar solo `len(...)` y después recortar la lista ACTUAL con `[:n]`
+    falla en cuanto se restaura un snapshot más viejo después de haber
+    hecho backtrack más allá de él (la lista ya fue truncada a algo más
+    corto por un restore intermedio, y recortarla de nuevo da menos de lo
+    que había). Por eso acá se guarda una COPIA real de `pallet.torres`
+    (barata: son referencias a `Torre` ya construidas, no deepcopy) en vez
+    de solo su longitud."""
+    return (
+        [(list(pc.pallet.torres), pc.libres) for pc in construcciones],
+        [dict(d) for d in colocados_por_pallet],
+        dict(pendientes),
+    )
+
+
+def _restaurar_estado_pallets(
+    construcciones: list[_PalletEnConstruccion], colocados_por_pallet: list[dict[str, int]], pendientes: dict[str, int],
+    snapshot: tuple[list[tuple[list, list]], list[dict[str, int]], dict[str, int]],
+) -> None:
+    snap_pallets, snap_colocados, snap_pendientes = snapshot
+    for pc, (torres, libres) in zip(construcciones, snap_pallets):
+        pc.pallet.torres = list(torres)
+        pc.libres = libres
+        _recalcular_metricas_pallet(pc.pallet)
+    for d, snap_d in zip(colocados_por_pallet, snap_colocados):
+        d.clear()
+        d.update(snap_d)
+    pendientes.clear()
+    pendientes.update(snap_pendientes)
+
+
+def _candidatos_lote(
+    construcciones: list[_PalletEnConstruccion],
+    colocados_por_pallet: list[dict[str, int]],
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
+    n_pallets: int,
+) -> list[tuple[tuple, bool, int, str, TorreCandidate, int, int]]:
+    """[granularidad de LOTE, no de caja] Para cada (SKU, pallet) activo,
+    NO solo el mejor cuboide individual (eso fue la primera versión, y
+    quedaba corto: convergía siempre en el mismo 78/93 en Pallet 1 sin
+    importar cuánto presupuesto de nodos se le diera, porque cada SKU solo
+    aportaba SU propia mejor opción al árbol -nunca "SKU X cede su mejor
+    columna y usa la segunda mejor, liberando la primera para otro SKU
+    necesitado"). Acá se juntan los top-`COMBINACION_PALLETS_OPCIONES_POR_
+    SKU` cuboides DISTINTOS por (SKU, pallet) -no solo 1- antes de armar la
+    lista global. Para cada opción se calcula cuántas caben de UNA vez en
+    esa columna (tope de capa, tope de PH, profundidad Z del cuboide), se
+    ordena todo por el mismo criterio de siempre `(z, nivel, -área,
+    -pendiente)`, y se devuelve el top-`COMBINACION_PALLETS_SHORTLIST_K`
+    global -garantizando que si hay un candidato que genuinamente necesita
+    columna nueva (`_necesita_columna_nueva`, igual que la cesión ya
+    shippeada) quede incluido aunque no entre en el top-K por prioridad
+    normal."""
+    candidatos = []
+    for sku in pendientes:
+        if pendientes[sku] <= 0:
+            continue
+        tope_capa = capacidad_cama_por_sku.get(sku)
+        nivel_sku = nivel_por_sku.get(sku, config.NIVEL_REMATE)
+        tope_pallet = tope_pallet_por_sku.get(sku, float("inf"))
+        for pidx in range(n_pallets):
+            ya_en_pallet = colocados_por_pallet[pidx].get(sku, 0)
+            if ya_en_pallet >= tope_pallet:
+                continue
+            pallet = construcciones[pidx].pallet
+            pc = construcciones[pidx]
+            # [top-M cuboides distintos por SKU, no solo el mejor] Para
+            # cada orientación, se prueban TODOS los cuboides libres (no
+            # solo el mejor de `_mejor_cuboide_para_sku`) y se agrupan por
+            # índice de cuboide -cada cuboide se queda con su mejor
+            # candidato (menor volumen sobrante), pero se conservan varios
+            # cuboides distintos por SKU.
+            por_idx: dict[int, tuple[tuple, TorreCandidate]] = {}
+            for cand_op in por_sku[sku]:
+                for idx_op, c in enumerate(pc.libres):
+                    if not _cuboide_admite_candidato(pallet, c, cand_op, tope_capa, nivel_sku, nivel_por_sku):
+                        continue
+                    clave_op = (c.z, c.volumen)
+                    actual = por_idx.get(idx_op)
+                    if actual is None or clave_op < actual[0]:
+                        por_idx[idx_op] = (clave_op, cand_op)
+            opciones = sorted(
+                ((clave_op, idx_op, cand_op) for idx_op, (clave_op, cand_op) in por_idx.items()),
+                key=lambda o: o[0],
+            )[:COMBINACION_PALLETS_OPCIONES_POR_SKU]
+            for _, idx_libre, cand in opciones:
+                libre = pc.libres[idx_libre]
+                cantidad = min(
+                    pendientes[sku],
+                    tope_pallet - ya_en_pallet,
+                    _capacidad_restante_en_capa(pallet, sku, libre.z, tope_capa),
+                    int((libre.d + TOL) // cand.alto_caja),
+                )
+                if cantidad <= 0:
+                    continue
+                area = cand.largo * cand.ancho
+                necesita = _necesita_columna_nueva(
+                    pallet, sku, pendientes[sku], nivel_sku, libre.x, libre.y, libre.z, presupuesto
+                )
+                clave = (libre.z, nivel_sku, -area, -pendientes[sku])
+                candidatos.append((clave, necesita, pidx, sku, cand, idx_libre, int(cantidad)))
+
+    candidatos.sort(key=lambda c: c[0])
+    top = candidatos[:COMBINACION_PALLETS_SHORTLIST_K]
+    if not any(c[1] for c in top):
+        necesitado = next((c for c in candidatos if c[1]), None)
+        if necesitado is not None:
+            top.append(necesitado)
+    return top
+
+
+def _resolver_pallets_backtracking(
+    construcciones: list[_PalletEnConstruccion],
+    colocados_por_pallet: list[dict[str, int]],
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
+    n_pallets: int,
+) -> int:
+    """[backtracking real, DFS con poda] A diferencia del greedy (1 caja,
+    sin vuelta atrás), acá cada nodo coloca un LOTE completo -toda una
+    columna de una vez- y puede DESHACERLO si la rama no mejora el mejor
+    resultado encontrado (`_snapshot_estado_pallets`/`_restaurar_estado_
+    pallets`). La primera rama que explora cada nodo es siempre la de
+    mayor prioridad (misma clave que usa el greedy) -así la primera hoja
+    completa que encuentra ya iguala el resultado de hoy; de ahí en más
+    solo puede empatar o mejorar. Acotado por
+    `COMBINACION_PALLETS_MAX_NODOS` (conteo de nodos, no de reloj -
+    reproducible entre corridas). Modifica `construcciones`/`colocados_
+    por_pallet`/`pendientes` IN-PLACE, dejándolos en el MEJOR estado
+    encontrado al terminar -no devuelve una copia."""
+    demanda_inicial = sum(pendientes.values())
+    estado = {"mejor_total": -1, "mejor_snapshot": None, "nodos": 0}
+
+    def _volumen_libre_total() -> float:
+        return sum(c.w * c.h * c.d for pc in construcciones for c in pc.libres)
+
+    def _cota(colocado_actual: int) -> int:
+        pendiente_total = sum(pendientes.values())
+        if pendiente_total == 0:
+            return colocado_actual
+        volumenes_min = [
+            min(cand.largo * cand.ancho * cand.alto_caja for cand in por_sku[sku])
+            for sku, cant in pendientes.items() if cant > 0 and por_sku.get(sku)
+        ]
+        if not volumenes_min:
+            return colocado_actual
+        vol_min_caja = min(volumenes_min)
+        cota_volumen = int(_volumen_libre_total() // vol_min_caja) if vol_min_caja > 0 else pendiente_total
+        return colocado_actual + min(pendiente_total, cota_volumen)
+
+    def _dfs(colocado_actual: int) -> None:
+        estado["nodos"] += 1
+        if colocado_actual > estado["mejor_total"]:
+            estado["mejor_total"] = colocado_actual
+            estado["mejor_snapshot"] = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
+        if estado["nodos"] > COMBINACION_PALLETS_MAX_NODOS:
+            return
+        if colocado_actual >= demanda_inicial:
+            return  # se colocó TODO -óptimo absoluto, no hay nada más que buscar
+        if _cota(colocado_actual) <= estado["mejor_total"]:
+            return  # ni en el mejor caso esta rama supera lo ya encontrado
+        candidatos = _candidatos_lote(
+            construcciones, colocados_por_pallet, pendientes, por_sku,
+            capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+        )
+        if not candidatos:
+            return
+        for _, _, pidx, sku, cand, idx_libre, cantidad in candidatos:
+            snap = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
+            construcciones[pidx].colocar(cand, cantidad, idx_libre)
+            pendientes[sku] -= cantidad
+            colocados_por_pallet[pidx][sku] = colocados_por_pallet[pidx].get(sku, 0) + cantidad
+            _dfs(colocado_actual + cantidad)
+            _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap)
+            if estado["nodos"] > COMBINACION_PALLETS_MAX_NODOS:
+                break
+
+    _dfs(demanda_inicial - sum(pendientes.values()))
+    if estado["mejor_snapshot"] is not None:
+        _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, estado["mejor_snapshot"])
+    return estado["mejor_total"]
+
+
+def _empacar_n_pallets(
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    cd: str,
+    contador: list[int],
+    n_pallets: int,
+) -> tuple[list[PalletV5], dict[str, int]]:
+    """[wrapper -ver comentario de sección arriba] Corre el greedy de
+    siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
+    referencia, corre el backtracking real desde cero (mismos `pendientes`
+    originales, pallets frescos -no continúa desde el estado ya "atascado"
+    del greedy), y se queda con el que haya colocado MÁS cajas -empate
+    prefiere el greedy (determinismo, cero superficie de cambio nueva). El
+    backtracking nunca puede dar un resultado peor al del greedy porque su
+    primera rama explorada reproduce exactamente la misma prioridad."""
+    pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
+        dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+        cd, contador, n_pallets,
+    )
+    total_greedy = sum(t.cantidad for p in pallets_greedy for t in p.torres)
+
+    demanda_total = sum(pendientes.values())
+    if total_greedy >= demanda_total:
+        return pallets_greedy, sin_colocar_greedy  # ya se colocó todo -no hace falta buscar más
+
+    presupuesto = _altura_presupuesto()
+    pallets_bt: list[PalletV5] = []
+    construcciones_bt: list[_PalletEnConstruccion] = []
+    colocados_bt: list[dict[str, int]] = []
+    for _ in range(n_pallets):
+        contador[0] += 1
+        pallet = PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd)
+        pallets_bt.append(pallet)
+        construcciones_bt.append(_PalletEnConstruccion(pallet=pallet))
+        colocados_bt.append({})
+    pendientes_bt = dict(pendientes)
+
+    total_bt = _resolver_pallets_backtracking(
+        construcciones_bt, colocados_bt, pendientes_bt, por_sku,
+        capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+    )
+
+    if total_bt > total_greedy:
+        sin_colocar_bt = {sku: cant for sku, cant in pendientes_bt.items() if cant > 0}
+        return pallets_bt, sin_colocar_bt
+    return pallets_greedy, sin_colocar_greedy
 
 
 # [sección 8, redistribución de dispersos] Un pallet por debajo de este

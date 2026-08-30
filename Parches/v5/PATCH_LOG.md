@@ -3178,3 +3178,212 @@ el tamaño del esfuerzo.
 código real. Pendiente: diseñar el solver de backtracking real, si se
 decide continuar en una sesión futura. Se documenta acá para no repetir
 estos 2 intentos ya descartados sin una razón nueva.
+
+## Combinación por fila -intento 3: solver DFS con poda, también descartado
+[sesión posterior, pedido explícito del usuario: "diseñemos el solver
+real"] Se diseñó (con un agente de planning dedicado, revisando código
+real) e implementó un solver de asignación conjunta por fila: DFS con
+poda (branch and bound), presupuesto de nodos contados (no de reloj, para
+reproducibilidad), shortlist top-K por cuboide, y cota superior admisible
+-no el heurístico local puntual de los intentos 1-2, un algoritmo de
+verdad que evalúa combinaciones de varios SKUs a la vez sobre TODOS los
+cuboides libres disjuntos de la misma Z frontera (`_cuboides_en_
+frontera`), no una sola celda.
+
+### Hallazgo de datos, aparte del algoritmo (SÍ vale la pena, no se aplicó)
+Antes de diseñar el solver se investigó por qué Electrolight (NABs) nunca
+pasa de ~18-20 cajas: `reconciliacion_geometrica.reconciliar_sku` degrada
+su objetivo del Maestro (24 cajas/cama) a ~19-20 porque la huella
+declarada en UMA (26x22.5cm, parada) da esa capacidad geométrica real. Si
+la huella real parada fuera 26x19cm (22.5cm de alto, no 19cm) el cálculo
+da exactamente 24 -coincide con el Maestro. Se le preguntó al usuario si
+Electrolight (u NABs en general) podía acostarse para aprovechar esto -
+**el usuario confirmó mantener la regla "NABs siempre de pie" tal cual**,
+y aclaró que la huella real parada de Electrolight es 26x19 (no 26x22.5):
+o sea, el dato de "Ancho de caja"/"Alto de caja" de UMA está invertido
+para este SKU, sin que haga falta acostarlo. Esto es una corrección de
+DATO FUENTE (UMAS 17.06.2026.xlsx / Plantilla_Ejemplo_Agente_Cubicador),
+no de algoritmo -queda fuera de alcance de este intento, pendiente de
+corregir en la fuente si se retoma.
+
+### Diseño implementado (3 variantes, las 3 descartadas)
+Se probaron 3 disparadores distintos para cuándo invocar el solver,
+cada uno verificado contra la suite completa (155 tests) Y
+`Cubicaje18.07.2026.xlsx` (9 CDs reales) antes de pasar al siguiente:
+
+1. **Disparo en CUALQUIER fila con 2+ cuboides libres distintos en la
+   misma Z**, sustituyendo al ganador normal si el solver encontraba una
+   asignación con más cajas totales. **Resultado**: 56->**55** pallets
+   (peor que los 54 ya shippeados) -BK41 pasó de 4 a 5.
+2. **Disparo restringido** (más conservador: solo si existía un SKU que
+   GENUINAMENTE necesitaba -`_necesita_columna_nueva`- un cuboide de la
+   frontera distinto al ganador normal, mismo criterio que ya usa la
+   cesión puntual shippeada, extendido a cuboides no idénticos).
+   **Resultado**: BK41 **seguía en 5** -el disparador más estricto no
+   alcanzó, el problema no era "disparar de más" sino la reasignación en
+   sí.
+3. **Versión ADITIVA** (la más conservadora posible: nunca tocar al
+   ganador normal en SU propio cuboide -eso queda exactamente igual que
+   hoy-, solo aprovechar en la MISMA ronda cuboides HERMANOS -mismo Z,
+   índice distinto- que de otro modo se llenarían recién varias
+   iteraciones después). **Resultado**: BK41 volvió a **4** (arreglado),
+   pero el TOTAL del dataset se mantuvo en **55** -SJ97 o algún otro CD
+   compensó en la dirección contraria (verificado con `pytest`
+   end-to-end, no solo el CD aislado).
+
+### Diagnóstico final, más preciso que el de los intentos 1-2
+Para aislar si el problema era la PRIORIZACIÓN ("necesita columna" gana
+el desempate del hermano) o el simple hecho de REORDENAR cuándo se coloca
+algo, se probó una 4ª variante de control: la versión aditiva, pero
+llenando cada cuboide hermano con el MISMO SKU que ya era su ganador
+natural por el criterio de siempre (`nivel, -área, -pendiente`, SIN el
+criterio de "necesita columna") -o sea, exactamente lo mismo que el
+algoritmo actual haría más adelante, solo que YA, en la misma ronda, sin
+cambiar NUNCA quién gana nada.
+
+**Resultado**: `Cubicaje18.07.2026.xlsx` volvió a dar **54** pallets en
+total (BK41 4, igual que el baseline) -pero **BK65 mejoró (6->5) y SJ95
+empeoró (5->6)**: mismo total, un CD distinto peor. Esto prueba que el
+problema NO es de criterio de prioridad -es que el pipeline completo
+(barrido + `_redistribuir_dispersos` + consolidación de remanentes de la
+sección 5) es sensible al ORDEN EXACTO en que se van colocando las cajas,
+incluso cuando esa reordenación no cambia NUNCA quién gana un cuboide,
+solo el momento en que lo gana. Cualquier perturbación -por más
+conservadora, aditiva y "sin cambiar el resultado" que parezca- puede
+cambiar la forma final de algún pallet lo suficiente como para que la
+consolidación posterior tome una decisión distinta en OTRO CD
+completamente separado.
+
+### Estado final
+Los 3 (+1 de control) intentos fueron revertidos -`src/packing_bloques.py`
+quedó exactamente como en el commit `a27128f` (cesión por capacidad
+instalada), sin ningún cambio de este intento aplicado al código real.
+El problema de combinación por fila sigue sin resolverse: se confirma con
+evidencia nueva y más precisa que el barrido voraz de este archivo no se
+puede "arreglar por partes" con ningún parche local -ni siquiera uno que
+no cambie ninguna decisión, solo la agilice- porque toda la tubería
+completa (barrido + redistribución + consolidación) es un sistema
+acoplado, sensible al orden. Un solver real necesitaría, como mínimo,
+correr DESPUÉS de la consolidación (sobre el resultado ya estable) o
+integrarse a ella como una sola pasada -no como una corrección puntual
+dentro del barrido principal. Pendiente para una sesión futura si se
+decide encarar ese rediseño más grande.
+
+## Solver exacto de N pallets fijos -shippeado, Pallet 1 de 67 a 78/93
+[sesión posterior, pedido explícito del usuario: "encaremos el diseño más
+grande pero solo utilicemos como base el pallet 1 que tenemos fotos y
+cantidades exactas de cuanto ha entrado, si logramos replicar ese pallet a
+la perfección lo demás va a salir"] El intento anterior fracasó porque
+CUALQUIER reordenamiento dentro de `_empacar` (el camino multi-CD) es
+sensible al orden vía `_redistribuir_dispersos` + consolidación de
+remanentes. Antes de diseñar nada se verificó con `grep -rn
+"pallets_objetivo"` en todo el repo: **`_empacar_n_pallets` (el camino que
+usa `pallets_objetivo`, el que reproduce Pallet 1) no tiene NINGÚN
+llamador de producción** (`pipeline_sku_bloque.py` nunca lo pasa) **ni
+ningún test que lo cubra** -a diferencia de `_empacar`, es un camino de
+código completamente aislado, sin usuarios reales ni consolidación
+posterior. Eso permitió construir ahí un backtracking real sin ningún
+riesgo sobre el dataset de referencia de 9 CDs.
+
+### Diseño (con agente de planning dedicado, revisando código real)
+`_empacar_n_pallets_greedy` (el motor de siempre, renombrado, verbatim -
+sirve de semilla/kill-switch) se complementa con `_resolver_pallets_
+backtracking`: DFS con poda real, con undo, sobre LOTES completos (una
+columna entera de una vez, no 1 caja a la vez -baja la profundidad del
+árbol de ~93 decisiones a ~30-60). Piezas nuevas en `src/packing_bloques.py`:
+- `_snapshot_estado_pallets`/`_restaurar_estado_pallets`: undo barato sin
+  `copy.deepcopy`, apoyado en que `_actualizar_libres_maxrects`
+  (`packing_columnar.py`) nunca muta un `_CuboidLibre` in-place -guardar
+  la referencia vieja de `pc.libres` alcanza. **Bug real encontrado y
+  corregido en el camino**: `pallet.torres` SÍ se muta con `.append()` (a
+  diferencia de `pc.libres`) -guardar solo su longitud y recortar la lista
+  ACTUAL con `[:n]` al restaurar fallaba en cuanto se restauraba un
+  snapshot viejo después de hacer backtrack más allá de él (el primer
+  intento completo dio 0 cajas colocadas, silencioso, hasta que se
+  encontró la causa). Fix: guardar una COPIA real de `pallet.torres` en el
+  snapshot, no su longitud.
+- `_candidatos_lote`: por cada (SKU, pallet) activo, cuántas cajas caben
+  de UNA vez en su mejor cuboide (tope de capa, tope de PH, profundidad Z)
+  -reusa `_mejor_cuboide_para_sku`/`_necesita_columna_nueva` tal cual, sin
+  tocarlas.
+- `_resolver_pallets_backtracking`: DFS con cota superior admisible
+  (volumen libre / volumen mínimo de caja pendiente), presupuesto de
+  NODOS contados (no de reloj, reproducible), shortlist top-K por nodo. La
+  primera rama de cada nodo reproduce la prioridad exacta del greedy -el
+  incumbente inicial nunca es peor que hoy.
+- `_empacar_n_pallets` (wrapper): corre el greedy, corre el backtracking
+  desde cero, se queda con el que coloque MÁS cajas. Mismo contrato de
+  firma/retorno -`armar_pallets_bloques` no cambió ni una línea.
+
+### Calibración (medida contra el caso real, no adivinada)
+- Con 1 sola opción de cuboide por SKU (su mejor, igual que el greedy),
+  `COMBINACION_PALLETS_SHORTLIST_K=8`, `COMBINACION_PALLETS_MAX_NODOS=30000`:
+  **Pallet 1 sube de 67 a 78 de 93 cajas** en ~28s, 0 violaciones
+  geométricas. Electrolight (el más golpeado) llega a **25/25, completo**
+  (antes 18/25). Quedan cortos: "Ron Flor de Caña" ya no aparece entre los
+  incompletos (llega a demanda completa vía otro Licor con más margen),
+  pero PO Galleta Vainilla, Gomas Ambrosito, PO Club Social, Piscano Sour
+  Limón y Maniak Surtido quedan con 15 cajas sin ubicar entre los 5.
+- **Probado explícitamente y descartado**: subir `COMBINACION_PALLETS_
+  OPCIONES_POR_SKU` a 2 o 3 (ofrecerle a cada SKU más de 1 cuboide
+  candidato por nodo, no solo el mejor) -la intuición era que así el DFS
+  podría explorar "SKU X cede su mejor columna para liberarla" de forma
+  más rica. Resultado real: **empeoró a 71/93**, con el MISMO o más
+  presupuesto de nodos (100,000) -el árbol se diluye entre más ramas por
+  nodo sin encontrar mejores combinaciones, en vez de concentrar la
+  búsqueda en qué SKU gana cada columna. Se descartó y se dejó en 1
+  (default validado), documentado en el propio código para no repetirlo.
+- Subir el presupuesto de nodos de 30,000 a 100,000 y 200,000 (con 1 sola
+  opción por SKU) **no cambió el resultado** (78/93 en los tres casos) -el
+  DFS converge antes de agotar el presupuesto; el techo actual no es de
+  búsqueda, es de qué combinaciones puede siquiera generar `_candidatos_
+  lote` tal como está diseñado hoy.
+
+### Los 15 restantes: mezcla de piso genuinamente agotado y datos, no de búsqueda
+Se revisó si los 5 SKUs que quedan cortos (PO Galleta Vainilla, Gomas
+Ambrosito, PO Club Social, Piscano Sour Limón, Maniak Surtido) tienen el
+mismo problema de dato mal etiquetado que Electrolight. Maniak y PO Club
+Social coinciden exacto entre el Maestro y la geometría reconciliada (no
+es un problema de dato). Piscano Sour Limón sí muestra una brecha real
+(Maestro declara 14 cajas/cama, la reconciliación calcula 13 -mínima,
+nada comparable a la de Electrolight) y su demanda pendiente (3 cajas) es
+bien menor a su `Cajas_Cama_Efectivo` -o sea, su problema tampoco es de
+capacidad por capa, es 100% de competencia por piso en las últimas
+posiciones libres del pallet, exactamente el tipo de problema que este
+solver ataca pero con presupuesto/diseño de candidatos que hoy no alcanza
+a resolver del todo.
+
+### Verificación
+- Suite completa: **158/158 pasan** (155 preexistentes + 3 nuevos:
+  `test_n_pallets_backtracking_nunca_peor_que_el_greedy`,
+  `test_pallets_objetivo_respeta_cantidad_exacta_y_reporta_sin_colocar`,
+  `test_snapshot_restaurar_estado_pallets_es_identidad` -el último fija
+  como contrato el bug de undo ya descrito, para que un cambio futuro que
+  lo reintroduzca falle ruidosamente acá).
+- `Cubicaje18.07.2026.xlsx` (9 CDs reales, pipeline completo, camino
+  `_empacar` SIN `pallets_objetivo`): **sigue en 54 pallets, sin ningún
+  cambio** -confirmado que este camino nunca se toca desde el solver
+  nuevo.
+- Pallet 1 forzado a 1 pallet real (`pallets_objetivo=1`): **67 -> 78 de
+  93 cajas**, 0 violaciones geométricas, altura 210.92cm (dentro del tope
+  de 215). No se prometió ni se alcanzó 93/93 -se documenta el resultado
+  real, no una promesa.
+
+### Estado final y qué queda pendiente
+El código quedó shippeado (`_empacar_n_pallets_greedy` + `_resolver_
+pallets_backtracking` + wrapper `_empacar_n_pallets`, todo en
+`src/packing_bloques.py`). Para acercarse más a 93/93 en una sesión
+futura, dos caminos separados, no mutuamente excluyentes:
+1. **Mejorar `_candidatos_lote`** sin repetir el error de subir `OPCIONES_
+   POR_SKU` a ciegas -por ejemplo, generar más opciones SOLO para los SKUs
+   que ya muestran señal de estar compitiendo por piso (`_necesita_
+   columna_nueva` verdadero), no para todos por igual.
+2. **Corregir el dato fuente de Piscano Sour Limón** (y revisar el resto
+   del Maestro de este cliente por el mismo patrón que Electrolight -Largo/
+   Ancho/Alto posiblemente invertidos en algunos SKUs) -aparte del
+   algoritmo, ya se sabe que al menos 1 SKU más tiene esta clase de
+   problema.
+`pallets_objetivo` sigue sin ningún llamador de producción -conectarlo al
+pipeline real por CD (mencionado como pendiente ya en una sección anterior
+de este archivo) sigue siendo una decisión de producto aparte, no tomada
+en esta sesión.
