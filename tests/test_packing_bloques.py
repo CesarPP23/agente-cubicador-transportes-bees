@@ -21,6 +21,7 @@ from src.packing_bloques import (
     _mejor_cuboide_para_sku,
     _necesita_columna_nueva,
     _restaurar_estado_pallets,
+    _romper_skus_con_cascada,
     _snapshot_estado_pallets,
     armar_pallets_bloques,
 )
@@ -727,3 +728,30 @@ def test_snapshot_restaurar_estado_pallets_es_identidad():
     assert pallet.altura_final == altura_en_snapshot
     assert colocados_por_pallet[0]["A"] == 3
     assert pendientes["A"] == 17
+
+
+def test_romper_skus_con_cascada_saca_tambien_lo_que_queda_flotando():
+    """[bug real encontrado y corregido en esta sesión: "caja flotando",
+    LNS de `_empacar_n_pallets`] La ruina del LNS deshace las columnas de
+    los SKUs elegidos para reintentar una combinación distinta -pero si
+    otro SKU (ni elegido, ni el mismo) estaba apoyado justo encima de una
+    columna removida, sacar SOLO la elegida lo dejaba flotando (violación
+    geométrica real, encontrada corriendo el LNS contra Pallet 1).
+    `_romper_skus_con_cascada` debe sacar TAMBIÉN esa torre dependiente, y
+    devolver su SKU a `pendientes` -sin tocar torres que no dependían de
+    nada removido."""
+    base = _torre_test("BASE", 0, 0, 0, 20, 1)  # z=0..20
+    encima = _torre_test("ENCIMA", 0, 0, 20, 15, 2)  # apoyada justo en z=20, misma huella
+    independiente = _torre_test("INDEPENDIENTE", 60, 0, 0, 10, 3)  # en el piso, sin relación
+    pallet = PalletV5(id="P1", cd="BK31", torres=[base, encima, independiente])
+    pc = _PalletEnConstruccion(pallet=pallet)
+    colocados_por_pallet = [{"BASE": 1, "ENCIMA": 2, "INDEPENDIENTE": 3}]
+    pendientes = {"BASE": 0, "ENCIMA": 0, "INDEPENDIENTE": 0}
+
+    _romper_skus_con_cascada([pc], colocados_por_pallet, pendientes, {"BASE"}, 1)
+
+    skus_restantes = {t.sku for t in pallet.torres}
+    assert skus_restantes == {"INDEPENDIENTE"}  # BASE y ENCIMA (cascada) afuera, INDEPENDIENTE queda
+    assert pendientes == {"BASE": 1, "ENCIMA": 2, "INDEPENDIENTE": 0}
+    assert colocados_por_pallet == [{"BASE": 0, "ENCIMA": 0, "INDEPENDIENTE": 3}]
+    assert validar_geometria_v5([pallet]) == []

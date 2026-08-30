@@ -148,6 +148,8 @@ que PH_FRACCION perseguía sin sacrificar la garantía exacta, se le agregan
    real de los demás pallets del CD antes de aceptarlo como pallet
    aparte.
 """
+import random
+
 import pandas as pd
 
 import config
@@ -158,6 +160,7 @@ from src.packing_columnar import (
     _PalletEnConstruccion,
     _reconstruir_en_construccion,
 )
+from src.validacion_v5 import _area_cubierta_por_soporte
 from src.torres import TorreCandidate, generar_torres_candidatas, generar_torres_candidatas_todas_orientaciones
 
 TOL = 1e-6
@@ -671,6 +674,26 @@ COMBINACION_PALLETS_MAX_NODOS = 30_000
 # de más opciones -pero el default validado es 1.
 COMBINACION_PALLETS_OPCIONES_POR_SKU = 1
 
+# [LNS -ruina y reconstrucción, ver `_lns_mejorar_pallets`] Medido con
+# datos reales (Pallet 1): el resultado del DFS (78/93) es un ÓPTIMO LOCAL
+# del modelo de candidatos -sobra más del doble del volumen (917,000 cm³
+# libres) que lo que necesitan las 15 cajas restantes (402,000 cm³), así
+# que el problema es de búsqueda, no de capacidad física. Ampliar candidatos
+# (2 intentos, ver COMBINACION_PALLETS_OPCIONES_POR_SKU arriba) diluye la
+# búsqueda y empeora el resultado -acá en cambio se DESHACE una porción ya
+# puesta y se reconstruye, escapando del óptimo local sin tocar el criterio
+# de prioridad de cada nodo individual.
+COMBINACION_PALLETS_LNS_ITERACIONES = 200
+COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX = 40
+COMBINACION_PALLETS_LNS_SKUS_A_ROMPER = 2
+COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION = 3_000
+# [multi-reinicio, ver `_empacar_n_pallets`] Una sola corrida de LNS
+# depende de la suerte de la semilla -medido con 17 semillas distintas
+# contra Pallet 1, la mayoría se queda en el mismo óptimo local del DFS
+# (78/93) pero varias llegan a 83/93. Se prueban esta cantidad de semillas
+# distintas desde el mismo punto de partida y se conserva el mejor.
+COMBINACION_PALLETS_LNS_REINICIOS = 5
+
 
 def _capacidad_restante_en_capa(pallet: PalletV5, sku: str, z: float, tope_capa: int | None) -> float:
     """Cuántas cajas MÁS de `sku` caben todavía en la capa exacta `z` de
@@ -818,6 +841,7 @@ def _resolver_pallets_backtracking(
     tope_pallet_por_sku: dict[str, int],
     presupuesto: float,
     n_pallets: int,
+    max_nodos: int = COMBINACION_PALLETS_MAX_NODOS,
 ) -> int:
     """[backtracking real, DFS con poda] A diferencia del greedy (1 caja,
     sin vuelta atrás), acá cada nodo coloca un LOTE completo -toda una
@@ -856,7 +880,7 @@ def _resolver_pallets_backtracking(
         if colocado_actual > estado["mejor_total"]:
             estado["mejor_total"] = colocado_actual
             estado["mejor_snapshot"] = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
-        if estado["nodos"] > COMBINACION_PALLETS_MAX_NODOS:
+        if estado["nodos"] > max_nodos:
             return
         if colocado_actual >= demanda_inicial:
             return  # se colocó TODO -óptimo absoluto, no hay nada más que buscar
@@ -875,13 +899,146 @@ def _resolver_pallets_backtracking(
             colocados_por_pallet[pidx][sku] = colocados_por_pallet[pidx].get(sku, 0) + cantidad
             _dfs(colocado_actual + cantidad)
             _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap)
-            if estado["nodos"] > COMBINACION_PALLETS_MAX_NODOS:
+            if estado["nodos"] > max_nodos:
                 break
 
     _dfs(demanda_inicial - sum(pendientes.values()))
     if estado["mejor_snapshot"] is not None:
         _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, estado["mejor_snapshot"])
     return estado["mejor_total"]
+
+
+def _romper_skus_con_cascada(
+    construcciones: list[_PalletEnConstruccion],
+    colocados_por_pallet: list[dict[str, int]],
+    pendientes: dict[str, int],
+    elegidos: set[str],
+    n_pallets: int,
+) -> None:
+    """[ruina, ver `_lns_mejorar_pallets`] Saca todas las torres de los
+    SKUs `elegidos` de TODOS los pallets, devuelve sus cajas a
+    `pendientes`, y reconstruye el espacio libre desde cero para cada
+    pallet (mismo mecanismo que `_redistribuir_dispersos` usa para
+    reinsertar torres sueltas).
+
+    [bug real encontrado y corregido en esta sesión: "caja flotando"]
+    Sacar SOLO las torres de los SKUs elegidos podía dejar OTRA torre (de
+    un SKU distinto, no elegido) sin soporte real debajo si estaba
+    apoyada justo encima de una de las removidas -acá se remueve en
+    CASCADA: después de sacar las elegidas, cualquier torre que quede sin
+    soporte real en TODA su huella (mismo criterio exacto que
+    `validacion_v5._area_cubierta_por_soporte`, el que usa el gate de
+    geometría) también se saca, devolviendo su SKU a `pendientes` -y se
+    repite hasta que no quede ninguna inestable (puede haber cadenas de
+    más de 1 nivel). Modifica `construcciones`/`colocados_por_pallet`/
+    `pendientes` IN-PLACE."""
+    for pidx in range(n_pallets):
+        pc = construcciones[pidx]
+        restantes = list(pc.pallet.torres)
+        elegidos_pallet = set(elegidos)  # copia local -la cascada de ESTE pallet no debe afectar a los demás
+        while True:
+            nuevas_restantes = []
+            cambio = False
+            for t in restantes:
+                if t.sku in elegidos_pallet:
+                    cambio = True
+                    continue
+                if t.z > TOL:
+                    soportes = [
+                        o for o in restantes
+                        if o is not t and o.sku not in elegidos_pallet and abs((o.z + o.altura) - t.z) <= TOL
+                    ]
+                    area_cubierta = _area_cubierta_por_soporte(t, soportes)
+                    if area_cubierta < t.largo * t.ancho - TOL:
+                        elegidos_pallet.add(t.sku)  # se agrega a la ronda de remoción, cascada
+                        cambio = True
+                        continue
+                nuevas_restantes.append(t)
+            restantes = nuevas_restantes
+            if not cambio:
+                break
+        ids_restantes = {id(t) for t in restantes}
+        for t in pc.pallet.torres:
+            if id(t) not in ids_restantes:
+                pendientes[t.sku] = pendientes.get(t.sku, 0) + t.cantidad
+                colocados_por_pallet[pidx][t.sku] = colocados_por_pallet[pidx].get(t.sku, 0) - t.cantidad
+        pc.pallet.torres = restantes
+        _recalcular_metricas_pallet(pc.pallet)
+        construcciones[pidx] = _reconstruir_en_construccion(pc.pallet)
+
+
+def _lns_mejorar_pallets(
+    construcciones: list[_PalletEnConstruccion],
+    colocados_por_pallet: list[dict[str, int]],
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
+    n_pallets: int,
+    semilla: str,
+) -> int:
+    """[LNS -ruina y reconstrucción, ver comentario junto a las
+    constantes `COMBINACION_PALLETS_LNS_*`] Complementa el DFS de
+    `_resolver_pallets_backtracking`: parte del incumbente YA construido
+    en `construcciones`/`colocados_por_pallet` (no arranca de cero), y en
+    cada iteración DESHACE todas las columnas de un par de SKUs elegidos
+    al azar -sus cajas vuelven a `pendientes`- y vuelve a correr el mismo
+    backtracking (con un presupuesto de nodos más chico,
+    `COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION`, porque acá se
+    corre muchas veces) sobre la demanda liberada + lo que ya estaba
+    pendiente. Si el total colocado mejora, se queda con el resultado
+    nuevo; si no, se revierte al mejor incumbente conocido
+    (`_snapshot_estado_pallets`/`_restaurar_estado_pallets`, el mismo
+    mecanismo de undo del DFS). Corta por iteraciones sin mejora
+    consecutivas (`COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX`) o por el total
+    de iteraciones (`COMBINACION_PALLETS_LNS_ITERACIONES`) -RNG con
+    semilla fija (derivada de `cd`+`n_pallets` por el caller) para que el
+    resultado sea reproducible entre corridas. Modifica `construcciones`/
+    `colocados_por_pallet`/`pendientes` IN-PLACE, igual que el DFS.
+    Devuelve el total de cajas colocadas en TODOS los pallets (no un delta
+    relativo a esta llamada, a diferencia de `_resolver_pallets_
+    backtracking`)."""
+    rng = random.Random(semilla)
+
+    def _total_colocado() -> int:
+        return sum(sum(d.values()) for d in colocados_por_pallet)
+
+    mejor_total = _total_colocado()
+    mejor_snapshot = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
+    sin_mejora = 0
+
+    for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES):
+        if sin_mejora >= COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX:
+            break
+        skus_colocados = sorted({sku for d in colocados_por_pallet for sku, cant in d.items() if cant > 0})
+        if not skus_colocados:
+            break
+        k = min(COMBINACION_PALLETS_LNS_SKUS_A_ROMPER, len(skus_colocados))
+        elegidos = set(rng.sample(skus_colocados, k))
+
+        _romper_skus_con_cascada(construcciones, colocados_por_pallet, pendientes, elegidos, n_pallets)
+
+        # [reconstrucción] Mismo backtracking, presupuesto de nodos más
+        # chico -acá se corre muchas veces, no una sola.
+        _resolver_pallets_backtracking(
+            construcciones, colocados_por_pallet, pendientes, por_sku,
+            capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+            max_nodos=COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION,
+        )
+
+        total_actual = _total_colocado()
+        if total_actual > mejor_total:
+            mejor_total = total_actual
+            mejor_snapshot = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
+            sin_mejora = 0
+        else:
+            _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
+            sin_mejora += 1
+
+    _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
+    return mejor_total
 
 
 def _empacar_n_pallets(
@@ -898,10 +1055,15 @@ def _empacar_n_pallets(
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
     referencia, corre el backtracking real desde cero (mismos `pendientes`
     originales, pallets frescos -no continúa desde el estado ya "atascado"
-    del greedy), y se queda con el que haya colocado MÁS cajas -empate
-    prefiere el greedy (determinismo, cero superficie de cambio nueva). El
-    backtracking nunca puede dar un resultado peor al del greedy porque su
-    primera rama explorada reproduce exactamente la misma prioridad."""
+    del greedy), y si todavía queda demanda sin colocar corre además LNS
+    (`_lns_mejorar_pallets`, ruina y reconstrucción) sobre el resultado del
+    backtracking -medido con datos reales (Pallet 1) que el DFS solo llega
+    a un ÓPTIMO LOCAL (78/93) con volumen de sobra, ver comentario junto a
+    `COMBINACION_PALLETS_LNS_ITERACIONES`. Se queda con el que haya
+    colocado MÁS cajas -empate prefiere el greedy (determinismo, cero
+    superficie de cambio nueva). El backtracking (y por lo tanto todo el
+    resultado final) nunca puede dar menos que el greedy porque su primera
+    rama explorada reproduce exactamente la misma prioridad."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -924,10 +1086,38 @@ def _empacar_n_pallets(
         colocados_bt.append({})
     pendientes_bt = dict(pendientes)
 
-    total_bt = _resolver_pallets_backtracking(
+    _resolver_pallets_backtracking(
         construcciones_bt, colocados_bt, pendientes_bt, por_sku,
         capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
     )
+    total_bt = sum(sum(d.values()) for d in colocados_bt)
+
+    if total_bt < demanda_total:
+        # [multi-reinicio -medido con datos reales, Pallet 1] Una sola
+        # corrida de LNS depende de la suerte de la semilla: probado con 17
+        # semillas distintas, el resultado varía entre 78 y 83 -la mayoría
+        # se queda en 78 (el mismo óptimo local del DFS solo), pero varias
+        # sí llegan a 83. En vez de confiar en una semilla fija, se prueban
+        # `COMBINACION_PALLETS_LNS_REINICIOS` semillas (derivadas de
+        # `cd`+`n_pallets`+número de intento, reproducibles) desde el MISMO
+        # punto de partida (el incumbente del DFS) y se conserva el mejor.
+        snapshot_dfs = _snapshot_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt)
+        mejor_total_lns = total_bt
+        mejor_snapshot_lns = snapshot_dfs
+        for intento in range(COMBINACION_PALLETS_LNS_REINICIOS):
+            _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, snapshot_dfs)
+            total_intento = _lns_mejorar_pallets(
+                construcciones_bt, colocados_bt, pendientes_bt, por_sku,
+                capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+                semilla=f"{cd}-{n_pallets}-{intento}",
+            )
+            if total_intento > mejor_total_lns:
+                mejor_total_lns = total_intento
+                mejor_snapshot_lns = _snapshot_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt)
+            if mejor_total_lns >= demanda_total:
+                break  # ya se colocó TODO -no hace falta seguir probando semillas
+        _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, mejor_snapshot_lns)
+        total_bt = mejor_total_lns
 
     if total_bt > total_greedy:
         sin_colocar_bt = {sku: cant for sku, cant in pendientes_bt.items() if cant > 0}

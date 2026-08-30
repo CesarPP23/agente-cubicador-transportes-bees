@@ -3387,3 +3387,82 @@ futura, dos caminos separados, no mutuamente excluyentes:
 pipeline real por CD (mencionado como pendiente ya en una sección anterior
 de este archivo) sigue siendo una decisión de producto aparte, no tomada
 en esta sesión.
+
+## LNS (ruina y reconstrucción) -shippeado, Pallet 1 de 78 a 84/93
+[misma sesión, pedido explícito del usuario: "Encara el LNS"] El intento 1
+del DFS solo (arriba) mide con datos reales que 78/93 es un ÓPTIMO LOCAL,
+no un techo físico: el pallet resultante usa apenas 62% del volumen total
+del presupuesto (1.48M de 2.4M cm³), y las 15 cajas restantes solo
+necesitan 402,000 cm³ -menos de la mitad de lo que sobra (917,000 cm³
+libres). El problema es de búsqueda, no de capacidad -confirma que valía
+la pena encarar LNS en vez de seguir ajustando `_candidatos_lote` (2
+intentos ya descartados en la sección anterior).
+
+### Diseño
+`_lns_mejorar_pallets` (nuevo, `src/packing_bloques.py`) parte del
+incumbente YA construido por el DFS (no arranca de cero) y, en cada
+iteración: elige al azar `COMBINACION_PALLETS_LNS_SKUS_A_ROMPER` SKUs con
+algo puesto, deshace TODAS sus columnas (`_romper_skus_con_cascada`, ver
+abajo), y corre el mismo `_resolver_pallets_backtracking` de siempre
+-reutilizado tal cual, con un presupuesto de nodos más chico
+(`COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION=3000`, porque acá se
+llama muchas veces)- sobre la demanda liberada + la que ya estaba
+pendiente. Si el total colocado mejora, se queda; si no, revierte al mejor
+incumbente conocido con el mismo mecanismo de undo del DFS
+(`_snapshot_estado_pallets`/`_restaurar_estado_pallets`). Corta por
+iteraciones sin mejora consecutivas o por tope de iteraciones. RNG con
+semilla fija (reproducible).
+
+### Bug real encontrado y corregido en el camino: cajas flotando
+La primera versión de la "ruina" sacaba SOLO las torres de los SKUs
+elegidos al azar -pero si otra torre (de un SKU DISTINTO, no elegido)
+estaba apoyada justo encima de una columna removida, se quedaba flotando.
+Se encontró corriendo el LNS contra Pallet 1 de verdad (`validar_
+geometria_v5` reportó "torre 23626@(...) no tiene soporte real en toda su
+huella -caja flotando"), no en un test -el mismo tipo de bug real que
+motivó la arquitectura MaxRects original de este archivo. Fix:
+`_romper_skus_con_cascada` (extraída aparte, testeable) remueve en
+CASCADA -después de sacar las elegidas, cualquier torre que quede sin
+soporte real en TODA su huella (mismo criterio exacto que `validacion_
+v5._area_cubierta_por_soporte`, el que usa el gate de geometría) también
+se saca, y se repite hasta que no quede ninguna inestable (puede haber
+cadenas de más de 1 nivel). Nuevo test de regresión: `test_romper_skus_
+con_cascada_saca_tambien_lo_que_queda_flotando` (fija el contrato: una
+torre apoyada se saca en cascada, una torre independiente no se toca).
+
+### Multi-reinicio: una sola semilla no alcanza
+Probado con 17 semillas distintas contra Pallet 1 (antes del fix de
+cascada, mismo patrón después): el resultado varía entre 78 (la mayoría,
+mismo óptimo local del DFS solo) y 83-84 (varias). Una semilla fija no es
+confiable -`_empacar_n_pallets` ahora prueba `COMBINACION_PALLETS_LNS_
+REINICIOS=5` semillas distintas (derivadas de `cd`+`n_pallets`+número de
+intento, reproducibles) desde el MISMO punto de partida (el incumbente del
+DFS) y se queda con el mejor.
+
+### Verificación
+- Suite completa: **159/159 pasan** (158 previos + 1 nuevo, el de la
+  cascada de soporte).
+- `Cubicaje18.07.2026.xlsx` (9 CDs reales): **sigue en 54 pallets, sin
+  cambios** -mismo argumento que antes, este camino no se toca.
+- Pallet 1 forzado a 1 pallet real: **78 -> 84 de 93 cajas**, **0
+  violaciones geométricas**, altura 212.42cm. Solo quedan 2 SKUs
+  incompletos (antes 5): "Ron Barcelo" 12/20 y "Gomas Ambrosito" 2/3
+  -Piscano Sour Limón, PO Club Social, Maniak Surtido y PO Galleta
+  Vainilla, que antes quedaban cortos, ahora completos.
+- **Costo real, sin maquillar**: ~5.4 minutos para Pallet 1 (vs ~30s del
+  DFS solo) -el LNS corre el backtracking de reconstrucción muchas veces
+  (hasta 200 iteraciones x 5 semillas), cada una con su propia cascada de
+  verificación de soporte. Aceptable hoy porque `pallets_objetivo` sigue
+  sin ningún llamador de producción (mismo argumento de aislamiento que
+  justificó encarar esto); si algún día se conecta al pipeline real por
+  CD, este costo por pallet habría que revisarlo (bajar reinicios/
+  iteraciones, o paralelizar semillas).
+
+### Qué queda pendiente
+Quedan 9 cajas sin ubicar en 2 SKUs. No se investigó todavía si es
+competencia genuina de piso (lo más probable, dado que 78->84 ya fue
+puramente de búsqueda, sin tocar ningún dato) o si hay algún problema de
+dato adicional como el de Piscano. Subir `COMBINACION_PALLETS_LNS_
+REINICIOS` más allá de 5, o generar más diversidad de vecindario (variar
+`SKUS_A_ROMPER` entre 1-3 en vez de fijo en 2), son las próximas perillas
+obvias si se decide seguir apretando -no probadas todavía.
