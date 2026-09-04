@@ -105,6 +105,38 @@ def _construir_nombres_cd(envios: pd.DataFrame) -> dict[str, str]:
     return dict(zip(pares["CD"], pares[columna]))
 
 
+def _demanda_excluida_geometria(envios: pd.DataFrame, maestro: pd.DataFrame, log_df: pd.DataFrame) -> pd.DataFrame:
+    """[bug real, corregido acá] La regla V4 de validacion.py (dimensión de
+    caja imposible para el pallet, en ninguna orientación) excluye la fila
+    de la demanda ANTES de que llegue a reconciliacion_geometrica -por
+    diseño, ver test_dimension_imposible_se_excluye: esa demanda nunca debe
+    competir por espacio en el motor de armado. Pero antes se perdía del
+    todo salvo por una línea en `Log_Validacion` -es tan "no colocada" como
+    la que rechaza `armar_pallets_bloques`, así que se reconstruye acá
+    (CD/SKU/Descripcion/Categoria/Cajas_No_Colocadas) para sumarla a
+    `cajas_no_colocadas_df` en vez de perderla."""
+    excluidas = log_df[log_df["regla"] == "V4"][["cd", "sku"]].drop_duplicates()
+    columnas = ["CD", "SKU", "Descripcion", "Categoria", "Cajas_No_Colocadas"]
+    if excluidas.empty:
+        return pd.DataFrame(columns=columnas)
+
+    envios = envios.copy()
+    envios["SKU"] = envios["SKU"].astype(str).str.strip()
+    demanda = envios.groupby(["CD", "SKU"], as_index=False).agg(
+        {"Descripción": "first", "Cajas Teóricas": "sum"}
+    )
+
+    maestro = maestro.copy()
+    maestro["SKU"] = maestro["SKU"].astype(str).str.strip()
+    categorias = maestro[["SKU", "Categoría"]].drop_duplicates(subset="SKU")
+
+    demanda = demanda.merge(categorias, on="SKU", how="left")
+    demanda = demanda.merge(excluidas.rename(columns={"cd": "CD", "sku": "SKU"}), on=["CD", "SKU"], how="inner")
+    return demanda.rename(
+        columns={"Descripción": "Descripcion", "Categoría": "Categoria", "Cajas Teóricas": "Cajas_No_Colocadas"}
+    )[columnas]
+
+
 def ejecutar_core_sku_bloque(
     envios: pd.DataFrame, maestro: pd.DataFrame, uma: pd.DataFrame,
     pallets_objetivo_por_cd: dict[str, int] | None = None,
@@ -181,7 +213,10 @@ def ejecutar_core_sku_bloque(
 
     plan_picking_df = exportar.construir_plan_picking_df(todos_pallets, info_sku, nombres_cd)
     resumen_cd_df = exportar.construir_resumen_cd_df(todos_pallets)
-    cajas_no_colocadas_df = exportar.construir_cajas_no_colocadas_df(pallets_v5, info_sku)
+    demanda_excluida_geometria_df = _demanda_excluida_geometria(envios, maestro, log_df)
+    cajas_no_colocadas_df = exportar.construir_cajas_no_colocadas_df(
+        pallets_v5, info_sku, demanda_excluida_geometria_df
+    )
 
     return ResultadoPipeline(
         plan_picking_df=plan_picking_df,

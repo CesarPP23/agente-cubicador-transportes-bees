@@ -184,7 +184,11 @@ def construir_pallets_3d_data_df(pallets_v5: list[PalletV5]) -> pd.DataFrame:
     return pd.DataFrame(filas, columns=columnas)
 
 
-def construir_cajas_no_colocadas_df(pallets_v5: list[PalletV5], info_sku: dict[str, dict] | None = None) -> pd.DataFrame:
+def construir_cajas_no_colocadas_df(
+    pallets_v5: list[PalletV5],
+    info_sku: dict[str, dict] | None = None,
+    demanda_excluida_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """[pedido explícito del usuario: "quiero que las cajas de cada cd que
     no logre cubicar la ponga en una hoja de resultado... igual que el
     detalle por cd y sku y cantidad"] `armar_pallets_bloques` ya calcula
@@ -218,6 +222,15 @@ def construir_cajas_no_colocadas_df(pallets_v5: list[PalletV5], info_sku: dict[s
             )
     columnas = ["CD", "SKU", "Descripcion", "Categoria", "Cajas_No_Colocadas"]
     df = pd.DataFrame(filas, columns=columnas)
+    # [bug real, corregido acá] Demanda excluida ANTES de llegar al motor de
+    # armado (ej. V4 en validacion.py: caja que no entra en el pallet en
+    # ninguna orientación) es tan "no colocada" como la que rechaza
+    # `armar_pallets_bloques` -pero vivía solo en Log_Validacion, invisible
+    # en esta hoja. `demanda_excluida_df` (armado en pipeline_sku_bloque.py
+    # a partir de ese log) se suma acá con el mismo esquema CD/SKU/
+    # Descripcion/Categoria/Cajas_No_Colocadas.
+    if demanda_excluida_df is not None and not demanda_excluida_df.empty:
+        df = pd.concat([df, demanda_excluida_df[columnas]], ignore_index=True)
     if not df.empty:
         df = df.groupby(["CD", "SKU", "Descripcion", "Categoria"], as_index=False)["Cajas_No_Colocadas"].sum()
         df = df.sort_values(["CD", "SKU"]).reset_index(drop=True)

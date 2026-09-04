@@ -310,6 +310,13 @@ def reconciliar_sku(row) -> GeometriaSKU:
     )
 
 
+_AUDITORIA_COLUMNAS = [
+    "SKU", "Largo_UMA", "Ancho_UMA", "Alto_UMA", "Largo_Efectivo", "Ancho_Efectivo",
+    "Alto_Efectivo", "Capacidad_Geometrica_UMA", "Cajas_Cama_Maestro", "Fuente_Geometria",
+    "Delta_Largo", "Delta_Ancho", "Requiere_Revision_Geometria", "Geometria_Acostada",
+]
+
+
 def reconciliar(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Reconcilia geometría UNA VEZ POR SKU (es propiedad del SKU, no de la
     fila CD+SKU) y agrega las columnas de geometría efectiva a `df`. Devuelve
@@ -324,11 +331,17 @@ def reconciliar(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df["Alto_Efectivo"] = df["SKU"].map(lambda s: geometrias[s].alto_efectivo)
     df["Fuente_Geometria"] = df["SKU"].map(lambda s: geometrias[s].fuente_geometria)
     df["Geometria_Inferida"] = df["Fuente_Geometria"].isin(("INFERIDA_MAESTRO", "MAESTRO_IMPOSIBLE_DEGRADADO"))
-    df["Requiere_Revision_Geometria"] = df["SKU"].map(lambda s: geometrias[s].requiere_revision)
+    # [fix] `.astype(bool)`: con `df` vacío (ej. TODAS las filas de la
+    # demanda quedaron excluidas antes de llegar acá -ver V4 en
+    # validacion.py), `.map` sobre una Series vacía no infiere `bool`, y esa
+    # columna "booleana" en realidad object/string se rompe más abajo
+    # (`~df_no_bat["Requiere_Revision_Geometria"]` en pipeline_sku_bloque.py
+    # -pandas ya no permite invertir un dtype no-booleano).
+    df["Requiere_Revision_Geometria"] = df["SKU"].map(lambda s: geometrias[s].requiere_revision).astype(bool)
     # [V4c] True si conviene acostar la caja (una cara lateral como huella)
     # en vez de dejarla parada -confirmado con las fotos de los 42 pallets
     # reales para Comestibles/Cigarros (config.CATEGORIAS_ROTACION_LIBRE).
-    df["Geometria_Acostada"] = df["SKU"].map(lambda s: geometrias[s].acostada)
+    df["Geometria_Acostada"] = df["SKU"].map(lambda s: geometrias[s].acostada).astype(bool)
     # [V4 / P3] "Cajas por cama" ya RECONCILIADO: igual al del Maestro salvo
     # que fuera geométricamente imposible incluso con sobresaliente, en cuyo
     # caso viene degradado al techo real (ver reconciliar_sku). derivados.py
@@ -336,6 +349,16 @@ def reconciliar(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     # -si no, el guard de P3 queda solo en la auditoría y nunca protege el plan.
     df["Cajas_Cama_Maestro_Reconciliado"] = df["SKU"].map(lambda s: geometrias[s].cajas_cama_maestro)
 
+    # [fix] `columns=_AUDITORIA_COLUMNAS` explícito: si `geometrias` queda
+    # vacío (mismo caso de `df` vacío de arriba), `pd.DataFrame([])` sin
+    # columnas explícitas devuelve un DataFrame con CERO columnas (ni
+    # "Fuente_Geometria" ni ninguna otra) en vez de 0 filas con las columnas
+    # esperadas -pipeline_sku_bloque.py indexa
+    # `auditoria_geometrica_df["Fuente_Geometria"]` incondicionalmente
+    # (KeyError real, encontrado con un SKU cuya caja no entra en el pallet
+    # en ninguna orientación: V4 en validacion.py lo excluye de la demanda
+    # ANTES de reconciliar, y si era el único SKU del run, `df` llega vacío
+    # acá).
     auditoria = pd.DataFrame(
         [
             {
@@ -355,6 +378,7 @@ def reconciliar(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "Geometria_Acostada": g.acostada,
             }
             for g in geometrias.values()
-        ]
+        ],
+        columns=_AUDITORIA_COLUMNAS,
     )
     return df, auditoria

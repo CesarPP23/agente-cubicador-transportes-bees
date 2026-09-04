@@ -58,6 +58,28 @@ def test_hoja_cajas_no_colocadas_aparece_en_el_excel_solo_si_hay_faltantes(datas
     assert "Cajas_No_Colocadas" not in libro_ok.sheetnames
 
 
+def test_caja_mas_grande_que_el_pallet_no_crashea_y_reporta_no_colocada(dataset_factory):
+    """[bug real, corregido acá] Un SKU cuya caja no entra en el pallet en
+    ninguna orientación es excluido por la regla V4 de validacion.py ANTES
+    de llegar a reconciliacion_geometrica.reconciliar() -si era el único SKU
+    del run (nada más necesitaba revisión geométrica), `reconciliar()`
+    recibía un DataFrame vacío y `pd.DataFrame([])` sin columnas explícitas
+    devolvía una auditoría CERO columnas -pipeline_sku_bloque.py indexaba
+    `auditoria_geometrica_df["Fuente_Geometria"]` incondicionalmente,
+    KeyError. La demanda de esa caja, además, se perdía del todo salvo por
+    una línea en Log_Validacion -ahora tiene que aparecer en
+    `cajas_no_colocadas_df` igual que cualquier otra demanda no colocada."""
+    envios, maestro, uma = dataset_factory(
+        uma_overrides=[{"sku": 1, "largo": 200, "ancho": 200, "alto": 30}]
+    )
+    resultado = ejecutar_pipeline(envios, maestro, uma)
+    df = resultado.cajas_no_colocadas_df
+    assert df is not None and not df.empty
+    fila = df[df["SKU"] == "1"].iloc[0]
+    assert fila["CD"] == "BK31"
+    assert fila["Cajas_No_Colocadas"] == 10
+
+
 def test_construir_cajas_no_colocadas_df_agrupa_por_cd_sku(dataset_factory):
     """`construir_cajas_no_colocadas_df` en aislado -reusa `info_sku` para
     traer descripción/categoría, y agrupa si el mismo SKU quedara marcado
