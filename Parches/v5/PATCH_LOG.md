@@ -3531,3 +3531,60 @@ que el usuario apriete "Procesar", en vez de que se entere recién cuando
 ve que no termina. No se implementó ningún límite de tiempo global ni
 paralelización de CDs/semillas en esta sesión -sigue siendo la perilla
 obvia si el uso real lo pide.
+
+## Hoja "Cajas_No_Colocadas" -reporte de demanda que no entró en ningún pallet
+[misma sesión, pedido explícito del usuario: "quiero que las cajas de
+cada cd que no logre cubicar la ponga en una hoja de resultado... igual
+que el detalle por cd y sku y cantidad"]
+
+### Bug real encontrado y corregido: `sin_colocar` se perdía en silencio
+`armar_pallets_bloques` ya calculaba `sin_colocar` (SKU -> cantidad,
+cuando un SKU no encuentra lugar ni en un pallet vacío, o cuando los N
+pallets fijos de `pallets_objetivo` genuinamente se llenan) y lo guardaba
+en `pallet.metadata["sin_colocar"]` de un `PalletV5` -pero
+`_palletv5_a_pallet` (`pipeline_sku_bloque.py`) solo copiaba `torres`/
+`cajas_bat` al `Pallet` final, nunca `metadata`. Esa demanda desaparecía
+entre el motor de armado y el Excel/la app -sin ningún aviso, ni en el
+Plan de Picking ni en ningún otro lado.
+
+### Fix
+- `exportar.construir_cajas_no_colocadas_df(pallets_v5, info_sku)`
+  (nuevo): recorre `pallet.metadata["sin_colocar"]` de todos los
+  `PalletV5`, arma filas `CD/SKU/Descripcion/Categoria/Cajas_No_
+  Colocadas` (con descripción/categoría desde `info_sku`, mismo patrón
+  que el resto de `exportar.py`), agrupa por si el mismo SKU quedara
+  marcado en más de un pallet del mismo CD.
+- `models.ResultadoPipeline.cajas_no_colocadas_df` (nuevo campo opcional,
+  mismo patrón que `auditoria_geometrica_df`/`benchmark_df`) ->
+  `pipeline_sku_bloque.ejecutar_core_sku_bloque` lo calcula y lo agrega
+  al resultado.
+- `exportar_workbook`: nueva hoja **"Cajas_No_Colocadas"** en el Excel
+  exportado -solo se agrega si hay algo que reportar (un archivo sin
+  faltantes no muestra una hoja vacía).
+- `app.py`: nuevo tab **"⚠ Cajas No Colocadas"** (con `st.success` si no
+  hay faltantes, `st.warning` + tabla si los hay) y una 6ª métrica
+  "Cajas no colocadas" arriba de los tabs.
+
+### Verificación
+- Suite completa: **168/168 pasan** (164 previos + 4 nuevos en
+  `tests/test_cajas_no_colocadas.py`: DF vacío sin faltantes, `Pallets_
+  Objetivo` insuficiente reporta el faltante real por CD/SKU, la hoja
+  del Excel aparece solo cuando hace falta, y agrupación correcta en
+  `construir_cajas_no_colocadas_df` aislado).
+- `Cubicaje18.07.2026.xlsx`: sigue en 54 pallets, sin cambios.
+
+### Bug preexistente encontrado en el camino (NO corregido, fuera de
+alcance de este pedido) -derivado a una tarea aparte
+Al armar un test con una caja más grande que el propio pallet en ambas
+orientaciones (120x100), la pipeline completa explota con `KeyError:
+'Fuente_Geometria'` en `pipeline_sku_bloque.py:172` -pasa solo cuando
+NINGÚN SKU del batch necesita reconciliación geométrica excepto ese
+(dataset chico/sintético, no se había visto con datasets reales más
+variados). Hay un warning de pandas justo antes ("'and' operations
+between boolean dtype and str son deprecated") que sugiere que
+`Requiere_Revision_Geometria` termina con dtype mixto en ese caso
+puntual, y eso arrastra a `auditoria_geometrica_df` a perder columnas.
+No se investigó la causa raíz en `reconciliacion_geometrica.py` -se
+delegó como tarea aparte (no bloquea el pedido de esta sesión: los tests
+de "no colocadas" usan el camino real de `Pallets_Objetivo` insuficiente,
+que no toca este bug).

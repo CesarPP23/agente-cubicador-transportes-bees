@@ -331,3 +331,4 @@ class ResultadoPipeline:
     auditoria_geometrica_df: pd.DataFrame | None = None
     benchmark_df: pd.DataFrame | None = None
     pallets_v5: list[PalletV5] | None = None
+    cajas_no_colocadas_df: pd.DataFrame | None = None

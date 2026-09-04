@@ -75,8 +75,14 @@ if resultado is None:
 
 pallets = resultado.pallets
 df = resultado.plan_picking_df
+cajas_no_colocadas_df = resultado.cajas_no_colocadas_df
+cajas_no_colocadas_total = (
+    int(cajas_no_colocadas_df["Cajas_No_Colocadas"].sum())
+    if cajas_no_colocadas_df is not None and not cajas_no_colocadas_df.empty
+    else 0
+)
 
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric("Pallets totales", len(pallets))
 col2.metric("Homogéneos (base 1 SKU)", sum(1 for p in pallets if p.tipo.startswith("Homogéneo")))
 col3.metric("Mixtos", sum(1 for p in pallets if p.tipo == "Mixto"))
@@ -85,9 +91,10 @@ col5.metric(
     "Cajas extra por consolidación",
     int(df["Cajas_Extra_Consolidacion"].sum()) if not df.empty else 0,
 )
+col6.metric("Cajas no colocadas", cajas_no_colocadas_total)
 
-tab_plan, tab_log, tab_resumen, tab_inspector = st.tabs(
-    ["Plan de Picking", "Log de Validación", "Resumen por CD", "Inspector de Pallets"]
+tab_plan, tab_log, tab_resumen, tab_no_colocadas, tab_inspector = st.tabs(
+    ["Plan de Picking", "Log de Validación", "Resumen por CD", "⚠ Cajas No Colocadas", "Inspector de Pallets"]
 )
 
 with tab_plan:
@@ -98,6 +105,17 @@ with tab_log:
 
 with tab_resumen:
     st.dataframe(resultado.resumen_cd_df, use_container_width=True)
+
+with tab_no_colocadas:
+    if cajas_no_colocadas_df is None or cajas_no_colocadas_df.empty:
+        st.success("Toda la demanda se colocó -no quedaron cajas sin cubicar.")
+    else:
+        st.warning(
+            f"{cajas_no_colocadas_total} cajas no entraron en ningún pallet -detalle por CD y SKU abajo. "
+            "Esto pasa cuando un CD tiene `Pallets_Objetivo` fijo y esa cantidad de pallets genuinamente "
+            "no alcanza para toda la demanda."
+        )
+        st.dataframe(cajas_no_colocadas_df, use_container_width=True)
 
 with tab_inspector:
     if not pallets:

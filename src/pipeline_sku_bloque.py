@@ -181,6 +181,7 @@ def ejecutar_core_sku_bloque(
 
     plan_picking_df = exportar.construir_plan_picking_df(todos_pallets, info_sku, nombres_cd)
     resumen_cd_df = exportar.construir_resumen_cd_df(todos_pallets)
+    cajas_no_colocadas_df = exportar.construir_cajas_no_colocadas_df(pallets_v5, info_sku)
 
     return ResultadoPipeline(
         plan_picking_df=plan_picking_df,
@@ -191,4 +192,5 @@ def ejecutar_core_sku_bloque(
         auditoria_geometrica_df=auditoria_geometrica_df,
         benchmark_df=bench_df,
         pallets_v5=pallets_v5,
+        cajas_no_colocadas_df=cajas_no_colocadas_df,
     )

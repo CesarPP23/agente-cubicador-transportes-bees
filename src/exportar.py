@@ -184,6 +184,46 @@ def construir_pallets_3d_data_df(pallets_v5: list[PalletV5]) -> pd.DataFrame:
     return pd.DataFrame(filas, columns=columnas)
 
 
+def construir_cajas_no_colocadas_df(pallets_v5: list[PalletV5], info_sku: dict[str, dict] | None = None) -> pd.DataFrame:
+    """[pedido explícito del usuario: "quiero que las cajas de cada cd que
+    no logre cubicar la ponga en una hoja de resultado... igual que el
+    detalle por cd y sku y cantidad"] `armar_pallets_bloques` ya calcula
+    `sin_colocar` (SKU -> cantidad) cuando un CD no logra ubicar toda su
+    demanda -sea porque ni entra en un pallet vacío, o porque los N
+    pallets fijos de `pallets_objetivo` genuinamente se llenaron- y lo
+    guarda en `pallet.metadata["sin_colocar"]` del último `PalletV5` de
+    ese CD. [bug real, corregido acá] Ese metadata nunca llegaba a ningún
+    reporte: `_palletv5_a_pallet` (pipeline_sku_bloque.py) solo copia
+    `torres`/`cajas_bat` a un `Pallet`, no `metadata` -así que esta
+    demanda se perdía en silencio entre el motor de armado y el Excel
+    final. Esta función arma el detalle CD/SKU/cantidad que faltaba."""
+    info_sku = info_sku or {}
+    filas = []
+    for pallet in pallets_v5:
+        sin_colocar = pallet.metadata.get("sin_colocar")
+        if not sin_colocar:
+            continue
+        for sku, cantidad in sin_colocar.items():
+            if cantidad <= 0:
+                continue
+            meta = info_sku.get(sku, {})
+            filas.append(
+                {
+                    "CD": pallet.cd,
+                    "SKU": sku,
+                    "Descripcion": meta.get("descripcion", ""),
+                    "Categoria": meta.get("categoria", ""),
+                    "Cajas_No_Colocadas": cantidad,
+                }
+            )
+    columnas = ["CD", "SKU", "Descripcion", "Categoria", "Cajas_No_Colocadas"]
+    df = pd.DataFrame(filas, columns=columnas)
+    if not df.empty:
+        df = df.groupby(["CD", "SKU", "Descripcion", "Categoria"], as_index=False)["Cajas_No_Colocadas"].sum()
+        df = df.sort_values(["CD", "SKU"]).reset_index(drop=True)
+    return df
+
+
 def construir_estabilidad_df(pallets_v5: list[PalletV5]) -> pd.DataFrame:
     """[V5-P13] Exporta lo que P11 calculaba pero todavía no exportaba
     (informativo, nunca bloquea -ver src/estabilidad.py)."""
@@ -223,6 +263,12 @@ def exportar_workbook(resultado: ResultadoPipeline, ruta_o_buffer=None):
             resultado.auditoria_geometrica_df.to_excel(writer, sheet_name="Auditoria_Geometrica", index=False)
         if resultado.benchmark_df is not None:
             resultado.benchmark_df.to_excel(writer, sheet_name="Benchmark", index=False)
+        # [pedido explícito del usuario: hoja de detalle de cajas que no se
+        # pudieron cubicar, por CD/SKU/cantidad] Solo se agrega si hay algo
+        # que reportar -un archivo sin faltantes no debería mostrar una
+        # hoja vacía y generar confusión.
+        if resultado.cajas_no_colocadas_df is not None and not resultado.cajas_no_colocadas_df.empty:
+            resultado.cajas_no_colocadas_df.to_excel(writer, sheet_name="Cajas_No_Colocadas", index=False)
         # [V5-P13] Hojas propias del core columnar -solo existen cuando el
         # pipeline corrió con PACKER_VERSION="V5" (`pallets_v5` viene None
         # en V4, ver models.ResultadoPipeline).
