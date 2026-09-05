@@ -15,10 +15,14 @@ que usa el pipeline.
 
 Reutiliza VAL/DEM/GEO/DER/SPLIT/PESO/EXP tal cual el resto de los motores
 -esa infraestructura no depende de la estrategia de armado."""
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import pandas as pd
 
 import config
-from models import Pallet, PalletLinea, ResultadoPipeline
+from models import CajaBAT, Pallet, PalletLinea, PalletV5, ResultadoPipeline
 from src import (
     bat,
     benchmark,
@@ -116,7 +120,7 @@ def _demanda_excluida_geometria(envios: pd.DataFrame, maestro: pd.DataFrame, log
     (CD/SKU/Descripcion/Categoria/Cajas_No_Colocadas) para sumarla a
     `cajas_no_colocadas_df` en vez de perderla."""
     excluidas = log_df[log_df["regla"] == "V4"][["cd", "sku"]].drop_duplicates()
-    columnas = ["CD", "SKU", "Descripcion", "Categoria", "Cajas_No_Colocadas"]
+    columnas = ["CD", "SKU", "Descripcion", "Categoria", "Cajas_No_Colocadas", "Unidades_No_Colocadas"]
     if excluidas.empty:
         return pd.DataFrame(columns=columnas)
 
@@ -128,13 +132,46 @@ def _demanda_excluida_geometria(envios: pd.DataFrame, maestro: pd.DataFrame, log
 
     maestro = maestro.copy()
     maestro["SKU"] = maestro["SKU"].astype(str).str.strip()
-    categorias = maestro[["SKU", "Categoría"]].drop_duplicates(subset="SKU")
+    categorias = maestro[["SKU", "Categoría", "Unidades por caja"]].drop_duplicates(subset="SKU")
 
     demanda = demanda.merge(categorias, on="SKU", how="left")
     demanda = demanda.merge(excluidas.rename(columns={"cd": "CD", "sku": "SKU"}), on=["CD", "SKU"], how="inner")
+    demanda["Unidades_No_Colocadas"] = demanda["Cajas Teóricas"] * demanda["Unidades por caja"]
     return demanda.rename(
         columns={"Descripción": "Descripcion", "Categoría": "Categoria", "Cajas Teóricas": "Cajas_No_Colocadas"}
     )[columnas]
+
+
+# [paralelismo por CD -pedido explícito del usuario: "como podemos hacer
+# para que no demore tanto", después de confirmar que paralelizar el LNS
+# por semilla ya daba ~2.7x sin perder calidad] Cada CD es independiente
+# -ni comparte demanda, ni pallets, ni el contador de IDs (que ya viene
+# prefijado por CD, `PV5-{cd}-NNN` -confirmado con grep que ningún otro
+# lugar del código asume que el contador es global entre CDs). Con esto,
+# en vez de procesar los N CDs uno detrás del otro, se procesan hasta
+# `PIPELINE_MAX_PROCESOS_CD` a la vez.
+PIPELINE_MAX_PROCESOS_CD = os.cpu_count() or 1
+
+
+def _procesar_cd(
+    cd: str, grupo: pd.DataFrame, cajas_bat: list[CajaBAT], pallets_objetivo: int | None, paralelo_lns: bool,
+) -> list[PalletV5]:
+    """[worker de nivel de módulo -necesario para que `ProcessPoolExecutor`
+    pueda picklearlo] Todo el trabajo de UN CD: arma los pallets (con un
+    contador LOCAL, no el global de siempre -ver comentario arriba de por
+    qué es seguro), asigna las cajas BAT reales, y calcula estabilidad.
+    `paralelo_lns=False` cuando se llama desde acá -si cada uno de los N
+    CDs en paralelo ADEMÁS abriera su propio pool de 5 procesos para el
+    LNS, se terminaría con N×5 procesos peleando por los mismos núcleos
+    reales (satura en vez de acelerar)."""
+    pallets_cd = armar_pallets_bloques(
+        grupo, cd, contador=[0], pallets_objetivo=pallets_objetivo, paralelo_lns=paralelo_lns,
+    )
+    bat.renombrar_pallets_bat_puros(pallets_cd, cd)
+    bat.asignar_cajas_bat_a_torres(pallets_cd, cajas_bat)
+    for p in pallets_cd:
+        p.metadata["estabilidad"] = estabilidad.calcular_estabilidad(p)
+    return pallets_cd
 
 
 def ejecutar_core_sku_bloque(
@@ -167,24 +204,37 @@ def ejecutar_core_sku_bloque(
     df_armado = pd.concat([df_clasificado, df_bat_pseudo], ignore_index=True, sort=False)
 
     pallets_v5: list = []
-    contador = [0]
-    cds_procesados: set[str] = set()
     pallets_objetivo_por_cd = pallets_objetivo_por_cd or {}
-    for cd, grupo in df_armado.groupby("CD"):
-        cds_procesados.add(cd)
-        pallets_cd = armar_pallets_bloques(
-            grupo, cd, contador=contador, pallets_objetivo=pallets_objetivo_por_cd.get(cd)
-        )
-        bat.renombrar_pallets_bat_puros(pallets_cd, cd)
-        bat.asignar_cajas_bat_a_torres(pallets_cd, cajas_bat_por_cd.get(cd, []))
-        for p in pallets_cd:
-            p.metadata["estabilidad"] = estabilidad.calcular_estabilidad(p)
-        pallets_v5.extend(pallets_cd)
+    grupos_cd = list(df_armado.groupby("CD"))
+    cds_procesados: set[str] = {cd for cd, _ in grupos_cd}
+
+    if len(grupos_cd) > 1:
+        # [paralelo por CD, ver _procesar_cd/PIPELINE_MAX_PROCESOS_CD
+        # arriba] paralelo_lns=False en cada worker -ya estamos
+        # paralelizando en este nivel, no anidar otro pool de procesos.
+        n_procesos = min(PIPELINE_MAX_PROCESOS_CD, len(grupos_cd))
+        contexto = multiprocessing.get_context("fork") if hasattr(os, "fork") else None
+        with ProcessPoolExecutor(max_workers=n_procesos, mp_context=contexto) as executor:
+            futuros = [
+                executor.submit(
+                    _procesar_cd, cd, grupo, cajas_bat_por_cd.get(cd, []), pallets_objetivo_por_cd.get(cd), False,
+                )
+                for cd, grupo in grupos_cd
+            ]
+            for futuro in as_completed(futuros):
+                pallets_v5.extend(futuro.result())
+    else:
+        # [1 solo CD -sin paralelismo por CD, pero SÍ el del LNS interno
+        # (paralelo_lns=True) si ese único CD lo necesita.]
+        for cd, grupo in grupos_cd:
+            pallets_v5.extend(
+                _procesar_cd(cd, grupo, cajas_bat_por_cd.get(cd, []), pallets_objetivo_por_cd.get(cd), True)
+            )
 
     for cd, cajas in cajas_bat_por_cd.items():
         if cd not in cds_procesados and cajas:
             pallets_cd = armar_pallets_bloques(
-                pd.DataFrame(columns=df_armado.columns), cd, contador=contador
+                pd.DataFrame(columns=df_armado.columns), cd, contador=[0]
             )
             bat.renombrar_pallets_bat_puros(pallets_cd, cd)
             bat.asignar_cajas_bat_a_torres(pallets_cd, cajas)

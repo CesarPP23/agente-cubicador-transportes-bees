@@ -148,7 +148,11 @@ que PH_FRACCION perseguía sin sacrificar la garantía exacta, se le agregan
    real de los demás pallets del CD antes de aceptarlo como pallet
    aparte.
 """
+import multiprocessing
+import os
 import random
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
 
@@ -694,6 +698,24 @@ COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION = 3_000
 # distintas desde el mismo punto de partida y se conserva el mejor.
 COMBINACION_PALLETS_LNS_REINICIOS = 5
 
+# [tope de reloj real -pedido explícito del usuario tras el corrido con
+# `Pallets_Objetivo` real que quedó colgado >21 horas] `max_nodos` acota
+# la CANTIDAD de nodos, no lo que tarda cada uno -con `pallets_objetivo`
+# apretado contra la demanda real (varios CDs, N pallets fijos muy por
+# debajo del óptimo abierto) el estado queda mucho más fragmentado que en
+# Pallet 1 (único caso medido hasta ahora) y `_candidatos_lote`/el
+# snapshot por nodo se vuelven caros -sin este tope, ese costo por nodo
+# multiplicado por hasta 5 reinicios x 200 iteraciones x 3,000 nodos de
+# reconstrucción puede tardar horas. Estos topes son DEADLINES de reloj
+# real (`time.time()`, no `time.monotonic()` -tiene que ser comparable
+# entre el proceso padre y los workers de `ProcessPoolExecutor`, que en
+# `fork` heredan el mismo reloj de pared), chequeados en el punto más
+# caliente de cada bucle -nunca puede empeorar el resultado: el DFS y el
+# LNS siempre devuelven el MEJOR incumbente encontrado hasta el corte, no
+# fallan ni tiran excepción.
+COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS = 20.0
+COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS = 40.0
+
 
 def _capacidad_restante_en_capa(pallet: PalletV5, sku: str, z: float, tope_capa: int | None) -> float:
     """Cuántas cajas MÁS de `sku` caben todavía en la capa exacta `z` de
@@ -842,6 +864,7 @@ def _resolver_pallets_backtracking(
     presupuesto: float,
     n_pallets: int,
     max_nodos: int = COMBINACION_PALLETS_MAX_NODOS,
+    limite_tiempo: float | None = None,
 ) -> int:
     """[backtracking real, DFS con poda] A diferencia del greedy (1 caja,
     sin vuelta atrás), acá cada nodo coloca un LOTE completo -toda una
@@ -850,13 +873,19 @@ def _resolver_pallets_backtracking(
     pallets`). La primera rama que explora cada nodo es siempre la de
     mayor prioridad (misma clave que usa el greedy) -así la primera hoja
     completa que encuentra ya iguala el resultado de hoy; de ahí en más
-    solo puede empatar o mejorar. Acotado por
-    `COMBINACION_PALLETS_MAX_NODOS` (conteo de nodos, no de reloj -
-    reproducible entre corridas). Modifica `construcciones`/`colocados_
+    solo puede empatar o mejorar. Acotado por `COMBINACION_PALLETS_MAX_
+    NODOS` (conteo de nodos, reproducible entre corridas) Y, si se pasa
+    `limite_tiempo` (deadline absoluto de `time.time()`), también por
+    reloj real -ver comentario junto a `COMBINACION_PALLETS_TIEMPO_MAX_
+    DFS_SEGUNDOS` sobre por qué el conteo de nodos solo no alcanza cuando
+    el estado está muy fragmentado. Modifica `construcciones`/`colocados_
     por_pallet`/`pendientes` IN-PLACE, dejándolos en el MEJOR estado
     encontrado al terminar -no devuelve una copia."""
     demanda_inicial = sum(pendientes.values())
     estado = {"mejor_total": -1, "mejor_snapshot": None, "nodos": 0}
+
+    def _tiempo_agotado() -> bool:
+        return limite_tiempo is not None and time.time() > limite_tiempo
 
     def _volumen_libre_total() -> float:
         return sum(c.w * c.h * c.d for pc in construcciones for c in pc.libres)
@@ -880,7 +909,7 @@ def _resolver_pallets_backtracking(
         if colocado_actual > estado["mejor_total"]:
             estado["mejor_total"] = colocado_actual
             estado["mejor_snapshot"] = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
-        if estado["nodos"] > max_nodos:
+        if estado["nodos"] > max_nodos or _tiempo_agotado():
             return
         if colocado_actual >= demanda_inicial:
             return  # se colocó TODO -óptimo absoluto, no hay nada más que buscar
@@ -899,7 +928,7 @@ def _resolver_pallets_backtracking(
             colocados_por_pallet[pidx][sku] = colocados_por_pallet[pidx].get(sku, 0) + cantidad
             _dfs(colocado_actual + cantidad)
             _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap)
-            if estado["nodos"] > max_nodos:
+            if estado["nodos"] > max_nodos or _tiempo_agotado():
                 break
 
     _dfs(demanda_inicial - sum(pendientes.values()))
@@ -978,6 +1007,7 @@ def _lns_mejorar_pallets(
     presupuesto: float,
     n_pallets: int,
     semilla: str,
+    limite_tiempo: float | None = None,
 ) -> int:
     """[LNS -ruina y reconstrucción, ver comentario junto a las
     constantes `COMBINACION_PALLETS_LNS_*`] Complementa el DFS de
@@ -1012,6 +1042,8 @@ def _lns_mejorar_pallets(
     for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES):
         if sin_mejora >= COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX:
             break
+        if limite_tiempo is not None and time.time() > limite_tiempo:
+            break
         skus_colocados = sorted({sku for d in colocados_por_pallet for sku, cant in d.items() if cant > 0})
         if not skus_colocados:
             break
@@ -1021,11 +1053,13 @@ def _lns_mejorar_pallets(
         _romper_skus_con_cascada(construcciones, colocados_por_pallet, pendientes, elegidos, n_pallets)
 
         # [reconstrucción] Mismo backtracking, presupuesto de nodos más
-        # chico -acá se corre muchas veces, no una sola.
+        # chico -acá se corre muchas veces, no una sola- y el mismo
+        # deadline de reloj real de esta corrida de LNS.
         _resolver_pallets_backtracking(
             construcciones, colocados_por_pallet, pendientes, por_sku,
             capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
             max_nodos=COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION,
+            limite_tiempo=limite_tiempo,
         )
 
         total_actual = _total_colocado()
@@ -1041,6 +1075,40 @@ def _lns_mejorar_pallets(
     return mejor_total
 
 
+def _lns_una_semilla_worker(
+    construcciones: list[_PalletEnConstruccion],
+    colocados_por_pallet: list[dict[str, int]],
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
+    n_pallets: int,
+    semilla: str,
+    limite_tiempo: float | None = None,
+) -> tuple[int, list[_PalletEnConstruccion], list[dict[str, int]], dict[str, int]]:
+    """[paralelización -pedido explícito del usuario: "como podemos hacer
+    para que no demore tanto"] Función de nivel de módulo (necesaria para
+    que `ProcessPoolExecutor` pueda "picklearla" y mandarla a otro
+    proceso) que corre UNA sola semilla de `_lns_mejorar_pallets` hasta el
+    final. Los argumentos ya le llegan a este proceso como una copia
+    independiente (el propio mecanismo de serialización del `Executor` al
+    mandarlos -ningún estado se comparte entre procesos, así que no hace
+    falta copiarlos a mano acá), así que puede mutarlos libremente sin
+    afectar al proceso llamador. Devuelve el total colocado y el estado
+    final -el llamador decide con cuál de las N semillas se queda.
+    `limite_tiempo` es un deadline absoluto de `time.time()` -comparable
+    entre este proceso hijo y el padre porque `fork` hereda el mismo
+    reloj de pared."""
+    total = _lns_mejorar_pallets(
+        construcciones, colocados_por_pallet, pendientes, por_sku,
+        capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, semilla,
+        limite_tiempo=limite_tiempo,
+    )
+    return total, construcciones, colocados_por_pallet, pendientes
+
+
 def _empacar_n_pallets(
     pendientes: dict[str, int],
     por_sku: dict[str, list[TorreCandidate]],
@@ -1050,6 +1118,7 @@ def _empacar_n_pallets(
     cd: str,
     contador: list[int],
     n_pallets: int,
+    paralelo_lns: bool = True,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1089,34 +1158,77 @@ def _empacar_n_pallets(
     _resolver_pallets_backtracking(
         construcciones_bt, colocados_bt, pendientes_bt, por_sku,
         capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+        limite_tiempo=time.time() + COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS,
     )
     total_bt = sum(sum(d.values()) for d in colocados_bt)
 
     if total_bt < demanda_total:
-        # [multi-reinicio -medido con datos reales, Pallet 1] Una sola
-        # corrida de LNS depende de la suerte de la semilla: probado con 17
-        # semillas distintas, el resultado varía entre 78 y 83 -la mayoría
-        # se queda en 78 (el mismo óptimo local del DFS solo), pero varias
-        # sí llegan a 83. En vez de confiar en una semilla fija, se prueban
-        # `COMBINACION_PALLETS_LNS_REINICIOS` semillas (derivadas de
-        # `cd`+`n_pallets`+número de intento, reproducibles) desde el MISMO
-        # punto de partida (el incumbente del DFS) y se conserva el mejor.
+        # [multi-reinicio -medido con datos reales, Pallet 1; pedido
+        # explícito del usuario: "como podemos hacer para que no demore
+        # tanto"] Una sola corrida de LNS depende de la suerte de la
+        # semilla: probado con 17 semillas distintas, el resultado varía
+        # entre 78 y 83 -la mayoría se queda en 78 (el mismo óptimo local
+        # del DFS solo), pero varias sí llegan a 83. Las
+        # `COMBINACION_PALLETS_LNS_REINICIOS` semillas son 100%
+        # independientes entre sí (cada una arranca del mismo incumbente
+        # del DFS, sin compartir estado) -con `paralelo_lns=True` (default)
+        # corren en procesos separados a la vez (`ProcessPoolExecutor`),
+        # bajando el tiempo de reloj hasta ~Nx en una máquina con N
+        # núcleos libres, sin sacrificar nada de calidad (exactamente el
+        # mismo trabajo, solo en paralelo en vez de en serie). Con
+        # `paralelo_lns=False` (cuando el LLAMADOR ya paraleliza por CD,
+        # ver `pipeline_sku_bloque.py`) corren secuenciales, una tras otra
+        # -evita anidar 2 pools de procesos y saturar los núcleos reales.
         snapshot_dfs = _snapshot_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt)
         mejor_total_lns = total_bt
         mejor_snapshot_lns = snapshot_dfs
-        for intento in range(COMBINACION_PALLETS_LNS_REINICIOS):
-            _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, snapshot_dfs)
-            total_intento = _lns_mejorar_pallets(
-                construcciones_bt, colocados_bt, pendientes_bt, por_sku,
-                capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
-                semilla=f"{cd}-{n_pallets}-{intento}",
-            )
-            if total_intento > mejor_total_lns:
-                mejor_total_lns = total_intento
-                mejor_snapshot_lns = _snapshot_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt)
-            if mejor_total_lns >= demanda_total:
-                break  # ya se colocó TODO -no hace falta seguir probando semillas
-        _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, mejor_snapshot_lns)
+        # [tope de reloj real, ver comentario junto a COMBINACION_PALLETS_
+        # TIEMPO_MAX_LNS_SEGUNDOS] Un solo deadline absoluto para TODA la
+        # fase de LNS -en paralelo, lo respeta cada semilla por igual (no
+        # se suma, corren a la vez); en secuencial, se reparte entre los
+        # reinicios que alcancen a arrancar antes de que se cumpla.
+        deadline_lns = time.time() + COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS
+
+        if paralelo_lns:
+            n_procesos = min(COMBINACION_PALLETS_LNS_REINICIOS, os.cpu_count() or 1)
+            contexto = multiprocessing.get_context("fork") if hasattr(os, "fork") else None
+            with ProcessPoolExecutor(max_workers=n_procesos, mp_context=contexto) as executor:
+                futuros = [
+                    executor.submit(
+                        _lns_una_semilla_worker, construcciones_bt, colocados_bt, pendientes_bt, por_sku,
+                        capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+                        f"{cd}-{n_pallets}-{intento}", deadline_lns,
+                    )
+                    for intento in range(COMBINACION_PALLETS_LNS_REINICIOS)
+                ]
+                for futuro in as_completed(futuros):
+                    total_intento, construcciones_i, colocados_i, pendientes_i = futuro.result()
+                    if total_intento > mejor_total_lns:
+                        mejor_total_lns = total_intento
+                        mejor_snapshot_lns = (
+                            [(list(pc.pallet.torres), pc.libres) for pc in construcciones_i],
+                            [dict(d) for d in colocados_i],
+                            dict(pendientes_i),
+                        )
+            _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, mejor_snapshot_lns)
+        else:
+            for intento in range(COMBINACION_PALLETS_LNS_REINICIOS):
+                if time.time() > deadline_lns:
+                    break
+                _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, snapshot_dfs)
+                total_intento = _lns_mejorar_pallets(
+                    construcciones_bt, colocados_bt, pendientes_bt, por_sku,
+                    capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+                    semilla=f"{cd}-{n_pallets}-{intento}", limite_tiempo=deadline_lns,
+                )
+                if total_intento > mejor_total_lns:
+                    mejor_total_lns = total_intento
+                    mejor_snapshot_lns = _snapshot_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt)
+                if mejor_total_lns >= demanda_total:
+                    break  # ya se colocó TODO -no hace falta seguir probando semillas
+            _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, mejor_snapshot_lns)
+
+        pallets_bt = [pc.pallet for pc in construcciones_bt]
         total_bt = mejor_total_lns
 
     if total_bt > total_greedy:
@@ -1211,6 +1323,7 @@ MAX_INTENTOS_CONSOLIDACION = 3
 
 def armar_pallets_bloques(
     df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None, pallets_objetivo: int | None = None,
+    paralelo_lns: bool = True,
 ) -> list[PalletV5]:
     """[V-SKU_BLOQUE, camas] Punto de entrada. `df_cd` debe traer demanda
     pendiente (`Cajas_Remanente` o `Cajas_Teoricas_Redondeadas`), geometría
@@ -1227,7 +1340,16 @@ def armar_pallets_bloques(
     armado usa `_empacar_n_pallets` (reparte TODA la demanda del CD entre
     exactamente esa cantidad de pallets, sin abrir ni cerrar ninguno de
     más) en vez de `_empacar` (que abre pallets hasta agotar la demanda,
-    el comportamiento de siempre si no se pasa este parámetro)."""
+    el comportamiento de siempre si no se pasa este parámetro).
+
+    `paralelo_lns` (default `True`) -pedido explícito del usuario: "como
+    podemos hacer para que no demore tanto". Cuando el DFS no completa
+    toda la demanda, el LNS prueba varias semillas en procesos separados
+    (`ProcessPoolExecutor`) para bajar el tiempo de reloj. Poner esto en
+    `False` cuando el LLAMADOR ya está paralelizando por CD (ver
+    `pipeline_sku_bloque.py`) -evita anidar dos pools de procesos, que
+    satura los núcleos disponibles en vez de acelerar (N CDs en paralelo x
+    5 reinicios cada uno son muchos más procesos que núcleos reales)."""
     contador = contador if contador is not None else [0]
 
     # [sección 6, orientación flexible] Comestibles/Aseo/Cigarros pueden
@@ -1329,7 +1451,7 @@ def armar_pallets_bloques(
         # alguno vacío y reducir el conteo por debajo de lo pedido.
         pallets, sin_colocar_barrido = _empacar_n_pallets(
             pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
-            cd, contador, pallets_objetivo,
+            cd, contador, pallets_objetivo, paralelo_lns=paralelo_lns,
         )
         for sku, cant in sin_colocar_barrido.items():
             sin_colocar[sku] = sin_colocar.get(sku, 0) + cant

@@ -3588,3 +3588,115 @@ No se investigó la causa raíz en `reconciliacion_geometrica.py` -se
 delegó como tarea aparte (no bloquea el pedido de esta sesión: los tests
 de "no colocadas" usan el camino real de `Pallets_Objetivo` insuficiente,
 que no toca este bug).
+
+## Paralelización real: LNS por semilla + CD por CD
+[misma sesión, pedido explícito del usuario tras ver que un cubicaje real
+de 12 CDs/42 pallets fijos iba a tardar horas: "como podemos hacer para
+que no demore tanto"]
+
+### Nivel 1: las 5 semillas del LNS, en procesos separados
+`_lns_una_semilla_worker` (nuevo, `packing_bloques.py`) corre UNA semilla
+de `_lns_mejorar_pallets` hasta el final -función de nivel de módulo,
+necesaria para que `ProcessPoolExecutor` pueda "picklearla". `_empacar_n_
+pallets` ahora manda las `COMBINACION_PALLETS_LNS_REINICIOS` semillas a un
+`ProcessPoolExecutor` (contexto `fork`, no `spawn` -evita reimportar
+`__main__` en cada worker, que rompería la app de Streamlit/pytest) en vez
+de correrlas una tras otra, y se queda con la mejor. Cada semilla es 100%
+independiente (mismo punto de partida, sin estado compartido) -paralelizar
+no cambia el resultado, solo el tiempo de reloj.
+**Verificado contra Pallet 1: mismo resultado exacto (84/93, 0
+violaciones), 324s -> 118.5s (~2.7x)** en una Mac de 10 núcleos. No es un
+5x limpio porque el DFS previo (~30s) no se paraleliza, y las 5 semillas
+no tardan lo mismo entre sí (el tiempo de pared lo marca la más lenta).
+
+### Nivel 2: los CDs, en procesos separados
+Verificado con `grep -rn "contador\[0\]"`: TODOS los IDs de pallet son
+`PV5-{cd}-NNN` -el contador nunca necesitó ser global entre CDs, cada CD
+puede tener el suyo propio arrancando en 0 sin ningún riesgo de colisión.
+Eso hizo trivial paralelizar también el loop de CDs: `_procesar_cd` (nuevo,
+`pipeline_sku_bloque.py`) hace todo el trabajo de UN CD (armar pallets +
+BAT real + estabilidad) con su propio contador local, y `ejecutar_core_
+sku_bloque` manda hasta `PIPELINE_MAX_PROCESOS_CD` (=núcleos disponibles)
+CDs a la vez a otro `ProcessPoolExecutor` -solo si hay 2+ CDs (con 1 solo
+CD no hay nada que paralelizar a este nivel, se corre directo).
+
+**Anidar pools -evitado a propósito**: si cada uno de los N CDs en
+paralelo ADEMÁS abriera su propio pool de 5 procesos para el LNS, serían
+N×5 procesos peleando por los mismos núcleos reales -satura en vez de
+acelerar. Por eso `_procesar_cd` siempre llama a `armar_pallets_bloques`
+con `paralelo_lns=False` (LNS secuencial adentro) cuando hay 2+ CDs -el
+paralelismo real pasa a vivir en el nivel de CD, no en el de semilla, en
+ese caso. Con 1 solo CD (ej. Pallet 1 forzado con `pallets_objetivo=1`),
+no hay nivel de CD que paralelizar, así que ahí SÍ se usa
+`paralelo_lns=True` (nivel 1).
+
+### Verificación
+- Suite completa: **169/169 pasan** (168 previos + 1 nuevo -no se agregó
+  ningún test nuevo de paralelismo en sí, los existentes ya ejercitan el
+  camino de 2+ CDs vía `test_otro_cd_sin_pallets_objetivo_sigue_como_
+  siempre`). **La suite completa bajó de ~113s a ~55s** -el dataset de
+  referencia (9 CDs, sin `Pallets_Objetivo`) ya se beneficia del
+  paralelismo por CD aunque nunca use LNS.
+- `Cubicaje18.07.2026.xlsx`: sigue en 54 pallets, sin cambios -mismo
+  resultado, la mitad del tiempo.
+- Pallet 1 (1 solo CD, `pallets_objetivo=1`): 84/93, 0 violaciones,
+  324s -> 118.5s.
+
+### Riesgo conocido, no probado a fondo en esta sesión
+`multiprocessing.get_context("fork")` en macOS puede, en teoría, chocar
+con librerías que ya inicializaron hilos/frameworks nativos ANTES del
+fork (el clásico crash `objc[PID]: ... may have been in progress...`).
+No se vio ningún crash en las corridas de esta sesión (suite completa +
+Pallet 1 + el cubicaje real de 12 CDs), pero si algún día aparece un
+crash rarísimo y no reproducible en un entorno productivo distinto (ej.
+un contenedor Linux con otra configuración), esta es la primera sospecha
+a revisar -la mitigación estándar sería forzar `spawn` ahí específicamente
+a costa de perder algo de velocidad por el overhead de reimportar.
+
+## Tope de reloj real en el backtracking/LNS + unidades en Cajas_No_Colocadas
+[mismo hilo, corrida real contra el archivo corregido del usuario: 12
+CDs, `Pallets_Objetivo` sumando 42 pallets en total] El primer corrido
+real con `Pallets_Objetivo` (no solo Pallet 1) quedó **colgado más de 21
+horas** -se mató manualmente. Causa raíz: `COMBINACION_PALLETS_MAX_NODOS`
+y `COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION` acotan la CANTIDAD de
+nodos del DFS, no lo que tarda cada uno. El objetivo fijo (42) resultó
+estar sistemáticamente por debajo del óptimo abierto de CADA uno de los 12
+CDs (59 pallets en total sin forzar nada) -con ese nivel de compresión
+exigida, el estado queda mucho más fragmentado que en Pallet 1 (el único
+caso medido hasta entonces) y el costo POR NODO de `_candidatos_lote`/el
+snapshot se dispara -multiplicado por hasta 5 reinicios x 200 iteraciones
+x 3,000 nodos de reconstrucción, cualquier CD grande (`Pallets_Objetivo`
+alto, ej. BK79=11 o BK80=8) podía tardar horas.
+
+**Fix**: `_resolver_pallets_backtracking` y `_lns_mejorar_pallets` ahora
+aceptan `limite_tiempo` -un deadline ABSOLUTO de `time.time()` (no
+`time.monotonic()`, para que sea comparable entre el proceso padre y los
+workers de `ProcessPoolExecutor` con contexto `fork`, que heredan el mismo
+reloj de pared). `_empacar_n_pallets` arma dos deadlines nuevos,
+`COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS` (20s) para el DFS inicial y
+`COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS` (40s) para TODA la fase de
+LNS (compartido entre las 5 semillas, en paralelo o secuencial según
+`paralelo_lns`) -~60s de tope duro por CD en el peor caso, contra horas
+antes. Al cortar por tiempo, el DFS/LNS simplemente devuelve el MEJOR
+incumbente encontrado hasta ese punto (mismo mecanismo que ya usaba el
+corte por nodos) -nunca falla, nunca tira excepción, nunca da un resultado
+inválido, solo puede llegar a un óptimo más lejano si el corte llega
+temprano.
+
+**Verificado contra el archivo real del usuario** (12 CDs, 42 pallets
+fijos): pipeline completo en **152s** (antes: colgado >21h). Resultado:
+**94.2% de fill rate** (4,074.2 de 4,323.2 cajas colocables en los 42
+pallets), por encima del 93% mínimo pedido por el usuario. Suite completa
+sigue en 169/169.
+
+**Pedido explícito del usuario** ("esas [cajas sobrantes] hay que hacer un
+cuadro aparte... la cd, el skus y las cajas y unidades que no pudieron ser
+cubicadas, eso se llama fill rate"): `construir_cajas_no_colocadas_df`
+(`exportar.py`) ahora también calcula `Unidades_No_Colocadas` (cajas ×
+`Unidades por caja` del Maestro, vía `info_sku`) -mismo tratamiento en
+`_demanda_excluida_geometria` (`pipeline_sku_bloque.py`) para la demanda
+excluida por geometría (V4), que se suma a la misma hoja. Cuando el SKU no
+tiene `Unidades por caja` disponible (ej. la caja física de consolidación
+`__BAT__`, que no es un SKU real) queda `None`/`NaN` en vez de inventar un
+0 -el groupby final usa `sum(min_count=1)` para no confundir "no sé" con
+"cero".

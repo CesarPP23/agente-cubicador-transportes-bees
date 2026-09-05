@@ -211,6 +211,7 @@ def construir_cajas_no_colocadas_df(
             if cantidad <= 0:
                 continue
             meta = info_sku.get(sku, {})
+            unidades_por_caja = meta.get("unidades_por_caja")
             filas.append(
                 {
                     "CD": pallet.cd,
@@ -218,9 +219,10 @@ def construir_cajas_no_colocadas_df(
                     "Descripcion": meta.get("descripcion", ""),
                     "Categoria": meta.get("categoria", ""),
                     "Cajas_No_Colocadas": cantidad,
+                    "Unidades_No_Colocadas": cantidad * unidades_por_caja if pd.notna(unidades_por_caja) else None,
                 }
             )
-    columnas = ["CD", "SKU", "Descripcion", "Categoria", "Cajas_No_Colocadas"]
+    columnas = ["CD", "SKU", "Descripcion", "Categoria", "Cajas_No_Colocadas", "Unidades_No_Colocadas"]
     df = pd.DataFrame(filas, columns=columnas)
     # [bug real, corregido acá] Demanda excluida ANTES de llegar al motor de
     # armado (ej. V4 en validacion.py: caja que no entra en el pallet en
@@ -230,9 +232,12 @@ def construir_cajas_no_colocadas_df(
     # a partir de ese log) se suma acá con el mismo esquema CD/SKU/
     # Descripcion/Categoria/Cajas_No_Colocadas.
     if demanda_excluida_df is not None and not demanda_excluida_df.empty:
-        df = pd.concat([df, demanda_excluida_df[columnas]], ignore_index=True)
+        demanda_excluida_df = demanda_excluida_df.reindex(columns=columnas)
+        df = pd.concat([df, demanda_excluida_df], ignore_index=True)
     if not df.empty:
-        df = df.groupby(["CD", "SKU", "Descripcion", "Categoria"], as_index=False)["Cajas_No_Colocadas"].sum()
+        df = df.groupby(["CD", "SKU", "Descripcion", "Categoria"], as_index=False)[
+            ["Cajas_No_Colocadas", "Unidades_No_Colocadas"]
+        ].sum(min_count=1)
         df = df.sort_values(["CD", "SKU"]).reset_index(drop=True)
     return df
 
