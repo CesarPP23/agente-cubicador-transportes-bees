@@ -717,6 +717,24 @@ COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS = 20.0
 COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS = 40.0
 
 
+def _tiempo_max_dfs(demanda_total: int) -> float:
+    """[escalado por tamaño -pedido explícito del usuario: el camino
+    abierto (`_empacar_optimizado`) prueba VARIOS `n_pallets` por CD
+    (búsqueda binaria), así que el tope fijo de arriba (pensado para UN
+    solo intento con `Pallets_Objetivo`) multiplicado por hasta 5 intentos
+    volvía lenta hasta la suite de tests (CDs chicos sintéticos no
+    necesitan 20s de DFS para converger). Escala con la demanda real -un
+    problema chico converge en un puñado de nodos igual, sin gastar el
+    tope completo; un CD real grande sigue teniendo el mismo tope de
+    siempre (el `min` lo satura en el valor de antes)."""
+    return min(COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS, 1.0 + demanda_total * 0.05)
+
+
+def _tiempo_max_lns(demanda_total: int) -> float:
+    """Ver `_tiempo_max_dfs` -mismo escalado, para la fase de LNS."""
+    return min(COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS, 2.0 + demanda_total * 0.1)
+
+
 def _capacidad_restante_en_capa(pallet: PalletV5, sku: str, z: float, tope_capa: int | None) -> float:
     """Cuántas cajas MÁS de `sku` caben todavía en la capa exacta `z` de
     este pallet antes de tocar `Cajas_Cama_Efectivo` -mismo conteo que ya
@@ -1119,6 +1137,7 @@ def _empacar_n_pallets(
     contador: list[int],
     n_pallets: int,
     paralelo_lns: bool = True,
+    con_lns: bool = True,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1132,7 +1151,19 @@ def _empacar_n_pallets(
     colocado MÁS cajas -empate prefiere el greedy (determinismo, cero
     superficie de cambio nueva). El backtracking (y por lo tanto todo el
     resultado final) nunca puede dar menos que el greedy porque su primera
-    rama explorada reproduce exactamente la misma prioridad."""
+    rama explorada reproduce exactamente la misma prioridad.
+
+    `con_lns=False` -pedido explícito del usuario tras medir que la suite
+    de tests pasó de 56s a 43 minutos: `_empacar_optimizado` (camino
+    abierto) llama a esta función varias veces por CD (búsqueda binaria de
+    N) y antes de este flag cada llamada pagaba el costo completo de LNS
+    (hasta 5 semillas en paralelo). Con `con_lns=False` se salta esa fase
+    -sirve para SONDEAR rápido "¿entran 100% de las cajas en N pallets?"
+    solo con DFS (mucho más barato, sin el multi-reinicio), reservando el
+    LNS completo para una única corrida final sobre la N que la búsqueda
+    binaria termine eligiendo. Puede subestimar qué N es factible (LNS
+    encuentra soluciones que el DFS solo no ve) -aceptable para sondear: la
+    N final igual se re-verifica con LNS completo antes de aceptarse."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -1158,11 +1189,11 @@ def _empacar_n_pallets(
     _resolver_pallets_backtracking(
         construcciones_bt, colocados_bt, pendientes_bt, por_sku,
         capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
-        limite_tiempo=time.time() + COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS,
+        limite_tiempo=time.time() + (_tiempo_max_dfs(demanda_total) if con_lns else min(5.0, _tiempo_max_dfs(demanda_total))),
     )
     total_bt = sum(sum(d.values()) for d in colocados_bt)
 
-    if total_bt < demanda_total:
+    if total_bt < demanda_total and con_lns:
         # [multi-reinicio -medido con datos reales, Pallet 1; pedido
         # explícito del usuario: "como podemos hacer para que no demore
         # tanto"] Una sola corrida de LNS depende de la suerte de la
@@ -1187,7 +1218,7 @@ def _empacar_n_pallets(
         # fase de LNS -en paralelo, lo respeta cada semilla por igual (no
         # se suma, corren a la vez); en secuencial, se reparte entre los
         # reinicios que alcancen a arrancar antes de que se cumpla.
-        deadline_lns = time.time() + COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS
+        deadline_lns = time.time() + _tiempo_max_lns(demanda_total)
 
         if paralelo_lns:
             n_procesos = min(COMBINACION_PALLETS_LNS_REINICIOS, os.cpu_count() or 1)
@@ -1235,6 +1266,109 @@ def _empacar_n_pallets(
         sin_colocar_bt = {sku: cant for sku, cant in pendientes_bt.items() if cant > 0}
         return pallets_bt, sin_colocar_bt
     return pallets_greedy, sin_colocar_greedy
+
+
+# [camino abierto, sin Pallets_Objetivo -pedido explícito del usuario tras
+# comparar una captura real del render isométrico contra una foto de un
+# pallet físico: "el 100% o lo maximo posible de la superficie de cada cama
+# tiene que estar llena... recien pasar a la siguiente cama"] Con cuántos
+# pasos de búsqueda binaria intentar bajar de `N_greedy`. [bajado de 4 a 2
+# -medido con datos reales: con 4 pasos y cada uno pagando el tope de
+# reloj completo, la suite de tests pasó de 56s a 43 minutos. Ver `con_lns`
+# en `_empacar_n_pallets` (sondeo de factibilidad barato, solo DFS, con un
+# tope de tiempo aparte más chico) -ese cambio solo bajó a 24 minutos; este
+# recorte de 4 a 2 pasos es el segundo ajuste sobre la misma medición, ver
+# PATCH_LOG.md para el número final]. 2 pasos de búsqueda binaria ya cubre
+# la mitad del rango greedy->1 pallet, que es donde está la mayoría de la
+# ganancia real.
+COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA = 2
+
+
+def _empacar_optimizado(
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
+    cd: str,
+    contador: list[int],
+    paralelo_lns: bool,
+) -> list[PalletV5]:
+    """[camino abierto, ver comentario junto a COMBINACION_ABIERTO_MAX_
+    INTENTOS_BUSQUEDA] `_empacar` (greedy de 1 caja a la vez, sin vuelta
+    atrás) ya coloca el 100% de la demanda por construcción -su corte es
+    agotar `pendientes`, no falta de espacio- pero la reparte con huecos
+    dentro de cada cama porque nunca puede deshacer una elección para
+    dejarle lugar a otro SKU que complementaría mejor el piso. Retar al
+    backtracking+LNS YA probado (`_empacar_n_pallets`, hoy solo se usaba con
+    `Pallets_Objetivo`) a colocar la MISMA demanda completa en MENOS
+    pallets que el greedy lo obliga a combinar SKUs dentro de la misma cama
+    para que todo siga entrando -eso es, en este motor, lo mismo que "tapizar
+    la cama antes de subir de nivel".
+
+    Búsqueda binaria acotada de la N mínima de pallets que sigue colocando
+    el 100% de la demanda ORIGINAL (no la del greedy, para no arrastrar sus
+    decisiones subóptimas): `_empacar_n_pallets` ya expone exactamente esa
+    pregunta (¿entra el 100% en N pallets?) vía `sin_colocar` vacío/no
+    vacío. Los pasos de sondeo usan `con_lns=False` (solo DFS, barato -ver
+    ese flag) y una sola corrida FINAL, ya en la N ganadora, usa LNS
+    completo -si la búsqueda nunca logra bajar de `N_greedy`, esa corrida
+    final termina siendo exactamente en `N_greedy`, y el solver de lotes
+    (`_candidatos_lote`, combina SKUs por cuboide en vez de 1 caja a la
+    vez) igual suele cerrar huecos visibles aunque el conteo de pallets no
+    baje. `contador` no se resetea entre intentos (es un contador global de
+    IDs únicos, sin ninguna otra parte del código que asuma contigüidad -
+    ver grep de `contador[0]` en el resto del archivo); los intentos
+    descartados simplemente dejan huecos en la numeración, cosmético, nunca
+    una colisión de ID.
+
+    Nunca puede terminar peor que `_empacar` solo: si todos los intentos de
+    `_empacar_n_pallets` fallaran en colocar el 100% (no debería pasar -
+    `_empacar` ya probó que `N_greedy` alcanza, y `_empacar_n_pallets`
+    compara internamente contra su propio greedy interno, al menos igual de
+    capaz), el fallback final es `pallets_greedy` tal cual."""
+    pendientes_originales = dict(pendientes)
+    pallets_greedy = _empacar(
+        dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+        presupuesto, cd, contador,
+    )
+    n_greedy = len(pallets_greedy)
+    if n_greedy <= 1:
+        return pallets_greedy  # nada que comprimir
+
+    # [búsqueda barata -pedido explícito del usuario tras medir 43 min de
+    # suite] Sondea con `con_lns=False` (solo DFS, sin el multi-reinicio
+    # de LNS) -mucho más rápido, aunque puede subestimar qué N es
+    # factible. `hi` termina siendo la N más chica que el DFS solo ya
+    # prueba que alcanza para el 100% -nunca peor que `n_greedy` (arranca
+    # ahí) y la corrida final (abajo) SIEMPRE tiene éxito en esa N (si DFS
+    # solo ya la resolvía, DFS+LNS -que nunca hace menos que el DFS solo-
+    # también).
+    lo, hi = 1, n_greedy
+    intentos = 0
+    while lo < hi and intentos < COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA:
+        intentos += 1
+        mid = (lo + hi) // 2
+        _, sin_colocar_mid = _empacar_n_pallets(
+            dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+            cd, contador, mid, paralelo_lns=paralelo_lns, con_lns=False,
+        )
+        if not sin_colocar_mid:
+            hi = mid
+        else:
+            lo = mid + 1
+
+    # Una sola corrida final, con LNS completo, en la N que ganó la
+    # búsqueda -acá sí se busca la mejor densidad posible, no solo
+    # factibilidad.
+    pallets_final, sin_colocar_final = _empacar_n_pallets(
+        dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+        cd, contador, hi, paralelo_lns=paralelo_lns,
+    )
+    if not sin_colocar_final:
+        return pallets_final
+    return pallets_greedy
 
 
 # [sección 8, redistribución de dispersos] Un pallet por debajo de este
@@ -1456,8 +1590,9 @@ def armar_pallets_bloques(
         for sku, cant in sin_colocar_barrido.items():
             sin_colocar[sku] = sin_colocar.get(sku, 0) + cant
     else:
-        pallets = _empacar(
-            pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, cd, contador
+        pallets = _empacar_optimizado(
+            pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, cd, contador,
+            paralelo_lns,
         )
 
         # [sección 5] Consolidación de remanentes: los pallets que quedaron

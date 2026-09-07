@@ -3700,3 +3700,57 @@ tiene `Unidades por caja` disponible (ej. la caja física de consolidación
 `__BAT__`, que no es un SKU real) queda `None`/`NaN` en vez de inventar un
 0 -el groupby final usa `sum(min_count=1)` para no confundir "no sé" con
 "cero".
+
+## Camino abierto (sin Pallets_Objetivo) también compacta cama por cama
+[pedido explícito del usuario: mandó una captura real de `PV5-BK31-002`
+(camino abierto) al lado de una foto de un pallet físico -en la captura
+quedaban franjas blancas enormes por cama, en la foto real cada cama queda
+tapizada de canto a canto mezclando SKUs antes de subir de nivel. "el 100%
+o lo maximo posible de la superficie de cada cama tiene que estar llena y
+cubicada para recien pasar a la siguiente cama"]
+
+**Diagnóstico**: el motor tiene DOS caminos de armado. `_empacar_n_pallets`
+(usado solo con `Pallets_Objetivo`) ya corre un backtracking real con poda
+más LNS multi-semilla -probado esta misma sesión (ver sección anterior) con
+tope de reloj real. Pero `_empacar` (el camino por defecto, sin
+`Pallets_Objetivo` -el que generó la captura del usuario) es un GREEDY
+PURO de 1 caja a la vez, sin vuelta atrás: coloca el ganador global de cada
+ronda y sigue, así que dos SKUs que podrían tapizar la misma cama de forma
+complementaria (uno el bloque grande, otro la franja que sobra) casi nunca
+calzan -sin backtracking, esa franja queda vacía para siempre en esa cama.
+El 99% del uso diario de la app (subir un Excel sin hoja `Pallets_Objetivo`)
+pasaba por este camino sin optimización de densidad.
+
+**Fix (`_empacar_optimizado`, nueva)**: `_empacar` YA coloca el 100% de la
+demanda por construcción (abre pallets hasta agotarla) -el problema no es
+demanda sin colocar, es que la reparte con huecos. Retar al backtracking+
+LNS YA probado a colocar la MISMA demanda en MENOS pallets que el greedy lo
+obliga a combinar SKUs dentro de la misma cama para que todo siga entrando
+-eso es, en este motor, lo mismo que "tapizar la cama antes de subir de
+nivel", y además reduce pallets reales. Búsqueda binaria acotada
+(`COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA`) de la N mínima que sigue
+colocando el 100% de la demanda original, reusando `_empacar_n_pallets` sin
+tocarla. Nunca puede terminar peor que el greedy solo (fallback explícito).
+
+**Costo de tiempo -3 rondas de medición real, no asumida:**
+1. Primera versión (búsqueda binaria de 4 pasos, cada uno con LNS
+   completo): la suite de tests pasó de 56s a **43 minutos**.
+2. `con_lns=False` para los pasos de sondeo (solo DFS, sin el multi-
+   reinicio de LNS -guardar LNS completo para una sola corrida final en la
+   N ganadora; nunca puede fallar ahí porque si el DFS solo ya alcanzaba el
+   100% en esa N, DFS+LNS también): bajó a **24 minutos**.
+3. Recortar `COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA` de 4 a 2 pasos +
+   tope de tiempo aparte más chico (5s) para los sondeos: bajó a
+   **14:56**. Mismo resultado de densidad en las 3 rondas (54->52 pallets
+   en el dataset de referencia, 85%->94% de aprovechamiento de altura,
+   pallets parciales 16->7) -los recortes de presupuesto de búsqueda no
+   sacrificaron calidad, solo tiempo de sondeos que no aportaban.
+
+**Verificado contra el archivo real completo del usuario** (12 CDs, Maestro
+completo, SIN `Pallets_Objetivo` -pipeline en producción real, CDs
+paralelos): **99.7s**, 100% de la demanda colocada (4,417.67 cajas), **56
+pallets totales** (contra 59 que daba el greedy solo en una corrida previa
+con MENOS demanda total -el fix comprime más pallets aun con más cajas que
+colocar). Ocupación de huella (`ocupacion_xy`) medida en los pallets reales
+del resultado: rango 78%-95%, la mayoría 85-90% -contra las franjas blancas
+visibles de la captura original. Suite completa: 169/169 sin regresiones.
