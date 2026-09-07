@@ -2506,3 +2506,1251 @@ demanda exacta.
   huecos ajenos, y el tope de `Cajas por PH` sigue aplicando aunque la
   colocación venga del llenado de huecos.
 - tests: 146 passed (suite completa).
+
+---
+
+## Cigarros no es lo mismo que Comestibles, y vuelta al motor exacto
+## -reportado por el usuario con fotos reales de la app
+
+El usuario corrió la app conectada con su dataset y mandó 2 fotos de
+pallets reales con dos problemas:
+1. Un pallet con Comestibles (categoría) apilado ENCIMA de Cigarros/BAT
+   -"esa caja es cigarros y siempre tiene que ir encima". Comestibles y
+   Cigarros compartían el mismo `NIVEL_REMATE` (7), así que podían quedar
+   en cualquier orden entre sí.
+2. Camas con espacio vacío grande Y ADEMÁS cajas visiblemente sin apoyo
+   real debajo -"eso no puede pasar... tiene que llenar la cama en su
+   dimension volumetrica completa y luego pasar a la siguiente".
+
+### Fix 1: `config.NIVEL_CIGARROS`
+Cigarros ya no comparte nivel con Comestibles -tiene el suyo propio, uno
+más alto (`NIVEL_REMATE + 1` = 8), así que por la misma regla de orden de
+categoría que ya existía (nunca decrece de piso a techo), Comestibles NUNCA
+puede quedar apoyado encima de Cigarros. El pseudo-SKU de BAT (consolidado
+de Cigarros/vapes) también se declara explícitamente con `Categoria_
+Normalizada="Cigarros"` y `Nivel_Categoria=NIVEL_CIGARROS` en `bat.py`
+-antes no declaraba categoría propia y cabía en el fallback genérico
+`NIVEL_REMATE`, quedando al mismo nivel que Comestibles.
+
+### Fix 2: se retiró `packing_ph_fraccion.py` del pipeline
+Se midió la magnitud real del problema de flotación antes de decidir:
+sobre `Cubicaje18.07.2026.xlsx`, de 4350 torres que no arrancan en el
+piso, la cobertura de soporte real promedio era del 79% -742 torres (17%)
+con menos del 50% de apoyo real, muchas con 0% (literalmente flotando).
+No era un caso límite raro, era sistemático -consecuencia directa de que
+cada capa arma su propio layout de estantería desde cero (x=0,y=0) sin
+mirar qué hay exactamente debajo; el % de cobertura por capa nunca
+garantizaba que CADA caja individual tuviera apoyo real en su posición
+exacta.
+
+Decisión del usuario, con el trade-off explicado (más pallets a cambio de
+garantía real caja por caja): volver a `src/packing_bloques.py` (el motor
+MaxRects exacto, ya con 0% de flotación verificado desde el fix original
+de esta sesión) como motor activo del pipeline. Se le agregaron 2
+ingredientes que `packing_ph_fraccion.py` sí había demostrado que ayudan a
+recuperar densidad sin sacrificar la garantía exacta:
+- **Orientación flexible** (`CATEGORIAS_ORIENTACION_FLEXIBLE = {"Comestibles",
+  "Aseo", "Cigarros"}`): estos SKUs generan las 6 orientaciones posibles
+  (`torres.generar_torres_candidatas_todas_orientaciones`, ya existía para
+  el llenado de huecos del motor retirado) en vez de las 2 "de pie" -de
+  pie sigue siendo la preferida cuando sirve (se calcula la mejor grilla
+  solo entre las "de pie"), acostado es el último recurso del fallback de
+  orientación que ya existía. NABs y el resto de las categorías siguen con
+  2 orientaciones nomás -pedido explícito: "nabs es el unico que siempre
+  tiene que ir de pie".
+- **Tope real de `Cajas por PH`** por pallet (`tope_pallet_por_sku` +
+  `colocado_en_pallet`, mismo mecanismo que ya se había probado en
+  `packing_ph_fraccion.py`).
+
+`packing_ph_fraccion.py` queda en el repo, probado, pero ya no es el motor
+del pipeline (`pipeline_sku_bloque.py` volvió a importar `armar_pallets_
+bloques` de `packing_bloques.py`).
+
+### Resultado -verificado con el pipeline real, ambos datasets
+```
+                    ANTES (PH_FRACCION)   AHORA (motor exacto + flexible)
+Cubicaje18.07.2026:  49 pallets            65 pallets
+  cobertura soporte:  79.0% promedio        100.0% (exacto, 0 flotando)
+  torres <50% apoyo:  742                   0
+
+Dataset del usuario: 19 pallets            27 pallets
+  5 CDs dentro de margen ±1: 4 de 5         1 de 5 (solo BK36)
+```
+Sube bastante el conteo de pallets -es el costo real de garantizar apoyo
+exacto caja por caja en vez de una aproximación por % de cobertura. Se
+reporta tal cual, sin ajustar nada para disimularlo: la brecha contra el
+cubicaje real (que ya se había cerrado con PH_FRACCION) se vuelve a abrir.
+0 solapamientos, 0 excesos de altura, 0 SKUs sobre su Cajas por PH,
+demanda exacta en ambos datasets.
+
+### Invariantes
+- `tests/test_packing_bloques.py`: 4 tests nuevos -categoría flexible
+  entra acostada donde de pie no calza (y el motor sigue en 0% de
+  flotación con esto activo), NABs nunca se acuesta, categoría no
+  flexible (ej. otro Licor) tampoco se acuesta, tope de Cajas por PH por
+  pallet.
+- Verificado manualmente (no solo tests sintéticos) contra ambos datasets
+  reales: 100.0% de cobertura de soporte exacta, 0 violaciones
+  geométricas, demanda exacta, 0 NABs acostados.
+- tests: 150 passed (suite completa).
+
+---
+
+## Investigación de los pallets peor aprovechados -motivada por fotos
+## reales de cubicaje sin ningún espacio libre
+
+El usuario mandó 2 fotos de camiones reales (CD Chanchamayo) con pallets
+sin ningún hueco -varios SKUs distintos combinados, capas completamente
+llenas. Se investigó la distribución REAL de ocupación XY del motor
+(no solo el promedio) para encontrar dónde estaba la brecha concreta.
+
+### Diagnóstico: la mediana ya es buena, el problema es una cola específica
+Sobre `Cubicaje18.07.2026.xlsx`: mediana de ocupación XY 88.8% (la
+MAYORÍA de los pallets ya está razonablemente cerca del estándar de las
+fotos), pero 6 pallets quedaban por debajo del 50% -y los 6 eran pallets
+dedicados SOLO a BAT (Cigarros consolidado) con 1-6 cajas.
+
+Causa real: Cigarros/BAT tiene el nivel de categoría más alto
+(`NIVEL_CIGARROS`, ver fix anterior) -eso significa que SIEMPRE pierde el
+desempate de prioridad mientras cualquier otro SKU de nivel más bajo
+todavía tenga dónde ir. Medido directamente: en cada CD afectado, el
+pallet más alto ya usaba prácticamente el 100% del presupuesto de altura (199.5-200.0 de 200.1cm) ANTES de que a BAT le
+tocara competir -sin margen real, sin importar que BAT tuviera demanda
+pendiente. BAT terminaba abriendo su propio pallet nuevo, donde ya no
+había nada más con qué competir.
+
+### Intento 1: redistribuir después de armar (`_redistribuir_dispersos`)
+Reutiliza el motor exacto (`_reconstruir_en_construccion`) para intentar
+mover las torres de un pallet muy vacío al espacio libre real de los
+pallets YA armados del mismo CD, respetando los mismos topes y el mismo
+orden de categoría. No encontró lugar en ningún caso -los pallets
+hermanos ya estaban a 199.5-200.0cm, sin los 49cm que Cigarros necesita.
+Se deja en el código (no hace daño, podría ayudar en datasets con más
+margen de altura disponible) pero no resolvió este caso.
+
+### Intento 2: reservar altura durante el armado (parcial)
+Mientras haya demanda pendiente de Cigarros, se descartan colocaciones de
+CUALQUIER OTRO nivel que dejarían menos margen de altura que lo que
+Cigarros necesita -con una válvula de escape: si respetar la reserva no
+deja NINGUNA colocación válida (ni para Cigarros ni para nadie), se
+descarta la reserva antes que desperdiciar altura sin ayudar a nadie.
+
+Resultado: mejoró 2 de 7 CDs (BK68, SJ86 ya no tienen pallet BAT-only),
+pero 5 siguen igual. Causa de que no alcance del todo: la reserva solo
+protege el PRESUPUESTO DE ALTURA restante, no la FORMA (ancho x
+profundidad) del hueco que queda -si lo que sobra en esos últimos
+centímetros no tiene el ancho que la caja de BAT (52.5x34cm) necesita, ni
+BAT ni nadie puede usarlo, y la válvula de escape lo libera de todas
+formas. Reservar también la posición XY exacta sería un cambio bastante
+más invasivo (equivale a apartar una región fija desde el principio del
+armado) para un beneficio acotado -no se implementó sin decisión
+explícita del usuario.
+
+### Resultado
+```
+Cubicaje18.07.2026.xlsx: 65 -> 64 pallets (aprovechamiento 78% -> 80%).
+Dataset del usuario: 27 -> 26 pallets.
+0 violaciones geométricas, demanda exacta en ambos -ninguna garantía se
+relajó, es una mejora real aunque parcial.
+```
+
+### Pendiente (no implementado, decisión del usuario)
+Cerrar el 100% de este caso puntual (BAT/Cigarros con muy poca demanda
+quedando solo) requeriría reservar una región XY específica desde el
+inicio del armado de un pallet, no solo un presupuesto de altura -un
+cambio más invasivo para un beneficio acotado (~5 pallets de 64 en el
+dataset de referencia).
+
+### Invariantes
+- Suite completa corrida contra ambos datasets reales tras cada intento:
+  0 violaciones, demanda exacta.
+- tests: 150 passed (sin tests nuevos en esta sección -el mecanismo se
+  verificó contra datos reales, no sintéticos; los tests existentes de
+  `test_packing_bloques.py` siguen pasando sin cambios).
+
+## Reescritura de bandas -pedido explícito del usuario
+
+> "reescribamos el orden, se arman las camas no las columnas primero
+> todos los licores si la demanda pide 1 cama de licores la siguiente
+> cama deberia ser de lacteos o nabs, y los remantes pueden ser
+> importados, comestibles, merch, cigarros que se mantenga la regla de se
+> consolifa hasta 500 unidaes por cd en las cajas y medidas que ya te di,
+> categorias disntinas si pueden compartir la misma cama siempre y cuando
+> en alto tambien sea compartido"
+
+Después de ver fotos de un camión real cargado (CD Chanchamayo) con
+pallets densos, sin ningún espacio libre, mezclando varios SKUs/marcas
+distintos por cama -el usuario pidió reemplazar la competencia
+simultánea "por nivel" (sección 4 de `packing_bloques.py` hasta acá, 8
+niveles de categoría, todos mezclándose libremente con el nivel solo como
+desempate) por 4 BANDAS estrictamente secuenciales: Licores → Lácteos →
+NABs → remanente (Aseo, Importados, Merch, Comestibles, Cigarros -y
+cualquier SKU forzado a nivel remate por Subcategoría RTD/Energizante,
+ver Four Loko). Aclarado en 3 preguntas de seguimiento:
+- Aseo entra en el grupo remanente ("Es parte del grupo remanente").
+- Cigarros YA NO tiene que ser lo más alto obligatorio ("Ya no es
+  obligatorio que sea lo más alto") -deja de ser un caso especial, es un
+  miembro más de la banda remanente.
+- Entre Lácteos y NABs (banda 2 y 3), Lácteos va primero cuando ambas
+  tienen demanda pendiente ("Lácteos primero, NABs después").
+- "hasta 500 unidades" fue un lapsus del usuario, confirmado 1000
+  (`CAJA_BAT_CAPACIDAD_UNIDADES`, sin cambios -dejar como está).
+
+### Diseño
+- **Banda como concepto NUEVO, propio de `packing_bloques.py`**
+  (`_banda_de_sku`), separado de `config.Nivel_Categoria` (que sigue
+  existiendo tal cual para reportes/exports, sin tocar `config.py` ni
+  `derivados.py`). 1=Licores, 2=Lácteos, 3=NABs, 4=remanente. Cualquier
+  SKU cuyo `Nivel_Categoria` original ya sea "remate o más" (incluye
+  Comestibles/Cigarros reales Y cualquier SKU forzado por Subcategoría
+  RTD/Energizante) cae en banda 4 sin importar su categoría textual -así
+  Four Loko (Categoria_Normalizada="Licores") no se cuela en la banda 1.
+- **La banda es el PRIMER criterio de la competencia por cuboide libre**
+  (antes que la Z): `clave = (banda_sku, z_destino, -area, -demanda)` en
+  vez de `(z_destino, nivel_sku, ...)`. Una banda menor SIEMPRE gana
+  sobre una mayor mientras tenga algún cuboide disponible, por lejano que
+  sea -eso agota Licores en la práctica antes de que Lácteos empiece,
+  sin necesitar una pasada separada ni resetear el estado 3D persistente
+  (la garantía de 0% de flotación no se toca).
+- **Exclusividad de cama entre bandas 1-3** (`_cama_es_de_otra_banda_
+  estricta`, NUEVO): a diferencia del esquema anterior, Licores/Lácteos/
+  NABs NUNCA comparten una misma Z entre sí, aunque la geometría dejara
+  hueco -"la siguiente cama debería ser de lácteos o nabs" se lee
+  literal: cada cama de estas 3 bandas es de una sola banda. La banda
+  remanente (4) queda AFUERA de esta restricción -puede aparecer en
+  cualquier cama, con cualquier banda, rellenando lo que sobre (es, por
+  diseño, el grupo remanente).
+- **Alto compartido dentro de la banda remanente** (`_altura_compatible_
+  con_cama`, NUEVO): al mezclar categorías distintas en una cama de la
+  banda 4, una caja nueva solo entra en una Z donde ya hay otras cajas de
+  esa banda si su alto coincide (±`TOLERANCIA_ALTURA_CAMA_CM=8.0`, mismo
+  valor ya calibrado en `packing_ph_fraccion.py`) con TODO lo que ya está
+  ahí -pedido explícito ("categorias disntinas si pueden compartir la
+  misma cama siempre y cuando en alto tambien sea compartido"). Exento en
+  el PISO del pallet (z=0): mezclar SKUs de alturas muy distintas ahí es
+  exactamente lo que el fix anterior de "huella grande gana el empate"
+  (ver sección previa) ya había demostrado que hace falta con datos
+  reales, y lo que muestran las fotos de cubicaje real del usuario
+  (botellas de alturas distintas conviviendo en la misma base). Bandas
+  1-3 no llevan esta restricción en ningún caso (son de una sola
+  categoría cada una).
+- **Se retiró la reserva de altura dedicada para Cigarros** (sección 8 de
+  una versión anterior de este archivo): dejó de tener sentido en cuanto
+  Cigarros pasó a ser un miembro más de la banda remanente en vez del
+  único SKU que siempre pierde la competencia por nivel. `_redistribuir_
+  dispersos` (mover pallets muy vacíos al espacio libre real de otros ya
+  armados) se mantiene, ahora parametrizado por banda en vez de nivel.
+
+### Efecto colateral (positivo, no buscado): resuelve el stranding de BAT
+El bug que quedaba PARCIALMENTE resuelto en la sección anterior (BAT/
+Cigarros stranded en pallets casi vacíos, 5 de 7 CDs sin resolver porque
+la reserva de altura solo protegía el presupuesto, no la forma XY) se
+resolvió ENTERO como efecto colateral de este rediseño: Cigarros ya no
+compite en desventaja estructural contra TODOS los demás niveles (era
+siempre el último de 8) -ahora comparte la banda 4 en igualdad de
+condiciones con Aseo/Importados/Merch/Comestibles, así que puede ganar la
+competencia por espacio como cualquier otro. Verificado contra
+`Cubicaje18.07.2026.xlsx`: **0 pallets BAT-puros** (antes 6), y SKUs de
+Comestibles/Aseo ahora sí quedan apoyados sobre Cigarros/BAT en varios
+pallets reales (ej. PV5-BK31-003, PV5-BK68-031, PV5-SJ97-060).
+
+### Desacoplamiento de `packing_ph_fraccion.py`
+Ese módulo (motor aproximado, abandonado, no usado por el pipeline)
+reusaba `packing_bloques._mejor_cuboide_para_sku` pasándole `nivel_por_
+sku` (escala 1-8) donde esta reescritura ahora espera una banda (escala
+1-4) -las 2 verificaciones nuevas (`_cama_es_de_otra_banda_estricta`,
+`_altura_compatible_con_cama`) interpretaban mal esos valores y rompían 2
+tests de `test_packing_ph_fraccion.py` (relleno de huecos). Se le dio a
+`packing_ph_fraccion.py` su propia copia local de la función (idéntica a
+la versión pre-reescritura, sin las 2 verificaciones nuevas) en vez de
+seguir importando la de `packing_bloques.py` -ese módulo queda congelado
+tal como estaba antes de esta reescritura, no recibe el concepto de
+bandas.
+
+### Resultado (`Cubicaje18.07.2026.xlsx`, 183 SKUs, 9 CDs)
+```
+61 pallets (antes 65 con el esquema por nivel). 0 violaciones
+geométricas. Demanda exacta (5049.99 cajas, 183 SKUs, igual que antes).
+Ocupación XY: media 84% (antes ~83%), solo 3 de 61 pallets <50% de
+ocupación (antes 6 de 65, todos BAT-puros -ahora 0 BAT-puros).
+```
+
+### Tests
+- `test_licores_nunca_queda_arriba_de_nabs` / `test_licores_si_puede_
+  quedar_debajo_de_nabs`: reescritos para pasar `categoria="Licores"`/
+  `"NABs"` explícito -bajo el esquema anterior alcanzaba con el nivel
+  numérico, ahora la banda se deriva de la categoría real.
+- `test_bandas_se_agotan_en_orden_licores_lacteos_nabs` (NUEVO): con las
+  3 bandas estrictas pendientes en un solo pallet, se agotan en orden
+  Licores → Lácteos → NABs, sin interfoliarse.
+- `test_four_loko_queda_en_banda_remanente_no_en_licores` (reescrito de
+  `test_four_loko_queda_arriba_de_todo_por_nivel_remate`): Four Loko cae
+  en banda remanente aunque su categoría textual sea "Licores", así que
+  queda por encima de Licores regulares en el mismo pallet -no porque
+  tenga una regla especial de "siempre lo más alto", sino por
+  construcción de bandas secuenciales.
+- `test_huella_grande_gana_el_empate_de_z_sobre_mas_demanda` (existente,
+  sin cambios): seguía pasando -confirma que la exención de piso (z=0) en
+  `_altura_compatible_con_cama` no regresionó este fix anterior.
+- Suite completa: 151 passed (22 en `test_packing_bloques.py`, 15 en
+  `test_packing_ph_fraccion.py` tras el desacople, resto sin tocar).
+
+## Columnas de altura despareja -orientación elegida por hueco real, no fija por SKU
+
+> "lo corri denuevo con una nueva demanda y mira el primer pallet de la
+> parte defrente se ve todos esos huecos y no deberia haber huecos, estas
+> apiladondo columnas por columnas lo que deberia ser cama por cama... si
+> es de un solo sku la demanada mejor"
+
+Foto real de un pallet con 3 "columnas" de Licores de altura visiblemente
+distinta, con aire de fondo visible por encima de las columnas más
+cortas. Investigado contra un pallet real equivalente
+(`Cubicaje18.07.2026.xlsx`, `PV5-BK65-021`): **no era flotación** (0
+violaciones, `validar_geometria_v5` limpio) ni huecos horizontales dentro
+de una misma cama (ocupación XY de piso: 96%) -era **aprovechamiento
+volumétrico bajo (67%)** porque distintos SKUs de Licores tienen alturas
+de caja distintas, así que cuando la demanda de un SKU en una zona X,Y se
+agota, esa "columna" deja de crecer mientras otras siguen subiendo -el
+aire queda por encima de la columna corta, hasta la altura de la más
+alta.
+
+Se le preguntó al usuario si autorizaba que Licores/Lácteos también
+pudieran acostarse/voltearse (como ya hacen Comestibles/Aseo/Cigarros)
+para cerrar estos huecos -**respondió que no, mantener ambos siempre de
+pie**, y pidió buscar otra forma.
+
+### Causa raíz real (más específica de lo que parecía)
+No era que faltara una orientación -Licores/Lácteos ya tienen 2
+orientaciones "de pie" (`L×A`/`A×L`)- sino que `_mejor_orientacion_grilla`
+fijaba UNA sola orientación por SKU para TODO el pallet (elegida por
+capacidad de grilla en un pallet VACÍO), y esa elección nunca se
+reconsideraba mientras la orientación preferida siguiera encontrando
+dónde ir (aunque fuera solo en su propia columna, cada vez más arriba).
+La orientación alternativa solo se probaba como último recurso si la
+preferida no entraba en NINGÚN cuboide libre de todo el pallet -pero si
+la preferida SÍ colocaba en otro lado (su propia columna), nunca se
+comparaba contra la alternativa, así que un hueco angosto que dejaba OTRA
+columna ya agotada quedaba sin usar aunque la alternativa calzara justo
+ahí.
+
+### Fix
+`_mejor_cuboide_para_sku` ya existía y no cambió -el cambio es en
+`_empacar`: para CADA SKU, en CADA intento de colocación, se prueban
+TODAS sus orientaciones disponibles (2 para Licores/Lácteos/NABs, hasta 6
+para las categorías flexibles) y se usa la que le da la Z más baja en ese
+momento -no una fija elegida de antemano. `_mejor_orientacion_grilla` quedó
+sin uso en este archivo y se eliminó (`packing_ph_fraccion.py` tiene su
+propia copia independiente, sin tocar).
+
+Riesgo considerado: una versión anterior de este archivo documentaba que
+mezclar orientaciones por SKU "fragmentaba el espacio" -pero esa nota se
+refería a una variante extendida con sobresaliente que ya no existe en el
+generador de candidatas actual (`torres.py` solo genera `L×A`/`A×L`
+simples, o las 6 completas para categorías flexibles). Verificado
+empíricamente contra los 4 datasets reales: ninguna regresión, mejora en
+todos.
+
+### Resultado (`Cubicaje18.07.2026.xlsx`, mismo dataset de la sección
+anterior)
+```
+58 pallets (antes 61 con la reescritura de bandas, 65 antes de eso).
+0 violaciones geométricas en los 4 datasets reales disponibles.
+Ocupación XY media: 86% (antes 84%). Aprovechamiento de altura: 85%
+(antes 83%). Pallets parciales: 16 de 58 -28%- (antes 19 de 61 -31%-).
+```
+Un residual de huecos angostos (unos ~10-15cm) sigue existiendo en
+algunos pallets -es geométricamente inevitable dado que Licores/Lácteos
+no pueden acostarse (decisión explícita del usuario) y las dimensiones de
+caja reales no dividen 120x100 parejo; ya no es un defecto de "columnas
+vs camas", es el mismo tipo de residual que cualquier cubicaje real con
+cajas heterogéneas tiene.
+
+### Tests
+- `test_orientacion_por_intento_cierra_columna_de_altura_pareja` (NUEVO):
+  reproduce el escenario sintético (SKU A agota su columna angosta, SKU B
+  tiene mucha demanda y su orientación preferida no calza en el hueco que
+  dejó A, pero la rotada sí) y confirma que B rellena ese hueco usando la
+  rotada.
+- `test_orientacion_cae_a_la_rotada_si_la_preferida_no_entra_en_nada`
+  (existente, docstring actualizado): seguía pasando, ahora explicado en
+  términos del nuevo mecanismo "probar todas, quedarse con la mejor" en
+  vez de "preferida + fallback solo si falla en todos lados".
+- Suite completa: 152 passed.
+
+## N pallets fijos por CD -pedido explícito del usuario, análisis de datos reales
+
+Contexto que originó este trabajo: el usuario compartió el cubicaje MANUAL
+real de un envío completo -`Plan de acción 24.08 - CUBICADO.xlsx` (hoja
+`BD`, el plan teórico) y `Plan de acción 24.08 - CUBICADO - ELIAN.xlsx`
+(hoja `PLAN 24,08,26`, lo que realmente armaron y subieron los operarios)-
+más una tabla de "PHs Físicas" por CD que define cuántos pallets debe
+llevar cada camión. Regla de negocio explícita: **"esa cantidad de pallet
+total no puede variar siempre tiene que ser la que dice en la
+planificacion"** -los camiones se programan en base a ese número, así que
+el agente tiene que repartir la demanda en EXACTAMENTE esa cantidad de
+pallets, ni más ni menos, cubicando cada uno lo mejor posible.
+
+### Validación del dato real
+- Crucé la tabla "PHs Físicas" contra la columna `PALET` de la hoja `BD`
+  agrupada por CD: coinciden EXACTO en los 9 CDs (Callao=5, Cono Norte=7,
+  Cono Sur=7, Rímac=5, Chanchamayo=5, Huánuco=4, Satipo=3, Tingo María=5,
+  Pucallpa=9).
+- La columna `PH` de ELIAN es exactamente `CJS / (CJ x PH)` -mismo dato
+  que ya usamos como `Cajas por PH` del Maestro, no requiere ningún input
+  nuevo para calcularse. Sumado por CD y dividido entre su cantidad de
+  pallets real: ~1.2 a 1.5 PH por pallet (promedio ~1.35), consistente
+  con lo que `packing_ph_fraccion.py` (el motor aproximado, abandonado)
+  ya había calibrado antes en la sesión contra otro dataset real distinto
+  (`OBJETIVO_PH_PALLET=1.4`).
+- El usuario decidió explícitamente que el N objetivo por CD sea un
+  **input que él sube** (no algo que el agente calcule con el factor
+  1.4) -pendiente: diseñar el mecanismo de carga (nueva hoja/columna en
+  la plantilla).
+
+### Bandas estrictas -revertidas, evidencia real en contra
+Inspeccioné línea por línea el Pallet 1 de BK34 en `PLAN 24,08,26`:
+Licores, Comestibles, Aseo y NABs aparecen TODOS mezclados en el mismo
+pallet, y 19 de 21 SKUs tienen demanda MENOR a su propio `Cajas por
+cama` (cada SKU ocupa como mucho 1-2 camas propias, compartiendo piso
+con los demás sin agotar una categoría antes de tocar otra). Esto
+contradice directamente la reescritura de bandas estrictamente
+secuenciales de la sección anterior -se revirtió (ver commit) a un
+esquema de NIVEL/peso (Licores=1 el más pesado, nunca apoyado sobre
+otra categoría; categorías más livianas SÍ pueden apoyarse sobre
+Licores), usando `config.nivel_de_categoria` para el chequeo de soporte
+por columna, SIN exclusividad de cama -pedido explícito del usuario
+tras confirmarle esta lectura de los datos.
+
+### Bug real encontrado y corregido: nivel como primer criterio de la cola
+Al implementar el nivel como PRIMER criterio del desempate (antes que la
+Z), Licores le ganaba a Comestibles/NABs/Aseo por una Z mucho más ALTA
+(seguía apilando en su propia columna) en vez de dejarlos usar una Z más
+baja real disponible en el piso -contradice "cama por cama, fila por
+fila" (el principio fundacional de todo este archivo) y, verificado con
+`pallets_objetivo` fijo, causaba que hasta 30% de la demanda de un CD se
+quedara sin colocar aunque hubiera piso libre. Corregido: la Z es
+SIEMPRE el primer criterio; el nivel solo desempata cuando dos SKUs
+podrían usar la MISMA Z (pedido original del usuario: "primero se tiene
+que acabar toda la demanda de licor" se cumple así, por desempate, no
+por prioridad absoluta). La restricción DURA de peso
+(`_soporte_viola_nivel`) es independiente de este orden y no cambió.
+
+### `_empacar_n_pallets` -mecanismo nuevo, funciona perfecto para el conteo
+`armar_pallets_bloques(..., pallets_objetivo=N)` abre los N pallets desde
+el inicio (no uno a la vez hasta agotar demanda) y en cada intento
+compara la mejor posición de cada SKU pendiente en CADA uno de los N
+pallets -reusa exactamente el mismo motor exacto (`_mejor_cuboide_para_
+sku`), solo con un lazo exterior más ancho. Verificado contra los 9 CDs
+reales:
+```
+Conteo de pallets: EXACTO en los 9 CDs (5,7,7,5,3,5,4,5,9 = 50 total).
+0 violaciones geométricas.
+```
+
+### Problema NO resuelto: fill rate ~65-70% (necesario: ~99%)
+El cubicaje real de ELIAN colocó 5,499 de 5,574 cajas (98.7%) en esos 50
+pallets. `_empacar_n_pallets`, con la misma demanda real, solo coloca
+~65-70% -deja hasta 30-45% de la demanda sin colocar por CD, muy por
+encima del "±2% de fill rate" que el usuario dijo que es la tolerancia
+real del negocio.
+
+**Causa raíz diagnosticada** (no es un bug de conteo -verificado:
+demanda = colocado + sin_colocar exacto en cada CD): inspeccionando los
+cuboides libres que quedan cuando el motor se atasca, aparecen tiras de
+piso de 2-9cm de ancho con la altura COMPLETA del pallet disponible
+(~200cm) -nunca reclamadas desde z=0 porque ningún SKU de la demanda
+restante (en ninguna de sus orientaciones) es tan angosto. El volumen
+total SÍ alcanza (SJ86: la demanda ocupa solo 69.5% del volumen bruto de
+sus 3 pallets) -el problema es la FORMA en que los anchos de las cajas
+se combinan sobre el piso de 120x100cm, no la cantidad de espacio.
+
+**4 intentos de arreglo, todos descartados** (con datos reales del
+mismo dataset, `Plantilla_Ejemplo_Agente_Cubicador (2).xlsx`):
+1. Nivel como primer criterio de la cola -sin efecto en este problema
+   puntual (aunque el fix en sí era necesario, ver arriba).
+2. Preferir huella más CHICA en vez de más grande al desempatar -mucho
+   peor (SJ86: 72% -> 36%). Confirma que "huella grande primero" (ya
+   validado antes en la sesión con datos reales de BK31) sigue siendo
+   correcto.
+3. Penalizar, en el desempate, elegir una orientación cuyo resto de
+   ancho/profundidad dentro del cuboide específico quede por debajo de
+   un umbral (probado con 15cm y con 8cm) -mejoró SJ86 (72% -> 80%) pero
+   empeoró gravemente SJ97 (78% -> 53%). Inestable: ayuda en CDs con
+   muchos SKUs chicos distintos, perjudica en CDs con demanda muy
+   concentrada en pocos SKUs (interrumpe una grilla ya bien aprovechada
+   del mismo SKU repitiéndose).
+4. Igual que (3) pero limitado a cuboides todavía "frescos" (≥60cm en
+   ambas dimensiones, para no tocar columnas ya en construcción) -mismo
+   problema, sigue empeorando SJ97 (78% -> 70%) y ahora también SJ90
+   (59% -> 55%), sin siquiera preservar la mejora de SJ86.
+
+**Diagnóstico final:** un ajuste de prioridad/desempate no alcanza. Hace
+falta decidir, al abrir una fila nueva de piso, qué COMBINACIÓN de SKUs
+pendientes la completa con el menor resto -un problema de tipo
+subset-sum/knapsack por fila- calculado ANTES de colocar la primera
+caja, no colocación voraz caja por caja con distintos criterios de
+desempate. Es un algoritmo distinto, no una variante más del actual.
+
+### Pendiente para la próxima sesión
+1. Diseñar e implementar el algoritmo de "combinación por fila" (probado
+   contra los 9 CDs reales de este mismo dataset -guardado en Downloads,
+   `Plantilla_Ejemplo_Agente_Cubicador (2).xlsx` + los 2 archivos
+   `Plan de acción 24.08...`- como benchmark de fill rate real: objetivo
+   ~99%, no solo "más que 70%").
+2. Diseñar el mecanismo de carga del `pallets_objetivo` por CD (nueva
+   hoja/columna en la plantilla -el usuario decidió que sea un input que
+   él sube, no algo calculado con el factor 1.4) y conectarlo end-to-end
+   (`validacion.cargar_hojas` -> `pipeline_sku_bloque.py` ->
+   `armar_pallets_bloques`).
+3. Los 4 intentos descartados (arriba) no deben repetirse sin una razón
+   nueva -ya están probados y devuelven peor resultado en al menos un CD
+   real cada uno.
+
+---
+
+## Combinación por fila (parcial) — cesión de columna por capacidad instalada
+
+Contexto: el usuario mandó 4 fotos reales de un Pallet 1 (CD Callao, BK34,
+210cm medido) y pidió replicar/reconstruir ese pallet con geometría real
+para validar si físicamente entra todo lo que el picker cargó (93 cajas,
+21 SKUs, hoja `Cubicado Real` de `Prueba.xlsx`). Cruzando esas 21 SKUs
+contra dos catálogos UMA reales del proyecto (`UMAS 17.06.2026.xlsx` para
+12, `Plantilla_Ejemplo_Agente_Cubicador (2).xlsx` para 9 más nuevas) y
+corriendo el motor exacto forzado a `pallets_objetivo=1`: **58 de 93
+cajas**, 0 violaciones geométricas. La demanda equivale a 1.31 "PH"
+(dentro del rango 1.13-1.53 ya validado contra cubicajes reales) -entra
+volumétricamente, el motor no lo estaba logrando por forma, no por
+espacio.
+
+### Diagnóstico con trazas reales (no supuesto)
+Instrumentando `_empacar` paso a paso: Electrolight (NABs, footprint
+26x22.5cm, demanda 25) quedaba atado a **una sola columna** durante todo
+el armado, deteniéndose en 7 cajas solo porque se acababa el presupuesto
+de altura de ESA columna -nunca consiguió una segunda columna en ningún
+otro punto del piso. Causa: el desempate de `_empacar`
+(`clave = (z, nivel_sku, -area, -pendientes[sku])`) hace ganar a Licores
+(nivel 1) cualquier celda compatible, sin importar si Licores YA tiene
+columnas de sobra para cubrir el resto de su propia demanda. Con ~49 de
+las 93 cajas de este pallet siendo Licores, ese desempate (pedido
+explícito y ya validado con datos reales, BK31) deja a NABs con muy poco
+margen dentro de un solo pallet -exactamente lo que muestran las fotos
+(NABs con una franja ancha propia, compitiendo con Licores desde
+temprano), no lo que el motor producía.
+
+### 4 intentos probados y descartados antes del diseño final
+Cada uno mejoraba Pallet 1 pero regresionaba algo real -mismo patrón que
+la sección "N pallets fijos por CD" ya había advertido ("un ajuste de
+prioridad/desempate no alcanza"):
+1. **Umbral de "demanda por columna" ("acaparado")**: ningún valor de
+   umbral (10/15/20/25/30) evitaba una regresión real en
+   `Cubicaje18.07.2026.xlsx` (SJ87 8->9) o directamente no tenía efecto.
+2. **Reestructurar `_empacar` "por fila"** (procesar todos los cuboides
+   libres del Z mínimo actual antes de subir, en vez de una carrera
+   global): probado en un prototipo aislado, da resultados IDÉNTICOS al
+   algoritmo actual -confirma que la reestructuración sola no alcanza sin
+   cambiar el criterio de selección.
+3. **Cesión de columna nueva por "capacidad instalada" sin restricción**:
+   mejoraba fuerte (56->51 en el dataset de referencia, Pallet 1 58->69)
+   pero rompía `test_four_loko_queda_en_banda_remanente_no_en_licores`
+   (Four Loko terminaba compartiendo el piso, z=0, con Licores reales).
+4. **Lo mismo restringido a z>0 en general**: arregla ese test pero
+   regresiona BK65 (6->7) en el dataset de referencia.
+
+### Diseño final: cesión por capacidad instalada, excepción solo para remate en el piso
+`_capacidad_instalada(pallet, sku, presupuesto)`: suma, sobre TODAS las
+columnas ya existentes de un SKU, cuánto más cabe verticalmente en cada
+una antes del presupuesto de altura. `_necesita_columna_nueva(...)`: una
+celda es "columna nueva" genuina para un SKU si no es continuación de una
+columna propia, su demanda pendiente SUPERA esa capacidad instalada, y
+-excepción explícita- no es una categoría de remate (Four Loko/Cigarros
+incluidos) compitiendo por el PISO del pallet (z=0) -ese piso sigue siendo
+dominio exclusivo de Licores reales mientras compitan ahí. En `_empacar` y
+`_empacar_n_pallets`: junto al `mejor` de siempre (sin tocar ese cálculo),
+se registra en paralelo `mejor_necesitado` -el mejor candidato que
+genuinamente necesita una celda nueva. Si ambos apuntan al MISMO cuboide
+libre (empate real) y el ganador normal no necesita esa celda (no es
+continuación de su propia columna, y su demanda pendiente ya cabe en la
+capacidad instalada que tiene), se la cede.
+
+### Verificado
+- Suite completa: **155/155 tests pasan** (152 anteriores + 2 tests
+  nuevos de las funciones puras `_capacidad_instalada`/
+  `_necesita_columna_nueva` + 1 de la excepción de remate en el piso;
+  incluye los 3 que las variantes anteriores rompían).
+- `Cubicaje18.07.2026.xlsx` (9 CDs reales, pipeline completo): **56 -> 54
+  pallets totales**, sin ningún CD peor (SJ86 8->7, SJ95 6->5, resto
+  igual).
+- Pallet 1 (CD Callao, forzado a 1 pallet real): **58 -> 67 cajas
+  colocadas** de 93, 0 violaciones geométricas, altura 207.92cm (dentro
+  del tope 215). Electrolight sube de 7 a 18 de 25. Quedan 4 SKUs
+  incompletos (antes 8): Ron Flor de Caña 8/20, Electrolight 18/25, PO
+  Galleta Vainilla 2/6, Gomas Ambrosito 0/3 -26 cajas sin ubicar, no 35.
+
+### Lo que queda pendiente (no resuelto en este patch)
+Pallet 1 sigue sin llegar a las 93/93 que el picker logró a mano -el
+diagnóstico de por qué (combinaciones de footprint que ningún ángulo del
+motor exacto actual tesela, ver secciones anteriores de este archivo)
+sigue vigente. Este patch resuelve la parte de "acaparamiento
+estructural por prioridad de categoría" del problema, no la parte de
+"combinación real por fila" (subset-sum/knapsack por rectángulo) que
+sigue pendiente de diseño, tal como ya lo dejaba anotado la sección "N
+pallets fijos por CD".
+
+### Invariantes
+- Demanda exacta y 0 violaciones geométricas: verificado en ambos
+  datasets reales.
+- Sin cambios a `_mejor_cuboide_para_sku`, `_soporte_viola_nivel`,
+  `_altura_compatible_con_cama`, tope por capa/pallet, ni a
+  `packing_columnar.py` -el fix vive enteramente en la selección de
+  `_empacar`/`_empacar_n_pallets`.
+- El caso normal (SKU sin capacidad de sobra, o compitiendo en igualdad
+  de nivel) es byte-idéntico al comportamiento anterior.
+- tests: 155 passed (suite completa).
+
+---
+
+## Combinación por fila -2 prototipos de look-ahead, ninguno superó lo shippeado
+
+Pedido explícito del usuario, después del fix de "cesión por capacidad
+instalada" de arriba: encarar la parte de "combinación por fila" que
+todavía queda pendiente. Se probaron 2 prototipos de look-ahead acotado
+-**ninguno de los dos se aplicó al código real**, vivieron solo como
+scripts aislados en `/tmp` (ya borrados), corridos contra
+`armar_pallets_bloques` real vía monkeypatch para medir su efecto antes
+de decidir si valía la pena escribirlos en el repo.
+
+### Intento 1: simular 2 escenarios por cuboide y comparar área ocupada
+Para cada celda disputada, simular (con snapshot/rollback vía
+`copy.deepcopy`, reusando `pc.colocar` real para que la geometría sea
+siempre válida) dos escenarios: (A) solo el ganador normal llena la
+celda, (B) el ganador normal PRIMERO y después un segundo candidato
+activo rellena lo que sobra del mismo cuboide -quedarse con el que deja
+más área ocupada.
+
+**Resultado**: `Cubicaje18.07.2026.xlsx` empeoró de 54 a **59** pallets
+(BK41 4->6, SJ87 8->9, SJ97 9->10), y ~45s de corrida (vs ~25-30s del
+motor actual) por el costo de simular con `deepcopy` en cada celda
+disputada. **Descartado.**
+
+Causa diagnosticada: el escenario B, por construcción, SIEMPRE usa igual
+o más área que A (incluye todo lo de A más el relleno) -así que la
+comparación "queda el que usa más área" terminaba diciendo "sí, metelo"
+casi siempre, sin evaluar si ESE relleno específico convenía ahí o le
+convenía más esperar una celda mejor más adelante en el mismo pallet.
+Rellenar oportunistamente cada hueco individual, sin ver el resto del
+pallet, es la trampa clásica de un greedy local -puede ser peor que dejar
+el hueco vacío si el SKU de relleno tenía un lugar mejor esperándolo.
+
+### Intento 2: "¿tiene el relleno otra oportunidad visible?"
+En vez de simular, un chequeo barato: antes de forzar un candidato de
+relleno en una celda disputada, mirar si ese mismo candidato tiene ALGUNA
+OTRA celda libre compatible en el resto de `pc.libres` -si la tiene, no
+hace falta forzarlo acá (puede esperar); si esta es su ÚNICA oportunidad
+visible, tomarla ahora antes de perderla. Sin simulación, sin
+`deepcopy` -una sola pasada extra sobre la lista de libres.
+
+**Resultado**: `Cubicaje18.07.2026.xlsx` dio **55** pallets (BK43 5->4 y
+BK68 5->4 mejoran, BK41 4->5 y SJ87 8->9 empeoran) en ~29s -mucho más
+rápido que el intento 1, pero **todavía 1 pallet peor que lo ya
+shippeado (54)**. Se calibró la ventana de "qué tan lejos en Z todavía
+cuenta como otra oportunidad" (probado 1x/2x/4x el alto de caja del
+candidato): 1x empeora más (56, SJ97 9->10), 2x y 4x dan el mismo 55 -la
+brecha con BK41/SJ87 no es un problema de calibración, es estructural a
+este heurístico puntual. **Descartado.**
+
+### Diagnóstico común a ambos intentos
+Los dos son heurísticos LOCALES -miran 1 celda o 1 chequeo de vecindad
+antes de decidir- y ambos topan con el mismo límite: decidir bien qué
+hacer con un candidato de relleno requiere saber qué le conviene en TODO
+el resto del pallet, no solo en la celda de al lado o en su vecindad
+inmediata. Eso confirma, con evidencia nueva de esta sesión, el
+diagnóstico que ya estaba en la sección "N pallets fijos por CD": el
+problema es genuinamente de tipo subset-sum/knapsack, no alcanza con
+ajustar cuánto "mira hacia adelante" un heurístico voraz -haría falta
+backtracking real (probar una asignación, medir el resultado completo
+del pallet, y volver atrás si no conviene), que es un algoritmo
+sustancialmente más grande y no se emprendió sin decisión explícita dado
+el tamaño del esfuerzo.
+
+### Estado final
+`src/packing_bloques.py` queda exactamente como en la sección anterior
+(cesión por capacidad instalada) -ninguno de estos 2 intentos tocó el
+código real. Pendiente: diseñar el solver de backtracking real, si se
+decide continuar en una sesión futura. Se documenta acá para no repetir
+estos 2 intentos ya descartados sin una razón nueva.
+
+## Combinación por fila -intento 3: solver DFS con poda, también descartado
+[sesión posterior, pedido explícito del usuario: "diseñemos el solver
+real"] Se diseñó (con un agente de planning dedicado, revisando código
+real) e implementó un solver de asignación conjunta por fila: DFS con
+poda (branch and bound), presupuesto de nodos contados (no de reloj, para
+reproducibilidad), shortlist top-K por cuboide, y cota superior admisible
+-no el heurístico local puntual de los intentos 1-2, un algoritmo de
+verdad que evalúa combinaciones de varios SKUs a la vez sobre TODOS los
+cuboides libres disjuntos de la misma Z frontera (`_cuboides_en_
+frontera`), no una sola celda.
+
+### Hallazgo de datos, aparte del algoritmo (SÍ vale la pena, no se aplicó)
+Antes de diseñar el solver se investigó por qué Electrolight (NABs) nunca
+pasa de ~18-20 cajas: `reconciliacion_geometrica.reconciliar_sku` degrada
+su objetivo del Maestro (24 cajas/cama) a ~19-20 porque la huella
+declarada en UMA (26x22.5cm, parada) da esa capacidad geométrica real. Si
+la huella real parada fuera 26x19cm (22.5cm de alto, no 19cm) el cálculo
+da exactamente 24 -coincide con el Maestro. Se le preguntó al usuario si
+Electrolight (u NABs en general) podía acostarse para aprovechar esto -
+**el usuario confirmó mantener la regla "NABs siempre de pie" tal cual**,
+y aclaró que la huella real parada de Electrolight es 26x19 (no 26x22.5):
+o sea, el dato de "Ancho de caja"/"Alto de caja" de UMA está invertido
+para este SKU, sin que haga falta acostarlo. Esto es una corrección de
+DATO FUENTE (UMAS 17.06.2026.xlsx / Plantilla_Ejemplo_Agente_Cubicador),
+no de algoritmo -queda fuera de alcance de este intento, pendiente de
+corregir en la fuente si se retoma.
+
+### Diseño implementado (3 variantes, las 3 descartadas)
+Se probaron 3 disparadores distintos para cuándo invocar el solver,
+cada uno verificado contra la suite completa (155 tests) Y
+`Cubicaje18.07.2026.xlsx` (9 CDs reales) antes de pasar al siguiente:
+
+1. **Disparo en CUALQUIER fila con 2+ cuboides libres distintos en la
+   misma Z**, sustituyendo al ganador normal si el solver encontraba una
+   asignación con más cajas totales. **Resultado**: 56->**55** pallets
+   (peor que los 54 ya shippeados) -BK41 pasó de 4 a 5.
+2. **Disparo restringido** (más conservador: solo si existía un SKU que
+   GENUINAMENTE necesitaba -`_necesita_columna_nueva`- un cuboide de la
+   frontera distinto al ganador normal, mismo criterio que ya usa la
+   cesión puntual shippeada, extendido a cuboides no idénticos).
+   **Resultado**: BK41 **seguía en 5** -el disparador más estricto no
+   alcanzó, el problema no era "disparar de más" sino la reasignación en
+   sí.
+3. **Versión ADITIVA** (la más conservadora posible: nunca tocar al
+   ganador normal en SU propio cuboide -eso queda exactamente igual que
+   hoy-, solo aprovechar en la MISMA ronda cuboides HERMANOS -mismo Z,
+   índice distinto- que de otro modo se llenarían recién varias
+   iteraciones después). **Resultado**: BK41 volvió a **4** (arreglado),
+   pero el TOTAL del dataset se mantuvo en **55** -SJ97 o algún otro CD
+   compensó en la dirección contraria (verificado con `pytest`
+   end-to-end, no solo el CD aislado).
+
+### Diagnóstico final, más preciso que el de los intentos 1-2
+Para aislar si el problema era la PRIORIZACIÓN ("necesita columna" gana
+el desempate del hermano) o el simple hecho de REORDENAR cuándo se coloca
+algo, se probó una 4ª variante de control: la versión aditiva, pero
+llenando cada cuboide hermano con el MISMO SKU que ya era su ganador
+natural por el criterio de siempre (`nivel, -área, -pendiente`, SIN el
+criterio de "necesita columna") -o sea, exactamente lo mismo que el
+algoritmo actual haría más adelante, solo que YA, en la misma ronda, sin
+cambiar NUNCA quién gana nada.
+
+**Resultado**: `Cubicaje18.07.2026.xlsx` volvió a dar **54** pallets en
+total (BK41 4, igual que el baseline) -pero **BK65 mejoró (6->5) y SJ95
+empeoró (5->6)**: mismo total, un CD distinto peor. Esto prueba que el
+problema NO es de criterio de prioridad -es que el pipeline completo
+(barrido + `_redistribuir_dispersos` + consolidación de remanentes de la
+sección 5) es sensible al ORDEN EXACTO en que se van colocando las cajas,
+incluso cuando esa reordenación no cambia NUNCA quién gana un cuboide,
+solo el momento en que lo gana. Cualquier perturbación -por más
+conservadora, aditiva y "sin cambiar el resultado" que parezca- puede
+cambiar la forma final de algún pallet lo suficiente como para que la
+consolidación posterior tome una decisión distinta en OTRO CD
+completamente separado.
+
+### Estado final
+Los 3 (+1 de control) intentos fueron revertidos -`src/packing_bloques.py`
+quedó exactamente como en el commit `a27128f` (cesión por capacidad
+instalada), sin ningún cambio de este intento aplicado al código real.
+El problema de combinación por fila sigue sin resolverse: se confirma con
+evidencia nueva y más precisa que el barrido voraz de este archivo no se
+puede "arreglar por partes" con ningún parche local -ni siquiera uno que
+no cambie ninguna decisión, solo la agilice- porque toda la tubería
+completa (barrido + redistribución + consolidación) es un sistema
+acoplado, sensible al orden. Un solver real necesitaría, como mínimo,
+correr DESPUÉS de la consolidación (sobre el resultado ya estable) o
+integrarse a ella como una sola pasada -no como una corrección puntual
+dentro del barrido principal. Pendiente para una sesión futura si se
+decide encarar ese rediseño más grande.
+
+## Solver exacto de N pallets fijos -shippeado, Pallet 1 de 67 a 78/93
+[sesión posterior, pedido explícito del usuario: "encaremos el diseño más
+grande pero solo utilicemos como base el pallet 1 que tenemos fotos y
+cantidades exactas de cuanto ha entrado, si logramos replicar ese pallet a
+la perfección lo demás va a salir"] El intento anterior fracasó porque
+CUALQUIER reordenamiento dentro de `_empacar` (el camino multi-CD) es
+sensible al orden vía `_redistribuir_dispersos` + consolidación de
+remanentes. Antes de diseñar nada se verificó con `grep -rn
+"pallets_objetivo"` en todo el repo: **`_empacar_n_pallets` (el camino que
+usa `pallets_objetivo`, el que reproduce Pallet 1) no tiene NINGÚN
+llamador de producción** (`pipeline_sku_bloque.py` nunca lo pasa) **ni
+ningún test que lo cubra** -a diferencia de `_empacar`, es un camino de
+código completamente aislado, sin usuarios reales ni consolidación
+posterior. Eso permitió construir ahí un backtracking real sin ningún
+riesgo sobre el dataset de referencia de 9 CDs.
+
+### Diseño (con agente de planning dedicado, revisando código real)
+`_empacar_n_pallets_greedy` (el motor de siempre, renombrado, verbatim -
+sirve de semilla/kill-switch) se complementa con `_resolver_pallets_
+backtracking`: DFS con poda real, con undo, sobre LOTES completos (una
+columna entera de una vez, no 1 caja a la vez -baja la profundidad del
+árbol de ~93 decisiones a ~30-60). Piezas nuevas en `src/packing_bloques.py`:
+- `_snapshot_estado_pallets`/`_restaurar_estado_pallets`: undo barato sin
+  `copy.deepcopy`, apoyado en que `_actualizar_libres_maxrects`
+  (`packing_columnar.py`) nunca muta un `_CuboidLibre` in-place -guardar
+  la referencia vieja de `pc.libres` alcanza. **Bug real encontrado y
+  corregido en el camino**: `pallet.torres` SÍ se muta con `.append()` (a
+  diferencia de `pc.libres`) -guardar solo su longitud y recortar la lista
+  ACTUAL con `[:n]` al restaurar fallaba en cuanto se restauraba un
+  snapshot viejo después de hacer backtrack más allá de él (el primer
+  intento completo dio 0 cajas colocadas, silencioso, hasta que se
+  encontró la causa). Fix: guardar una COPIA real de `pallet.torres` en el
+  snapshot, no su longitud.
+- `_candidatos_lote`: por cada (SKU, pallet) activo, cuántas cajas caben
+  de UNA vez en su mejor cuboide (tope de capa, tope de PH, profundidad Z)
+  -reusa `_mejor_cuboide_para_sku`/`_necesita_columna_nueva` tal cual, sin
+  tocarlas.
+- `_resolver_pallets_backtracking`: DFS con cota superior admisible
+  (volumen libre / volumen mínimo de caja pendiente), presupuesto de
+  NODOS contados (no de reloj, reproducible), shortlist top-K por nodo. La
+  primera rama de cada nodo reproduce la prioridad exacta del greedy -el
+  incumbente inicial nunca es peor que hoy.
+- `_empacar_n_pallets` (wrapper): corre el greedy, corre el backtracking
+  desde cero, se queda con el que coloque MÁS cajas. Mismo contrato de
+  firma/retorno -`armar_pallets_bloques` no cambió ni una línea.
+
+### Calibración (medida contra el caso real, no adivinada)
+- Con 1 sola opción de cuboide por SKU (su mejor, igual que el greedy),
+  `COMBINACION_PALLETS_SHORTLIST_K=8`, `COMBINACION_PALLETS_MAX_NODOS=30000`:
+  **Pallet 1 sube de 67 a 78 de 93 cajas** en ~28s, 0 violaciones
+  geométricas. Electrolight (el más golpeado) llega a **25/25, completo**
+  (antes 18/25). Quedan cortos: "Ron Flor de Caña" ya no aparece entre los
+  incompletos (llega a demanda completa vía otro Licor con más margen),
+  pero PO Galleta Vainilla, Gomas Ambrosito, PO Club Social, Piscano Sour
+  Limón y Maniak Surtido quedan con 15 cajas sin ubicar entre los 5.
+- **Probado explícitamente y descartado**: subir `COMBINACION_PALLETS_
+  OPCIONES_POR_SKU` a 2 o 3 (ofrecerle a cada SKU más de 1 cuboide
+  candidato por nodo, no solo el mejor) -la intuición era que así el DFS
+  podría explorar "SKU X cede su mejor columna para liberarla" de forma
+  más rica. Resultado real: **empeoró a 71/93**, con el MISMO o más
+  presupuesto de nodos (100,000) -el árbol se diluye entre más ramas por
+  nodo sin encontrar mejores combinaciones, en vez de concentrar la
+  búsqueda en qué SKU gana cada columna. Se descartó y se dejó en 1
+  (default validado), documentado en el propio código para no repetirlo.
+- Subir el presupuesto de nodos de 30,000 a 100,000 y 200,000 (con 1 sola
+  opción por SKU) **no cambió el resultado** (78/93 en los tres casos) -el
+  DFS converge antes de agotar el presupuesto; el techo actual no es de
+  búsqueda, es de qué combinaciones puede siquiera generar `_candidatos_
+  lote` tal como está diseñado hoy.
+
+### Los 15 restantes: mezcla de piso genuinamente agotado y datos, no de búsqueda
+Se revisó si los 5 SKUs que quedan cortos (PO Galleta Vainilla, Gomas
+Ambrosito, PO Club Social, Piscano Sour Limón, Maniak Surtido) tienen el
+mismo problema de dato mal etiquetado que Electrolight. Maniak y PO Club
+Social coinciden exacto entre el Maestro y la geometría reconciliada (no
+es un problema de dato). Piscano Sour Limón sí muestra una brecha real
+(Maestro declara 14 cajas/cama, la reconciliación calcula 13 -mínima,
+nada comparable a la de Electrolight) y su demanda pendiente (3 cajas) es
+bien menor a su `Cajas_Cama_Efectivo` -o sea, su problema tampoco es de
+capacidad por capa, es 100% de competencia por piso en las últimas
+posiciones libres del pallet, exactamente el tipo de problema que este
+solver ataca pero con presupuesto/diseño de candidatos que hoy no alcanza
+a resolver del todo.
+
+### Verificación
+- Suite completa: **158/158 pasan** (155 preexistentes + 3 nuevos:
+  `test_n_pallets_backtracking_nunca_peor_que_el_greedy`,
+  `test_pallets_objetivo_respeta_cantidad_exacta_y_reporta_sin_colocar`,
+  `test_snapshot_restaurar_estado_pallets_es_identidad` -el último fija
+  como contrato el bug de undo ya descrito, para que un cambio futuro que
+  lo reintroduzca falle ruidosamente acá).
+- `Cubicaje18.07.2026.xlsx` (9 CDs reales, pipeline completo, camino
+  `_empacar` SIN `pallets_objetivo`): **sigue en 54 pallets, sin ningún
+  cambio** -confirmado que este camino nunca se toca desde el solver
+  nuevo.
+- Pallet 1 forzado a 1 pallet real (`pallets_objetivo=1`): **67 -> 78 de
+  93 cajas**, 0 violaciones geométricas, altura 210.92cm (dentro del tope
+  de 215). No se prometió ni se alcanzó 93/93 -se documenta el resultado
+  real, no una promesa.
+
+### Estado final y qué queda pendiente
+El código quedó shippeado (`_empacar_n_pallets_greedy` + `_resolver_
+pallets_backtracking` + wrapper `_empacar_n_pallets`, todo en
+`src/packing_bloques.py`). Para acercarse más a 93/93 en una sesión
+futura, dos caminos separados, no mutuamente excluyentes:
+1. **Mejorar `_candidatos_lote`** sin repetir el error de subir `OPCIONES_
+   POR_SKU` a ciegas -por ejemplo, generar más opciones SOLO para los SKUs
+   que ya muestran señal de estar compitiendo por piso (`_necesita_
+   columna_nueva` verdadero), no para todos por igual.
+2. **Corregir el dato fuente de Piscano Sour Limón** (y revisar el resto
+   del Maestro de este cliente por el mismo patrón que Electrolight -Largo/
+   Ancho/Alto posiblemente invertidos en algunos SKUs) -aparte del
+   algoritmo, ya se sabe que al menos 1 SKU más tiene esta clase de
+   problema.
+`pallets_objetivo` sigue sin ningún llamador de producción -conectarlo al
+pipeline real por CD (mencionado como pendiente ya en una sección anterior
+de este archivo) sigue siendo una decisión de producto aparte, no tomada
+en esta sesión.
+
+## LNS (ruina y reconstrucción) -shippeado, Pallet 1 de 78 a 84/93
+[misma sesión, pedido explícito del usuario: "Encara el LNS"] El intento 1
+del DFS solo (arriba) mide con datos reales que 78/93 es un ÓPTIMO LOCAL,
+no un techo físico: el pallet resultante usa apenas 62% del volumen total
+del presupuesto (1.48M de 2.4M cm³), y las 15 cajas restantes solo
+necesitan 402,000 cm³ -menos de la mitad de lo que sobra (917,000 cm³
+libres). El problema es de búsqueda, no de capacidad -confirma que valía
+la pena encarar LNS en vez de seguir ajustando `_candidatos_lote` (2
+intentos ya descartados en la sección anterior).
+
+### Diseño
+`_lns_mejorar_pallets` (nuevo, `src/packing_bloques.py`) parte del
+incumbente YA construido por el DFS (no arranca de cero) y, en cada
+iteración: elige al azar `COMBINACION_PALLETS_LNS_SKUS_A_ROMPER` SKUs con
+algo puesto, deshace TODAS sus columnas (`_romper_skus_con_cascada`, ver
+abajo), y corre el mismo `_resolver_pallets_backtracking` de siempre
+-reutilizado tal cual, con un presupuesto de nodos más chico
+(`COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION=3000`, porque acá se
+llama muchas veces)- sobre la demanda liberada + la que ya estaba
+pendiente. Si el total colocado mejora, se queda; si no, revierte al mejor
+incumbente conocido con el mismo mecanismo de undo del DFS
+(`_snapshot_estado_pallets`/`_restaurar_estado_pallets`). Corta por
+iteraciones sin mejora consecutivas o por tope de iteraciones. RNG con
+semilla fija (reproducible).
+
+### Bug real encontrado y corregido en el camino: cajas flotando
+La primera versión de la "ruina" sacaba SOLO las torres de los SKUs
+elegidos al azar -pero si otra torre (de un SKU DISTINTO, no elegido)
+estaba apoyada justo encima de una columna removida, se quedaba flotando.
+Se encontró corriendo el LNS contra Pallet 1 de verdad (`validar_
+geometria_v5` reportó "torre 23626@(...) no tiene soporte real en toda su
+huella -caja flotando"), no en un test -el mismo tipo de bug real que
+motivó la arquitectura MaxRects original de este archivo. Fix:
+`_romper_skus_con_cascada` (extraída aparte, testeable) remueve en
+CASCADA -después de sacar las elegidas, cualquier torre que quede sin
+soporte real en TODA su huella (mismo criterio exacto que `validacion_
+v5._area_cubierta_por_soporte`, el que usa el gate de geometría) también
+se saca, y se repite hasta que no quede ninguna inestable (puede haber
+cadenas de más de 1 nivel). Nuevo test de regresión: `test_romper_skus_
+con_cascada_saca_tambien_lo_que_queda_flotando` (fija el contrato: una
+torre apoyada se saca en cascada, una torre independiente no se toca).
+
+### Multi-reinicio: una sola semilla no alcanza
+Probado con 17 semillas distintas contra Pallet 1 (antes del fix de
+cascada, mismo patrón después): el resultado varía entre 78 (la mayoría,
+mismo óptimo local del DFS solo) y 83-84 (varias). Una semilla fija no es
+confiable -`_empacar_n_pallets` ahora prueba `COMBINACION_PALLETS_LNS_
+REINICIOS=5` semillas distintas (derivadas de `cd`+`n_pallets`+número de
+intento, reproducibles) desde el MISMO punto de partida (el incumbente del
+DFS) y se queda con el mejor.
+
+### Verificación
+- Suite completa: **159/159 pasan** (158 previos + 1 nuevo, el de la
+  cascada de soporte).
+- `Cubicaje18.07.2026.xlsx` (9 CDs reales): **sigue en 54 pallets, sin
+  cambios** -mismo argumento que antes, este camino no se toca.
+- Pallet 1 forzado a 1 pallet real: **78 -> 84 de 93 cajas**, **0
+  violaciones geométricas**, altura 212.42cm. Solo quedan 2 SKUs
+  incompletos (antes 5): "Ron Barcelo" 12/20 y "Gomas Ambrosito" 2/3
+  -Piscano Sour Limón, PO Club Social, Maniak Surtido y PO Galleta
+  Vainilla, que antes quedaban cortos, ahora completos.
+- **Costo real, sin maquillar**: ~5.4 minutos para Pallet 1 (vs ~30s del
+  DFS solo) -el LNS corre el backtracking de reconstrucción muchas veces
+  (hasta 200 iteraciones x 5 semillas), cada una con su propia cascada de
+  verificación de soporte. Aceptable hoy porque `pallets_objetivo` sigue
+  sin ningún llamador de producción (mismo argumento de aislamiento que
+  justificó encarar esto); si algún día se conecta al pipeline real por
+  CD, este costo por pallet habría que revisarlo (bajar reinicios/
+  iteraciones, o paralelizar semillas).
+
+### Qué queda pendiente
+Quedan 9 cajas sin ubicar en 2 SKUs. No se investigó todavía si es
+competencia genuina de piso (lo más probable, dado que 78->84 ya fue
+puramente de búsqueda, sin tocar ningún dato) o si hay algún problema de
+dato adicional como el de Piscano. Subir `COMBINACION_PALLETS_LNS_
+REINICIOS` más allá de 5, o generar más diversidad de vecindario (variar
+`SKUS_A_ROMPER` entre 1-3 en vez de fijo en 2), son las próximas perillas
+obvias si se decide seguir apretando -no probadas todavía.
+
+## `pallets_objetivo` conectado al pipeline real (end-to-end)
+[misma sesión, pedido explícito del usuario: "conectalo al pipeline real"]
+Hasta acá `pallets_objetivo` (y por lo tanto el DFS+LNS de arriba) solo se
+podía usar llamando a `armar_pallets_bloques` directamente -sin ningún
+llamador de producción. Esta sección lo conecta de punta a punta, tal
+como quedó diseñado en la sección "Pendiente para la próxima sesión" de
+más arriba en este archivo: "el usuario decidió que sea un input que él
+sube, no algo calculado con el factor 1.4".
+
+### Diseño
+Hoja OPCIONAL nueva **"Pallets_Objetivo"** (columnas `CD`, `Pallets_
+Objetivo`) en el mismo Excel de siempre -si no está, CERO cambio de
+comportamiento (mismo `_empacar` de siempre para todos los CDs). Si está,
+cada CD que lista fuerza `armar_pallets_bloques(..., pallets_objetivo=N)`
+para ESE CD -el resto de los CDs del mismo archivo sigue sin cambios.
+
+Cadena completa: `src/validacion.py::cargar_pallets_objetivo` (nuevo, lee
+la hoja opcional, devuelve `dict[CD, int] | None`) -> `src/pipeline.py::
+ejecutar_pipeline`/`ejecutar_desde_archivo` (nuevo parámetro opcional
+`pallets_objetivo_por_cd`) -> `src/pipeline_sku_bloque.py::ejecutar_core_
+sku_bloque` (mismo parámetro, se lo pasa a `armar_pallets_bloques` por CD
+vía `.get(cd)` -`None` para los CDs no listados, comportamiento idéntico
+a hoy) -> `app.py` (detecta la hoja automáticamente en el Excel
+combinado, o en `Envios_Julio` en el modo de 3 archivos separados; avisa
+en pantalla qué CDs quedaron con cantidad fija antes de procesar, porque
+el costo real -ver abajo- amerita avisar antes, no después).
+`src/template.py::construir_template()` ahora incluye esta hoja de
+ejemplo (borrable) con instrucciones.
+
+### Verificación
+- Suite completa: **164/164 pasan** (159 previos + 5 nuevos en
+  `tests/test_pallets_objetivo.py` -lectura de la hoja opcional con/sin
+  ella, no-regresión cuando no se usa, forzado real de cantidad exacta, y
+  que un CD sin cantidad fija no se ve afectado aunque otro CD del mismo
+  archivo sí la tenga. Todos usan demanda chica que el motor exacto
+  resuelve sin LNS -rápidos, no dependen del tiempo real del solver).
+- `Cubicaje18.07.2026.xlsx` (9 CDs reales, SIN hoja Pallets_Objetivo):
+  **sigue en 54 pallets, sin cambios** -confirma que la conexión es
+  puramente aditiva.
+- End-to-end real con Pallet 1 (Excel armado con las 4 hojas, incluida
+  `Pallets_Objetivo` con BK34=1, corrido con `ejecutar_desde_archivo` -no
+  llamando a `armar_pallets_bloques` a mano como en las secciones
+  anteriores): confirmado que reconstruye el mismo pallet (altura
+  212.4cm, 21 líneas, coincide con el resultado ya validado de la sección
+  de LNS) -la conexión de punta a punta funciona con el pipeline real, no
+  solo con las funciones internas.
+- Reutilizar el mismo buffer de archivo dos veces (`cargar_hojas` y
+  después `cargar_pallets_objetivo` sobre el mismo objeto, sin `seek`
+  manual entre medio -el flujo real de `app.py`) confirmado que funciona:
+  `pd.ExcelFile`/`openpyxl` hacen sus propios seeks absolutos al abrir el
+  zip, no dependen de la posición del cursor del llamador.
+
+### Costo real -avisar ANTES de correr, no descubrirlo después
+Sigue vigente el costo documentado en la sección de LNS (~5 minutos por
+pallet cuando el barrido exacto no completa toda la demanda de una). Para
+un archivo con varios CDs y varios pallets fijos cada uno, esto puede
+sumar bastante tiempo total (ej. el dataset histórico de 50 pallets
+mencionado más arriba en este archivo, si se le pusiera `pallets_
+objetivo` a los 9 CDs, podría tardar horas, no minutos) -por eso `app.py`
+ahora muestra un aviso explícito con la lista de CDs afectados ANTES de
+que el usuario apriete "Procesar", en vez de que se entere recién cuando
+ve que no termina. No se implementó ningún límite de tiempo global ni
+paralelización de CDs/semillas en esta sesión -sigue siendo la perilla
+obvia si el uso real lo pide.
+
+## Hoja "Cajas_No_Colocadas" -reporte de demanda que no entró en ningún pallet
+[misma sesión, pedido explícito del usuario: "quiero que las cajas de
+cada cd que no logre cubicar la ponga en una hoja de resultado... igual
+que el detalle por cd y sku y cantidad"]
+
+### Bug real encontrado y corregido: `sin_colocar` se perdía en silencio
+`armar_pallets_bloques` ya calculaba `sin_colocar` (SKU -> cantidad,
+cuando un SKU no encuentra lugar ni en un pallet vacío, o cuando los N
+pallets fijos de `pallets_objetivo` genuinamente se llenan) y lo guardaba
+en `pallet.metadata["sin_colocar"]` de un `PalletV5` -pero
+`_palletv5_a_pallet` (`pipeline_sku_bloque.py`) solo copiaba `torres`/
+`cajas_bat` al `Pallet` final, nunca `metadata`. Esa demanda desaparecía
+entre el motor de armado y el Excel/la app -sin ningún aviso, ni en el
+Plan de Picking ni en ningún otro lado.
+
+### Fix
+- `exportar.construir_cajas_no_colocadas_df(pallets_v5, info_sku)`
+  (nuevo): recorre `pallet.metadata["sin_colocar"]` de todos los
+  `PalletV5`, arma filas `CD/SKU/Descripcion/Categoria/Cajas_No_
+  Colocadas` (con descripción/categoría desde `info_sku`, mismo patrón
+  que el resto de `exportar.py`), agrupa por si el mismo SKU quedara
+  marcado en más de un pallet del mismo CD.
+- `models.ResultadoPipeline.cajas_no_colocadas_df` (nuevo campo opcional,
+  mismo patrón que `auditoria_geometrica_df`/`benchmark_df`) ->
+  `pipeline_sku_bloque.ejecutar_core_sku_bloque` lo calcula y lo agrega
+  al resultado.
+- `exportar_workbook`: nueva hoja **"Cajas_No_Colocadas"** en el Excel
+  exportado -solo se agrega si hay algo que reportar (un archivo sin
+  faltantes no muestra una hoja vacía).
+- `app.py`: nuevo tab **"⚠ Cajas No Colocadas"** (con `st.success` si no
+  hay faltantes, `st.warning` + tabla si los hay) y una 6ª métrica
+  "Cajas no colocadas" arriba de los tabs.
+
+### Verificación
+- Suite completa: **168/168 pasan** (164 previos + 4 nuevos en
+  `tests/test_cajas_no_colocadas.py`: DF vacío sin faltantes, `Pallets_
+  Objetivo` insuficiente reporta el faltante real por CD/SKU, la hoja
+  del Excel aparece solo cuando hace falta, y agrupación correcta en
+  `construir_cajas_no_colocadas_df` aislado).
+- `Cubicaje18.07.2026.xlsx`: sigue en 54 pallets, sin cambios.
+
+### Bug preexistente encontrado en el camino (NO corregido, fuera de
+alcance de este pedido) -derivado a una tarea aparte
+Al armar un test con una caja más grande que el propio pallet en ambas
+orientaciones (120x100), la pipeline completa explota con `KeyError:
+'Fuente_Geometria'` en `pipeline_sku_bloque.py:172` -pasa solo cuando
+NINGÚN SKU del batch necesita reconciliación geométrica excepto ese
+(dataset chico/sintético, no se había visto con datasets reales más
+variados). Hay un warning de pandas justo antes ("'and' operations
+between boolean dtype and str son deprecated") que sugiere que
+`Requiere_Revision_Geometria` termina con dtype mixto en ese caso
+puntual, y eso arrastra a `auditoria_geometrica_df` a perder columnas.
+No se investigó la causa raíz en `reconciliacion_geometrica.py` -se
+delegó como tarea aparte (no bloquea el pedido de esta sesión: los tests
+de "no colocadas" usan el camino real de `Pallets_Objetivo` insuficiente,
+que no toca este bug).
+
+## Paralelización real: LNS por semilla + CD por CD
+[misma sesión, pedido explícito del usuario tras ver que un cubicaje real
+de 12 CDs/42 pallets fijos iba a tardar horas: "como podemos hacer para
+que no demore tanto"]
+
+### Nivel 1: las 5 semillas del LNS, en procesos separados
+`_lns_una_semilla_worker` (nuevo, `packing_bloques.py`) corre UNA semilla
+de `_lns_mejorar_pallets` hasta el final -función de nivel de módulo,
+necesaria para que `ProcessPoolExecutor` pueda "picklearla". `_empacar_n_
+pallets` ahora manda las `COMBINACION_PALLETS_LNS_REINICIOS` semillas a un
+`ProcessPoolExecutor` (contexto `fork`, no `spawn` -evita reimportar
+`__main__` en cada worker, que rompería la app de Streamlit/pytest) en vez
+de correrlas una tras otra, y se queda con la mejor. Cada semilla es 100%
+independiente (mismo punto de partida, sin estado compartido) -paralelizar
+no cambia el resultado, solo el tiempo de reloj.
+**Verificado contra Pallet 1: mismo resultado exacto (84/93, 0
+violaciones), 324s -> 118.5s (~2.7x)** en una Mac de 10 núcleos. No es un
+5x limpio porque el DFS previo (~30s) no se paraleliza, y las 5 semillas
+no tardan lo mismo entre sí (el tiempo de pared lo marca la más lenta).
+
+### Nivel 2: los CDs, en procesos separados
+Verificado con `grep -rn "contador\[0\]"`: TODOS los IDs de pallet son
+`PV5-{cd}-NNN` -el contador nunca necesitó ser global entre CDs, cada CD
+puede tener el suyo propio arrancando en 0 sin ningún riesgo de colisión.
+Eso hizo trivial paralelizar también el loop de CDs: `_procesar_cd` (nuevo,
+`pipeline_sku_bloque.py`) hace todo el trabajo de UN CD (armar pallets +
+BAT real + estabilidad) con su propio contador local, y `ejecutar_core_
+sku_bloque` manda hasta `PIPELINE_MAX_PROCESOS_CD` (=núcleos disponibles)
+CDs a la vez a otro `ProcessPoolExecutor` -solo si hay 2+ CDs (con 1 solo
+CD no hay nada que paralelizar a este nivel, se corre directo).
+
+**Anidar pools -evitado a propósito**: si cada uno de los N CDs en
+paralelo ADEMÁS abriera su propio pool de 5 procesos para el LNS, serían
+N×5 procesos peleando por los mismos núcleos reales -satura en vez de
+acelerar. Por eso `_procesar_cd` siempre llama a `armar_pallets_bloques`
+con `paralelo_lns=False` (LNS secuencial adentro) cuando hay 2+ CDs -el
+paralelismo real pasa a vivir en el nivel de CD, no en el de semilla, en
+ese caso. Con 1 solo CD (ej. Pallet 1 forzado con `pallets_objetivo=1`),
+no hay nivel de CD que paralelizar, así que ahí SÍ se usa
+`paralelo_lns=True` (nivel 1).
+
+### Verificación
+- Suite completa: **169/169 pasan** (168 previos + 1 nuevo -no se agregó
+  ningún test nuevo de paralelismo en sí, los existentes ya ejercitan el
+  camino de 2+ CDs vía `test_otro_cd_sin_pallets_objetivo_sigue_como_
+  siempre`). **La suite completa bajó de ~113s a ~55s** -el dataset de
+  referencia (9 CDs, sin `Pallets_Objetivo`) ya se beneficia del
+  paralelismo por CD aunque nunca use LNS.
+- `Cubicaje18.07.2026.xlsx`: sigue en 54 pallets, sin cambios -mismo
+  resultado, la mitad del tiempo.
+- Pallet 1 (1 solo CD, `pallets_objetivo=1`): 84/93, 0 violaciones,
+  324s -> 118.5s.
+
+### Riesgo conocido, no probado a fondo en esta sesión
+`multiprocessing.get_context("fork")` en macOS puede, en teoría, chocar
+con librerías que ya inicializaron hilos/frameworks nativos ANTES del
+fork (el clásico crash `objc[PID]: ... may have been in progress...`).
+No se vio ningún crash en las corridas de esta sesión (suite completa +
+Pallet 1 + el cubicaje real de 12 CDs), pero si algún día aparece un
+crash rarísimo y no reproducible en un entorno productivo distinto (ej.
+un contenedor Linux con otra configuración), esta es la primera sospecha
+a revisar -la mitigación estándar sería forzar `spawn` ahí específicamente
+a costa de perder algo de velocidad por el overhead de reimportar.
+
+## Tope de reloj real en el backtracking/LNS + unidades en Cajas_No_Colocadas
+[mismo hilo, corrida real contra el archivo corregido del usuario: 12
+CDs, `Pallets_Objetivo` sumando 42 pallets en total] El primer corrido
+real con `Pallets_Objetivo` (no solo Pallet 1) quedó **colgado más de 21
+horas** -se mató manualmente. Causa raíz: `COMBINACION_PALLETS_MAX_NODOS`
+y `COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION` acotan la CANTIDAD de
+nodos del DFS, no lo que tarda cada uno. El objetivo fijo (42) resultó
+estar sistemáticamente por debajo del óptimo abierto de CADA uno de los 12
+CDs (59 pallets en total sin forzar nada) -con ese nivel de compresión
+exigida, el estado queda mucho más fragmentado que en Pallet 1 (el único
+caso medido hasta entonces) y el costo POR NODO de `_candidatos_lote`/el
+snapshot se dispara -multiplicado por hasta 5 reinicios x 200 iteraciones
+x 3,000 nodos de reconstrucción, cualquier CD grande (`Pallets_Objetivo`
+alto, ej. BK79=11 o BK80=8) podía tardar horas.
+
+**Fix**: `_resolver_pallets_backtracking` y `_lns_mejorar_pallets` ahora
+aceptan `limite_tiempo` -un deadline ABSOLUTO de `time.time()` (no
+`time.monotonic()`, para que sea comparable entre el proceso padre y los
+workers de `ProcessPoolExecutor` con contexto `fork`, que heredan el mismo
+reloj de pared). `_empacar_n_pallets` arma dos deadlines nuevos,
+`COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS` (20s) para el DFS inicial y
+`COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS` (40s) para TODA la fase de
+LNS (compartido entre las 5 semillas, en paralelo o secuencial según
+`paralelo_lns`) -~60s de tope duro por CD en el peor caso, contra horas
+antes. Al cortar por tiempo, el DFS/LNS simplemente devuelve el MEJOR
+incumbente encontrado hasta ese punto (mismo mecanismo que ya usaba el
+corte por nodos) -nunca falla, nunca tira excepción, nunca da un resultado
+inválido, solo puede llegar a un óptimo más lejano si el corte llega
+temprano.
+
+**Verificado contra el archivo real del usuario** (12 CDs, 42 pallets
+fijos): pipeline completo en **152s** (antes: colgado >21h). Resultado:
+**94.2% de fill rate** (4,074.2 de 4,323.2 cajas colocables en los 42
+pallets), por encima del 93% mínimo pedido por el usuario. Suite completa
+sigue en 169/169.
+
+**Pedido explícito del usuario** ("esas [cajas sobrantes] hay que hacer un
+cuadro aparte... la cd, el skus y las cajas y unidades que no pudieron ser
+cubicadas, eso se llama fill rate"): `construir_cajas_no_colocadas_df`
+(`exportar.py`) ahora también calcula `Unidades_No_Colocadas` (cajas ×
+`Unidades por caja` del Maestro, vía `info_sku`) -mismo tratamiento en
+`_demanda_excluida_geometria` (`pipeline_sku_bloque.py`) para la demanda
+excluida por geometría (V4), que se suma a la misma hoja. Cuando el SKU no
+tiene `Unidades por caja` disponible (ej. la caja física de consolidación
+`__BAT__`, que no es un SKU real) queda `None`/`NaN` en vez de inventar un
+0 -el groupby final usa `sum(min_count=1)` para no confundir "no sé" con
+"cero".
+
+## Camino abierto (sin Pallets_Objetivo) también compacta cama por cama
+[pedido explícito del usuario: mandó una captura real de `PV5-BK31-002`
+(camino abierto) al lado de una foto de un pallet físico -en la captura
+quedaban franjas blancas enormes por cama, en la foto real cada cama queda
+tapizada de canto a canto mezclando SKUs antes de subir de nivel. "el 100%
+o lo maximo posible de la superficie de cada cama tiene que estar llena y
+cubicada para recien pasar a la siguiente cama"]
+
+**Diagnóstico**: el motor tiene DOS caminos de armado. `_empacar_n_pallets`
+(usado solo con `Pallets_Objetivo`) ya corre un backtracking real con poda
+más LNS multi-semilla -probado esta misma sesión (ver sección anterior) con
+tope de reloj real. Pero `_empacar` (el camino por defecto, sin
+`Pallets_Objetivo` -el que generó la captura del usuario) es un GREEDY
+PURO de 1 caja a la vez, sin vuelta atrás: coloca el ganador global de cada
+ronda y sigue, así que dos SKUs que podrían tapizar la misma cama de forma
+complementaria (uno el bloque grande, otro la franja que sobra) casi nunca
+calzan -sin backtracking, esa franja queda vacía para siempre en esa cama.
+El 99% del uso diario de la app (subir un Excel sin hoja `Pallets_Objetivo`)
+pasaba por este camino sin optimización de densidad.
+
+**Fix (`_empacar_optimizado`, nueva)**: `_empacar` YA coloca el 100% de la
+demanda por construcción (abre pallets hasta agotarla) -el problema no es
+demanda sin colocar, es que la reparte con huecos. Retar al backtracking+
+LNS YA probado a colocar la MISMA demanda en MENOS pallets que el greedy lo
+obliga a combinar SKUs dentro de la misma cama para que todo siga entrando
+-eso es, en este motor, lo mismo que "tapizar la cama antes de subir de
+nivel", y además reduce pallets reales. Búsqueda binaria acotada
+(`COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA`) de la N mínima que sigue
+colocando el 100% de la demanda original, reusando `_empacar_n_pallets` sin
+tocarla. Nunca puede terminar peor que el greedy solo (fallback explícito).
+
+**Costo de tiempo -3 rondas de medición real, no asumida:**
+1. Primera versión (búsqueda binaria de 4 pasos, cada uno con LNS
+   completo): la suite de tests pasó de 56s a **43 minutos**.
+2. `con_lns=False` para los pasos de sondeo (solo DFS, sin el multi-
+   reinicio de LNS -guardar LNS completo para una sola corrida final en la
+   N ganadora; nunca puede fallar ahí porque si el DFS solo ya alcanzaba el
+   100% en esa N, DFS+LNS también): bajó a **24 minutos**.
+3. Recortar `COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA` de 4 a 2 pasos +
+   tope de tiempo aparte más chico (5s) para los sondeos: bajó a
+   **14:56**. Mismo resultado de densidad en las 3 rondas (54->52 pallets
+   en el dataset de referencia, 85%->94% de aprovechamiento de altura,
+   pallets parciales 16->7) -los recortes de presupuesto de búsqueda no
+   sacrificaron calidad, solo tiempo de sondeos que no aportaban.
+
+**Verificado contra el archivo real completo del usuario** (12 CDs, Maestro
+completo, SIN `Pallets_Objetivo` -pipeline en producción real, CDs
+paralelos): **99.7s**, 100% de la demanda colocada (4,417.67 cajas), **56
+pallets totales** (contra 59 que daba el greedy solo en una corrida previa
+con MENOS demanda total -el fix comprime más pallets aun con más cajas que
+colocar). Ocupación de huella (`ocupacion_xy`) medida en los pallets reales
+del resultado: rango 78%-95%, la mayoría 85-90% -contra las franjas blancas
+visibles de la captura original. Suite completa: 169/169 sin regresiones.

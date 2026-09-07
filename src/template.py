@@ -31,6 +31,12 @@ UMA_EJEMPLO = pd.DataFrame(
     ]
 )
 
+PALLETS_OBJETIVO_EJEMPLO = pd.DataFrame(
+    [
+        {"CD": "BK34", "Pallets_Objetivo": 1},
+    ]
+)
+
 INSTRUCCIONES = pd.DataFrame(
     [
         {"Hoja": "Envios_Julio", "Columna": "CD", "Qué va aquí": "Código del Centro de Distribución destino (texto), ej. BK31."},
@@ -49,6 +55,9 @@ INSTRUCCIONES = pd.DataFrame(
         {"Hoja": "UMA", "Columna": "Largo de caja / Ancho de caja", "Qué va aquí": "Dimensiones de la base de la caja, en centímetros. El sistema prueba automáticamente ambas rotaciones sobre el pallet de 120x100 cm."},
         {"Hoja": "UMA", "Columna": "Alto de caja", "Qué va aquí": "Altura de la caja en centímetros. Máximo permitido: 180.08 cm."},
         {"Hoja": "UMA", "Columna": "Peso bruto por unidad", "Qué va aquí": "Peso en kg de una unidad suelta (se multiplica por 'Unidades por caja' de Maestro_SKUs para obtener el peso de la caja)."},
+        {"Hoja": "Pallets_Objetivo", "Columna": "(hoja opcional)", "Qué va aquí": "Borrar la hoja entera si no se necesita -sin ella, el sistema abre tantos pallets como haga falta (comportamiento de siempre). Si se incluye un CD acá, TODA su demanda se reparte en exactamente esa cantidad de pallets -viene de la planificación externa, el sistema no la calcula. OJO: puede tardar varios minutos por pallet listado (motor exacto + ruina-y-reconstrucción)."},
+        {"Hoja": "Pallets_Objetivo", "Columna": "CD", "Qué va aquí": "Código del CD, igual que en Envios_Julio."},
+        {"Hoja": "Pallets_Objetivo", "Columna": "Pallets_Objetivo", "Qué va aquí": "Cantidad FIJA de pallets para ese CD (entero, ej. 5)."},
     ]
 )
 
@@ -66,6 +75,7 @@ def construir_template(ruta_o_buffer=None):
         ENVIOS_EJEMPLO.to_excel(writer, sheet_name="Envios_Julio", index=False)
         MAESTRO_EJEMPLO.to_excel(writer, sheet_name="Maestro_SKUs", index=False)
         UMA_EJEMPLO.to_excel(writer, sheet_name="UMA", index=False)
+        PALLETS_OBJETIVO_EJEMPLO.to_excel(writer, sheet_name="Pallets_Objetivo", index=False)
 
         libro = writer.book
         encabezado_relleno = PatternFill(start_color="2A78D6", end_color="2A78D6", fill_type="solid")
@@ -76,6 +86,7 @@ def construir_template(ruta_o_buffer=None):
             ("Envios_Julio", ENVIOS_EJEMPLO),
             ("Maestro_SKUs", MAESTRO_EJEMPLO),
             ("UMA", UMA_EJEMPLO),
+            ("Pallets_Objetivo", PALLETS_OBJETIVO_EJEMPLO),
         ):
             hoja = libro[nombre_hoja]
             for celda in hoja[1]:

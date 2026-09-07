@@ -3,7 +3,7 @@ import streamlit as st
 from src.exportar import exportar_workbook
 from src.pipeline import ejecutar_pipeline
 from src.template import construir_template
-from src.validacion import cargar_hojas
+from src.validacion import cargar_hojas, cargar_pallets_objetivo
 from visualizacion import VISTAS_3D, dibujar_cama, dibujar_pallet, dibujar_pallet_v5_3d
 
 st.set_page_config(page_title="Agente Cubicador", layout="wide")
@@ -35,11 +35,13 @@ modo = st.radio(
 )
 
 envios = maestro = uma = None
+pallets_objetivo_por_cd = None
 
 if modo.startswith("Un solo"):
     archivo = st.file_uploader("Excel combinado", type=["xlsx"])
     if archivo is not None:
         envios, maestro, uma = cargar_hojas(archivo)
+        pallets_objetivo_por_cd = cargar_pallets_objetivo(archivo)
 else:
     col1, col2, col3 = st.columns(3)
     archivo_envios = col1.file_uploader("Envios_Julio", type=["xlsx"])
@@ -51,10 +53,19 @@ else:
         envios = pd.read_excel(archivo_envios)
         maestro = pd.read_excel(archivo_maestro)
         uma = pd.read_excel(archivo_uma)
+        pallets_objetivo_por_cd = cargar_pallets_objetivo(archivo_envios)
+
+if pallets_objetivo_por_cd:
+    st.info(
+        f"Cantidad de pallets fija (Pallets_Objetivo) detectada para {len(pallets_objetivo_por_cd)} CD(s): "
+        f"{pallets_objetivo_por_cd}. Estos CDs pueden tardar varios minutos cada uno (el motor exacto "
+        "corre backtracking + ruina-y-reconstrucción para aprovechar cada pallet al máximo, ver "
+        "Parches/v5/PATCH_LOG.md)."
+    )
 
 if envios is not None and st.button("Procesar", type="primary"):
     with st.spinner("Ejecutando el motor de optimización..."):
-        st.session_state["resultado"] = ejecutar_pipeline(envios, maestro, uma)
+        st.session_state["resultado"] = ejecutar_pipeline(envios, maestro, uma, pallets_objetivo_por_cd)
 
 resultado = st.session_state.get("resultado")
 
@@ -64,8 +75,14 @@ if resultado is None:
 
 pallets = resultado.pallets
 df = resultado.plan_picking_df
+cajas_no_colocadas_df = resultado.cajas_no_colocadas_df
+cajas_no_colocadas_total = (
+    int(cajas_no_colocadas_df["Cajas_No_Colocadas"].sum())
+    if cajas_no_colocadas_df is not None and not cajas_no_colocadas_df.empty
+    else 0
+)
 
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric("Pallets totales", len(pallets))
 col2.metric("Homogéneos (base 1 SKU)", sum(1 for p in pallets if p.tipo.startswith("Homogéneo")))
 col3.metric("Mixtos", sum(1 for p in pallets if p.tipo == "Mixto"))
@@ -74,9 +91,10 @@ col5.metric(
     "Cajas extra por consolidación",
     int(df["Cajas_Extra_Consolidacion"].sum()) if not df.empty else 0,
 )
+col6.metric("Cajas no colocadas", cajas_no_colocadas_total)
 
-tab_plan, tab_log, tab_resumen, tab_inspector = st.tabs(
-    ["Plan de Picking", "Log de Validación", "Resumen por CD", "Inspector de Pallets"]
+tab_plan, tab_log, tab_resumen, tab_no_colocadas, tab_inspector = st.tabs(
+    ["Plan de Picking", "Log de Validación", "Resumen por CD", "⚠ Cajas No Colocadas", "Inspector de Pallets"]
 )
 
 with tab_plan:
@@ -87,6 +105,17 @@ with tab_log:
 
 with tab_resumen:
     st.dataframe(resultado.resumen_cd_df, use_container_width=True)
+
+with tab_no_colocadas:
+    if cajas_no_colocadas_df is None or cajas_no_colocadas_df.empty:
+        st.success("Toda la demanda se colocó -no quedaron cajas sin cubicar.")
+    else:
+        st.warning(
+            f"{cajas_no_colocadas_total} cajas no entraron en ningún pallet -detalle por CD y SKU abajo. "
+            "Esto pasa cuando un CD tiene `Pallets_Objetivo` fijo y esa cantidad de pallets genuinamente "
+            "no alcanza para toda la demanda."
+        )
+        st.dataframe(cajas_no_colocadas_df, use_container_width=True)
 
 with tab_inspector:
     if not pallets:
