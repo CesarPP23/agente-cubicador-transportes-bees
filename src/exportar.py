@@ -242,6 +242,49 @@ def construir_cajas_no_colocadas_df(
     return df
 
 
+def construir_demanda_cigarros_df(
+    df_bat: pd.DataFrame, cajas_bat_por_cd: dict[str, list], nombres_cd: dict[str, str] | None = None
+) -> pd.DataFrame:
+    """[regla explícita del usuario, sept-2026] Cigarros/vapes nunca entran
+    al cubicaje (ver src/bat.py) -esta hoja es el único lugar del Excel
+    final donde esa demanda aparece: por CD/SKU, con la demanda real en
+    unidades (no la redondeada a caja completa, que infla ~3.8x) y cuántas
+    cajas físicas de consolidación (config.CAJA_BAT_*, hasta 1000 unidades
+    c/u) hace falta armar por CD para que el operario sepa qué y cuánto
+    consolidar."""
+    nombres_cd = nombres_cd or {}
+    columnas = [
+        "CD", "Nombre_CD", "SKU", "Descripcion", "Unidades_Demanda", "Unidades_Por_Caja",
+        "Cajas_Teoricas", "Total_Unidades_CD", "Cajas_Consolidacion_Necesarias_CD",
+    ]
+    if df_bat is None or df_bat.empty:
+        return pd.DataFrame(columns=columnas)
+
+    col_unidades = "Demanda_Unidades_Oficial" if "Demanda_Unidades_Oficial" in df_bat.columns else "Unidades"
+    col_uxc = "Unidades_por_Caja" if "Unidades_por_Caja" in df_bat.columns else "Unidades por caja"
+
+    filas = []
+    for cd, grupo in df_bat.groupby("CD"):
+        total_unidades_cd = grupo[col_unidades].sum()
+        n_cajas_cd = len(cajas_bat_por_cd.get(cd, []))
+        for _, fila in grupo.iterrows():
+            filas.append(
+                {
+                    "CD": cd,
+                    "Nombre_CD": nombres_cd.get(cd),
+                    "SKU": fila["SKU"],
+                    "Descripcion": fila.get("Descripción", ""),
+                    "Unidades_Demanda": fila[col_unidades],
+                    "Unidades_Por_Caja": fila[col_uxc],
+                    "Cajas_Teoricas": fila.get("Cajas Teóricas"),
+                    "Total_Unidades_CD": total_unidades_cd,
+                    "Cajas_Consolidacion_Necesarias_CD": n_cajas_cd,
+                }
+            )
+    df = pd.DataFrame(filas, columns=columnas)
+    return df.sort_values(["CD", "SKU"]).reset_index(drop=True)
+
+
 def construir_estabilidad_df(pallets_v5: list[PalletV5]) -> pd.DataFrame:
     """[V5-P13] Exporta lo que P11 calculaba pero todavía no exportaba
     (informativo, nunca bloquea -ver src/estabilidad.py)."""
@@ -287,6 +330,11 @@ def exportar_workbook(resultado: ResultadoPipeline, ruta_o_buffer=None):
         # hoja vacía y generar confusión.
         if resultado.cajas_no_colocadas_df is not None and not resultado.cajas_no_colocadas_df.empty:
             resultado.cajas_no_colocadas_df.to_excel(writer, sheet_name="Cajas_No_Colocadas", index=False)
+        # [regla explícita del usuario] Cigarros/vapes -demanda que nunca
+        # entra al cubicaje, ver src/bat.py- solo se agrega si hay algo que
+        # reportar, mismo criterio que Cajas_No_Colocadas arriba.
+        if resultado.demanda_cigarros_df is not None and not resultado.demanda_cigarros_df.empty:
+            resultado.demanda_cigarros_df.to_excel(writer, sheet_name="Cigarros", index=False)
         # [V5-P13] Hojas propias del core columnar -solo existen cuando el
         # pipeline corrió con PACKER_VERSION="V5" (`pallets_v5` viene None
         # en V4, ver models.ResultadoPipeline).

@@ -3,6 +3,18 @@ import unicodedata
 PALLET_LARGO = 120
 PALLET_ANCHO = 100
 
+# [Refinamiento 'grandes primero' -pedido explícito del usuario tras
+# comparar el cubicaje real de BK31 (Pallets_Objetivo=1) contra lo armado a
+# mano: a mano se reservó el bloque grande de Picaras (39x30, footprint más
+# grande de la demanda) ANTES de acomodar el resto -el solver exacto no lo
+# hacía, y los SKUs de footprint chico (Molitalia 13x10, Pringles 22.5x13,
+# etc.) fragmentaban el piso antes de que a Picaras le tocara competir por
+# espacio, dejándola afuera aunque sobraba aire/altura en varias columnas.
+# Umbral de "SKU grande" como fracción del área del pallet -SOLO usado por
+# `packing_bloques._reservar_skus_grandes`, SOLO en el camino de
+# Pallets_Objetivo (nunca en el camino abierto por defecto, ver ahí mismo).
+PRIORIZAR_GRANDES_FRACCION_AREA_PALLET = 0.05
+
 # [V4 / Parches/v4_cubicaje_mixto/PARCHES_V4.md, P2] Sobresaliente aceptado:
 # cuánto puede volar la caja del borde del pallet. Confirmado con Omar. 2,5 cm
 # por lado es el límite del estándar logístico -más allá la caja pierde sobre
@@ -135,16 +147,40 @@ PESO_UMA_ES_POR_UNIDAD = False
 # simple en la mayoría de los casos). Ver src/reconciliacion_geometrica.py.
 RECONCILIACION_PESO_DELTA_DIMENSIONES = 1.0
 RECONCILIACION_PESO_ESPACIO_VACIO = 0.5
+
+# [Tolerancia de sobresaliente SOBRE SOPORTE -pedido explícito del usuario
+# tras la sesión BK31: a mano se aceptó un sobresaliente chico caso por caso
+# (Altomayo, 25.7cm de ancho sobre una base de Vino de 24cm, sobresale 1.7cm
+# sobre AIRE libre, sin tocar el borde exterior del pallet)] Distinto de
+# `SOBRESALIENTE_MAX_CM` arriba -ese es sobre el BORDE EXTERIOR del pallet
+# (120x100, decisión de negocio todavía sin confirmar para el packing real);
+# este es sobre el borde de la CAJA DE ABAJO que sostiene, mientras la caja
+# de arriba se mantenga dentro de PALLET_LARGO x PALLET_ANCHO -no cambia el
+# perfil exterior del pallet, así que no aplica la misma objeción de "perfil
+# irregular difícil de estibar". Apagada por defecto (0.0 = comportamiento
+# idéntico a hoy, sin cambio en los pallets ya verificados) -subirla a un
+# valor > 0 permite que una caja de
+# src.packing_bloques.CATEGORIAS_ORIENTACION_FLEXIBLE sobresalga hasta esta
+# cantidad de cm, en UN solo eje, SOLO sobre aire completamente libre (nunca
+# sobre otra caja, nunca fuera del pallet -ver `_cuboide_admite_candidato`/
+# `_solapa_con_torres` en packing_bloques.py).
+TOLERANCIA_OVERHANG_CM = 0.0
 RECONCILIACION_PESO_ASPECT_RATIO = 0.25
 
-# --- BAT (Cigarros/vapes) -- V3 ---------------------------------------------
+# --- BAT (Cigarros/vapes) -- V3, reestructurado [regla explícita del
+# usuario, sept-2026] --------------------------------------------------------
 # [V3 / sección 9, 11] Cigarros/vapes NUNCA se despachan por caja completa (el
-# 96% de sus líneas de demanda son fraccionarias) y el personal los consolida
-# en una caja física FIJA, separada del cubicaje normal, que se coloca como
-# remate encima de un pallet "host" ya armado -no se empaca con la geometría
-# de cada SKU. La identificación de qué es BAT es una categoría logística
-# EXPLÍCITA (no un valor numérico genérico compartido con otros productos).
+# 96% de sus líneas de demanda son fraccionarias) NI entran al cubicaje en lo
+# absoluto: el personal los consolida tal cual los arma el hub, en una caja
+# física FIJA por CD, y se despachan como un envío adicional aparte -no
+# compiten por espacio con el resto de la demanda ni ocupan pallet en
+# `Plan_Picking`/`Pallets_3D_Data` (ver src/bat.py, hoja "Cigarros" del
+# Excel final). La identificación de qué es BAT es explícita: la categoría
+# logística (CATEGORIAS_BAT) O la subcategoría del Maestro (SUBCATEGORIAS_BAT,
+# ej. "Vapes" declarados bajo otra categoría) -no un valor numérico genérico
+# compartido con otros productos.
 CATEGORIAS_BAT = ["Cigarros"]
+SUBCATEGORIAS_BAT = {"vapes"}
 
 CAJA_BAT_LARGO = 52.5
 CAJA_BAT_ANCHO = 34.0

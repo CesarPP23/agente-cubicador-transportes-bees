@@ -25,6 +25,11 @@ class TorreCandidate:
     cantidad_disponible: int
     peso_unitario: float
     fuente_geometria: str = ""
+    # [Refinamiento 'tolerancia de sobresaliente'] True solo para candidatas
+    # de generar_torres_candidatas_todas_orientaciones (Comestibles/Aseo/
+    # Cigarros) -config.TOLERANCIA_OVERHANG_CM (packing_bloques._cuboide_
+    # admite_candidato) solo aplica a estas, nunca a Licores/Lácteos/NABs.
+    es_flexible: bool = False
 
 
 def generar_torres_candidatas(
@@ -131,7 +136,7 @@ def generar_torres_candidatas_todas_orientaciones(
                 TorreCandidate(
                     sku=sku, cd=cd, orientacion=ori, largo=l, ancho=a, alto_caja=h,
                     max_cajas_verticales=max_vert, cantidad_disponible=cantidad_disponible,
-                    peso_unitario=peso_unitario, fuente_geometria=fuente,
+                    peso_unitario=peso_unitario, fuente_geometria=fuente, es_flexible=True,
                 )
             )
 

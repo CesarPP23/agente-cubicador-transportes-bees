@@ -3754,3 +3754,172 @@ con MENOS demanda total -el fix comprime más pallets aun con más cajas que
 colocar). Ocupación de huella (`ocupacion_xy`) medida en los pallets reales
 del resultado: rango 78%-95%, la mayoría 85-90% -contra las franjas blancas
 visibles de la captura original. Suite completa: 169/169 sin regresiones.
+
+## Formalizar la disciplina BK31 en el cubicador -2 refinamientos puntuales
+[pedido explícito del usuario: "quiero que analices la logica que hemos
+utilizado juntos para este pallet [BK31, armado a mano caja por caja] y que
+lo apliques para todo el cubicador... tiene que quedar asi solido"]
+
+**Hallazgo previo a tocar código:** la pieza central de esa disciplina
+-"tapizar la cama combinando SKUs en vez de dejar franjas blancas"- YA era
+el comportamiento por defecto de todo el motor (ver sección de arriba,
+`_empacar_optimizado`). Re-verificado el mismo día, después de sacar
+Cigarros/Vapes del cubicaje (ver sección BAT más abajo): 169/169 tests,
+`test_invariantes.py` contra `ARCHIVO_REAL` (12 CDs) da **50 pallets
+totales, 4 parciales (8%), 95% de aprovechamiento de altura**. No hacía
+falta rediseñar el motor -solo faltaban 2 comportamientos puntuales de BK31
+que el motor real todavía no reproducía.
+
+**Refinamiento 1 -desempate "seguir la misma torre"** (`_hay_torre_mismo_
+sku_en_xy`, nueva, `src/packing_bloques.py`): caso real, se prefirió apilar
+una 4ta caja de Altomayo sobre las 3 que ya estaban en vez de meter un SKU
+distinto en el mismo lugar, aunque ambos hubieran calzado igual de bien. El
+solver real no tenía ninguna preferencia por SKU en su desempate -elegía
+por área sobrante, sin importar si el ganador continuaba una torre propia u
+otra distinta (confirmado con 2 agentes de exploración: cero mecanismo de
+"crecer una torre existente" en todo `src/`, cada caja nueva siempre
+compite en igualdad de condiciones, incluso una que cae justo encima de su
+propia torre). Se agregó `mismo_sku_continua` como término de desempate,
+insertado DESPUÉS de `-area` en las 3 claves de prioridad que existen en el
+archivo (`_empacar`, `_empacar_n_pallets_greedy`, `_candidatos_lote` -esta
+última en sus 2 mecanismos, el de prioridad por SKU y el de "frontera" que
+tapiza cama por cama) -a propósito nunca antes: el desempate solo decide
+empates REALES de área, nunca se antepone a la métrica de densidad real que
+ya daba 78-95% de ocupación (`test_desempate_no_le_gana_a_la_densidad_real`,
+`tests/test_packing_bloques.py`).
+
+**Refinamiento 2 -tolerancia de sobresaliente configurable** (`config.
+TOLERANCIA_OVERHANG_CM`, `_fit_directo_o_con_tolerancia`/`_solapa_con_
+torres`, `src/packing_bloques.py`): caso real, se aceptó que Altomayo
+(25.7cm de ancho) sobresaliera 1.7cm sobre una base de Vino de 24cm, sobre
+aire libre, decidido caso por caso mirando fotos. Apagada por defecto
+(`0.0` -cero cambio de comportamiento en los números de arriba hasta que se
+suba a propósito, ej. a 2.0cm como el caso real). Aplica SOLO a candidatos
+de `CATEGORIAS_ORIENTACION_FLEXIBLE` (Comestibles/Aseo -nuevo campo
+`TorreCandidate.es_flexible`, seteado en `generar_torres_candidatas_todas_
+orientaciones`), y SOLO si el footprint expandido (a) sigue dentro de
+`PALLET_LARGO`x`PALLET_ANCHO` y (b) no se solapa con ninguna Torre ya
+colocada -nunca sobre otra caja, solo sobre aire, en UN solo eje a la vez
+(nunca largo y ancho juntos, nunca la altura). Distinto de
+`SOBRESALIENTE_MAX_CM` (ese es sobre el borde EXTERIOR del pallet, decisión
+de negocio aparte todavía sin confirmar para el packing real -ver
+config.py); este es sobre el borde de la caja de ABAJO que sostiene, sin
+tocar el perfil exterior del pallet. 8 tests nuevos en `tests/test_packing_
+bloques.py` (apagada por defecto, caso feliz, choque con otra torre, se sale
+del pallet, categoría no flexible, dos ejes a la vez). Se evaluó agregar una
+columna de auditoría en `Plan_Picking` marcando qué pallets usan la
+tolerancia -se descartó por ahora: requería threadear el monto de
+sobresaliente por las 5 rutas de `.colocar()` del archivo (`_empacar`,
+`_empacar_n_pallets_greedy`, `_candidatos_lote` x2, consolidación de
+remanentes), superficie de cambio desproporcionada para una función de
+transparencia, no de seguridad -queda pendiente como mejora aparte si hace
+falta en el futuro.
+
+Suite completa después de ambos refinamientos: 169 tests previos + 8 nuevos
+= 177, todos verdes (incluido `test_invariantes.py` contra el dataset real,
+12 CDs). Contra ese mismo archivo real, con `TOLERANCIA_OVERHANG_CM` en su
+default (0.0) -o sea, el único cambio de comportamiento activo es el
+desempate del Refinamiento 1-: **49 pallets totales** (contra 50 de la
+corrida de esta misma sesión ANTES de este refinamiento -uno menos, mejora
+real, no regresión), 5 parciales (10%), 94% de aprovechamiento de altura,
+peso promedio 970.5/1430kg. La Refinamiento 2 (tolerancia apagada por
+default) no participa en esta corrida -confirmado que su costo es cero
+mientras `TOLERANCIA_OVERHANG_CM=0.0`, ver `test_tolerancia_overhang_
+apagada_por_defecto_no_cambia_nada`.
+
+## "Grandes primero" (Pallets_Objetivo) -investigación seria, resultado
+## parcial, PENDIENTE de cerrar
+[pedido explícito del usuario: que el cubicador, sin guía manual, logre
+para BK31 (`Pallets_Objetivo=1`, `Plantilla_Ejemplo_Agente_Cubicador (1)
+(3).xlsx`, 14 SKUs, 98 cajas) lo mismo que se logró armando el pallet a
+mano -las 98 cajas completas en 1 solo pallet. El motor real, sin este
+refinamiento, coloca 87/98 (deja 3 SKUs de Picaras enteros sin colocar,
+11 cajas, aunque sobre aire/altura en varias columnas)]
+
+**Diagnóstico inicial, con evidencia real antes de tocar código:** se
+descartó "falta de presupuesto de búsqueda" -10x más tiempo (60s/120s) y
+5x más ancho de búsqueda (shortlist/opciones/LNS) dieron el mismo 87/98 en
+20-140s, sin agotar tiempo ni nodos. Causa real: `_candidatos_lote`/
+`_resolver_pallets_backtracking` arman fila por fila por Z sin que ningún
+SKU reserve territorio por tamaño -los SKUs de footprint chico fragmentan
+el piso antes de que a Picaras (el footprint más grande) le toque competir.
+
+**7 iteraciones de diseño, cada una corrigiendo un bug real encontrado con
+la siguiente:**
+1. Reservar SKU por SKU completo antes del siguiente -el primero (Picaras)
+   devoraba 92% del piso, dejando a Vino (57 cajas) sin lugar -peor que no
+   hacer nada.
+2. Ronda-robin de 1 caja por turno -evitaba que un SKU devorara todo, pero
+   esparcía cada SKU por el piso en vez de apilarlo (la 2da caja de un SKU
+   nunca reutilizaba su propia columna: "z=0 en huella nueva" siempre le
+   ganaba a "apilar encima").
+3. Ronda-robin de 1 COLUMNA completa por turno -mejoró mucho (Picaras
+   completa + parte de Vino, 59/98), pero el LNS posterior (que solo
+   optimiza CANTIDAD total) deshacía la reserva de Picaras a cambio de más
+   Vino (más denso) -convergía siempre de vuelta a 87/98 sin Picaras.
+   **Fix que SÍ quedó**: `skus_protegidos` en `_lns_mejorar_pallets`/
+   `_lns_una_semilla_worker`/`_empacar_n_pallets` -nunca rompe columnas de
+   los SKUs que reservó `_reservar_skus_grandes`.
+4. Reescrito a "estantes" (shelf-packing conjunto, Shelf-Best-Fit-
+   Decreasing-Height por `ancho` de la orientación elegida) -coordina
+   varios SKUs a la vez en vez de que cada uno busque cuboide por su
+   cuenta, pero seguía apilando cada columna de una sola vez.
+5. Reescrito a "cama por cama" dentro de cada estante -causa raíz real
+   encontrada: `Cajas_Cama_Efectivo` (`tope_capa`, ej. Vino=15) es un tope
+   POR CAPA Z compartido entre TODAS las columnas de un SKU, no por
+   columna -apilar una columna entera de una vez agotaba ese tope
+   compartido en las primeras 2-3 columnas. La implementación de esta
+   iteración quedó con un bug real (varios SKUs en 0 cajas).
+6. **Fix real encontrado y confirmado con tests sintéticos** (no con el
+   caso real de 98 cajas -esta vez se escribieron tests chicos y rápidos
+   PRIMERO, ver `tests/test_packing_bloques.py`, sección "grandes
+   primero"): el algoritmo de estante-mejor-ajuste solo probaba el estante
+   de menos ancho libre y se rendía con el SKU en 0 si ese estante
+   resultaba con altura de caja incompatible (`TOLERANCIA_ALTURA_CAMA_CM`)
+   -corregido para probar TODOS los estantes abiertos antes de abrir uno
+   nuevo. Segundo bug encontrado con el mismo método: sin `Cajas_Cama_
+   Efectivo` (o con uno holgado), nada frenaba cuántas columnas NUEVAS se
+   abrían en la primera capa -terminaba abriendo 1 columna por unidad de
+   demanda en vez de `columnas_necesarias` columnas apiladas. Corregido
+   con un tope explícito de columnas nuevas por SKU. Con ambos fixes:
+   BK31 sube de 56/98 (iteración 3 con su propio bug) a **77/98** -Vino
+   queda con 21 cajas sin colocar, es el ÚNICO SKU corto (antes había 3
+   SKUs enteros en cero).
+7. Se probó cambiar el criterio de orden de los estantes de "ancho de la
+   orientación elegida" a "área total demandada" (`columnas_necesarias x
+   largo x ancho`) -esperando que reservar primero a quien más volumen
+   total necesita ayudara. Resultado: **empeoró en la práctica** -Vino
+   (57 cajas, la mayor área total de toda la demanda) pasa a reservar
+   primero y vuelve a dejar a Picaras en 0 (87/98, idéntico al greedy sin
+   este refinamiento). Revertido al criterio de ancho -es estrictamente
+   mejor (77/98 con 1 SKU corto es mejor que 87/98 con 3 SKUs en cero).
+
+**Conclusión honesta:** el patrón se repite con cualquier criterio de
+orden probado -el SKU que compite PRIMERO por el piso compartido siempre
+termina en desventaja el que compite LAST, sea cual sea el criterio de
+prioridad. Esto no es un bug puntual más para corregir: es la limitación
+estructural de cualquier heurística SECUENCIAL/greedy de asignación de
+territorio. Lo que se hizo a mano (reservar zonas dedicadas para Picaras Y
+para Vino, cada una calculada considerando a la otra, no una después de la
+otra) es, en el fondo, una asignación de área PROPORCIONAL/conjunta -el
+equivalente algorítmico real es un empaquetado 2D tipo strip-packing con
+reparto de área simultáneo entre los SKUs de mayor demanda, no una
+secuencia ordenada de reservas. Eso es un algoritmo distinto, no otro ajuste
+de esta función -queda pendiente como proyecto aparte si se decide seguir.
+
+**Estado actual del código:** `_reservar_skus_grandes` (reescrita, con
+estantes + cama por cama + los 2 fixes de la iteración 6) queda en el
+repo, PROBADA con 4 tests sintéticos nuevos (`test_grandes_primero_*`,
+`tests/test_packing_bloques.py`) que sí pasan y sí protegen contra
+regresión de lo que YA funciona -pero el resultado real de BK31 (77/98,
+mejor que antes pero no 100%) no logra superar el total crudo del greedy
+(87/98) en la comparación final de `_empacar_n_pallets`, así que la red de
+seguridad existente (nunca devolver menos cajas que el greedy) sigue
+descartando el resultado y el comportamiento real de producción para BK31
+NO cambió -sigue en 87/98, igual que antes de esta sesión. Suite completa
+(`tests/test_packing_bloques.py` + `tests/test_pallets_objetivo.py`,
+47 tests) verde. Pendiente de decidir con el usuario: (a) invertir en el
+strip-packing real, (b) cambiar el criterio de "éxito" de la comparación
+final para que priorice cobertura de SKUs en vez de cantidad cruda de
+cajas cuando `priorizar_grandes=True` (aceptaría 77/98 sobre 87/98 a
+propósito), o (c) dejarlo como está, documentado, sin activar.

@@ -16,17 +16,20 @@ import config
 from models import PalletV5, Torre
 from src.packing_bloques import (
     _capacidad_instalada,
+    _candidatos_lote,
     _empacar_n_pallets,
     _empacar_n_pallets_greedy,
+    _fit_directo_o_con_tolerancia,
     _mejor_cuboide_para_sku,
     _necesita_columna_nueva,
+    _reservar_skus_grandes,
     _restaurar_estado_pallets,
     _romper_skus_con_cascada,
     _snapshot_estado_pallets,
     armar_pallets_bloques,
 )
-from src.packing_columnar import _PalletEnConstruccion
-from src.torres import generar_torres_candidatas
+from src.packing_columnar import _CuboidLibre, _PalletEnConstruccion
+from src.torres import TorreCandidate, generar_torres_candidatas
 from src.validacion_v5 import validar_geometria_v5
 
 
@@ -755,3 +758,289 @@ def test_romper_skus_con_cascada_saca_tambien_lo_que_queda_flotando():
     assert pendientes == {"BASE": 1, "ENCIMA": 2, "INDEPENDIENTE": 0}
     assert colocados_por_pallet == [{"BASE": 0, "ENCIMA": 0, "INDEPENDIENTE": 3}]
     assert validar_geometria_v5([pallet]) == []
+
+
+# --- Refinamiento 'seguir la misma torre' -pedido explícito del usuario
+# tras la sesión BK31: se prefirió apilar una 4ta Altomayo sobre las 3 que
+# ya estaban en vez de meter un SKU distinto en el mismo lugar, aunque
+# ambos hubieran calzado igual de bien --------------------------------------
+
+def test_desempate_prefiere_seguir_la_misma_torre():
+    """"X" ya tiene una torre que cubre TODO el piso del pallet (así el
+    único cuboide libre que queda es el que se abre justo encima, mismo
+    footprint -sin esto, "Y" podría ganar por un hueco de piso distinto,
+    sin competir de verdad por la misma celda). "X" y "Y" tienen footprint
+    IDÉNTICO (empate real de área/sobra) y compiten por ESE cuboide. "Y"
+    tiene MÁS demanda pendiente que "X" -sin el desempate por continuidad
+    de torre, -pendientes lo haría ganar a "Y"; con el desempate, gana "X"
+    por seguir su propia torre."""
+    pallet = PalletV5(id="TEST", cd="BK31")
+    pc = _PalletEnConstruccion(pallet=pallet)
+    cand_base = TorreCandidate(
+        sku="X", cd="BK31", orientacion="L×A", largo=config.PALLET_LARGO, ancho=config.PALLET_ANCHO,
+        alto_caja=20.0, max_cajas_verticales=10, cantidad_disponible=1, peso_unitario=1.0,
+    )
+    pc.colocar(cand_base, 1, 0)  # cubre TODO el piso -solo queda libre el cuboide de encima
+
+    cand_x = TorreCandidate(
+        sku="X", cd="BK31", orientacion="L×A", largo=config.PALLET_LARGO, ancho=config.PALLET_ANCHO,
+        alto_caja=20.0, max_cajas_verticales=10, cantidad_disponible=1, peso_unitario=1.0,
+    )
+    cand_y = TorreCandidate(
+        sku="Y", cd="BK31", orientacion="L×A", largo=config.PALLET_LARGO, ancho=config.PALLET_ANCHO,
+        alto_caja=20.0, max_cajas_verticales=10, cantidad_disponible=5, peso_unitario=1.0,
+    )
+    candidatos = _candidatos_lote(
+        construcciones=[pc],
+        colocados_por_pallet=[{"X": 1}],
+        pendientes={"X": 1, "Y": 5},
+        por_sku={"X": [cand_x], "Y": [cand_y]},
+        capacidad_cama_por_sku={},
+        nivel_por_sku={"X": 1, "Y": 1},
+        tope_pallet_por_sku={},
+        presupuesto=300.0,
+        n_pallets=1,
+    )
+    assert candidatos, "debería haber al menos un candidato para el cuboide libre de encima"
+    ganador = candidatos[0]
+    assert ganador[3] == "X", (
+        f"esperaba que 'X' ganara el cuboide sobre su propia torre (desempate por continuidad), "
+        f"pero ganó '{ganador[3]}'"
+    )
+
+
+def test_desempate_no_le_gana_a_la_densidad_real():
+    """[guardrail del propio refinamiento] Si "Y" tapiza el cuboide MEJOR
+    que "X" (menos área sobrante), "Y" debe seguir ganando -el desempate por
+    continuidad de torre solo decide empates REALES, nunca se antepone a
+    -area (la métrica que ya dio 78-95% de ocupación real, ver PATCH_LOG.md).
+    Mismo montaje que el test anterior, pero "Y" tiene un footprint MÁS
+    chico (tapiza mejor el resto del cuboide -en este caso, igual de bien
+    porque el cuboide es exacto, así que se reduce ligeramente 'Y' para que
+    definitivamente sobre menos área)."""
+    pallet = PalletV5(id="TEST", cd="BK31")
+    pc = _PalletEnConstruccion(pallet=pallet)
+    cand_base = TorreCandidate(
+        sku="X", cd="BK31", orientacion="L×A", largo=config.PALLET_LARGO, ancho=config.PALLET_ANCHO,
+        alto_caja=20.0, max_cajas_verticales=10, cantidad_disponible=1, peso_unitario=1.0,
+    )
+    pc.colocar(cand_base, 1, 0)
+
+    # "X" deja 10cm² sobrantes en el cuboide de encima; "Y" (más grande en
+    # una dimensión) deja MENOS sobrante -Y tapiza mejor, tiene que ganar
+    # igual aunque no continúe ninguna torre propia.
+    cand_x = TorreCandidate(
+        sku="X", cd="BK31", orientacion="L×A", largo=config.PALLET_LARGO - 5, ancho=config.PALLET_ANCHO,
+        alto_caja=20.0, max_cajas_verticales=10, cantidad_disponible=1, peso_unitario=1.0,
+    )
+    cand_y = TorreCandidate(
+        sku="Y", cd="BK31", orientacion="L×A", largo=config.PALLET_LARGO, ancho=config.PALLET_ANCHO,
+        alto_caja=20.0, max_cajas_verticales=10, cantidad_disponible=1, peso_unitario=1.0,
+    )
+    candidatos = _candidatos_lote(
+        construcciones=[pc],
+        colocados_por_pallet=[{"X": 1}],
+        pendientes={"X": 1, "Y": 1},
+        por_sku={"X": [cand_x], "Y": [cand_y]},
+        capacidad_cama_por_sku={},
+        nivel_por_sku={"X": 1, "Y": 1},
+        tope_pallet_por_sku={},
+        presupuesto=300.0,
+        n_pallets=1,
+    )
+    ganador = candidatos[0]
+    assert ganador[3] == "Y", (
+        f"'Y' tapiza el cuboide mejor que 'X' (menos área sobrante) -no debería perder por el "
+        f"desempate de continuidad, pero ganó '{ganador[3]}'"
+    )
+
+
+# --- Refinamiento 'tolerancia de sobresaliente' -pedido explícito del
+# usuario tras la sesión BK31: a mano se aceptó que Altomayo (25.7cm)
+# sobresaliera 1.7cm sobre una base de Vino de 24cm, siempre sobre aire
+# libre, nunca sobre otra caja. Apagada por defecto (0.0cm) -----------------
+
+def _cand_altomayo(es_flexible=True):
+    return TorreCandidate(
+        sku="ALTOMAYO", cd="BK31", orientacion="L×A", largo=25.7, ancho=26.0, alto_caja=17.0,
+        max_cajas_verticales=5, cantidad_disponible=3, peso_unitario=1.0, es_flexible=es_flexible,
+    )
+
+
+def test_tolerancia_overhang_apagada_por_defecto_no_cambia_nada():
+    """config.TOLERANCIA_OVERHANG_CM es 0.0 por defecto -mismo comportamiento
+    estricto de siempre, sin necesidad de tocar la config en el test."""
+    assert config.TOLERANCIA_OVERHANG_CM == 0.0
+    pallet = PalletV5(id="TEST", cd="BK31")
+    c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)  # como el Vino real (24cm de ancho)
+    assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
+
+
+def test_tolerancia_overhang_permite_sobresalir_sobre_aire_libre(monkeypatch):
+    """[caso real BK31] Altomayo (25.7cm) sobre una base de 24cm -1.7cm de
+    sobresaliente, dentro de una tolerancia de 2.0cm, sobre aire completamente
+    libre (nada más ocupa ese pallet)."""
+    monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
+    pallet = PalletV5(id="TEST", cd="BK31")
+    c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)
+    assert _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
+
+
+def test_tolerancia_overhang_rechaza_si_choca_con_otra_torre(monkeypatch):
+    """El mismo sobresaliente de arriba, pero otra Torre ya ocupa justo el
+    aire donde caería -debe rechazarse: el sobresaliente NUNCA puede
+    aterrizar sobre otra caja, solo sobre aire libre."""
+    monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
+    pallet = PalletV5(id="TEST", cd="BK31")
+    pallet.torres.append(
+        Torre(
+            sku="OTRO", cd="BK31", x=24.0, y=0.0, largo=6.0, ancho=26.0, alto_caja=20.0,
+            cantidad=1, peso=1.0, orientacion="L×A", fuente_geometria="TEST", z=0.0,
+        )
+    )
+    c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)
+    assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
+
+
+def test_tolerancia_overhang_rechaza_si_se_sale_del_pallet(monkeypatch):
+    """El cuboide libre está pegado al borde derecho del pallet -el
+    sobresaliente se saldría de PALLET_LARGO, debe rechazarse."""
+    monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
+    pallet = PalletV5(id="TEST", cd="BK31")
+    c = _CuboidLibre(x=config.PALLET_LARGO - 24.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)
+    assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
+
+
+def test_tolerancia_overhang_no_aplica_a_categoria_no_flexible(monkeypatch):
+    """[pedido explícito del usuario] La tolerancia solo aplica a
+    Comestibles/Aseo (`CATEGORIAS_ORIENTACION_FLEXIBLE`) -un candidato de
+    Licores/NABs/etc. (`es_flexible=False`) nunca la recibe, ni con la
+    config activada."""
+    monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
+    pallet = PalletV5(id="TEST", cd="BK31")
+    c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)
+    assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo(es_flexible=False))
+
+
+def test_tolerancia_overhang_nunca_en_dos_ejes_a_la_vez(monkeypatch):
+    """Solo UN eje puede sobresalir -si largo Y ancho exceden el cuboide a
+    la vez (aunque cada uno esté dentro de la tolerancia individualmente),
+    se rechaza."""
+    monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
+    pallet = PalletV5(id="TEST", cd="BK31")
+    c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=25.0, d=50.0)  # 1.7cm y 1.0cm de exceso en cada eje
+    assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
+
+
+# --- "grandes primero" -pedido explícito del usuario: que el CUBICADOR
+# logre para BK31 (Pallets_Objetivo=1) lo mismo que se logró armando a
+# mano. 5 iteraciones documentadas en PATCH_LOG.md -tests sintéticos
+# chicos y rápidos para aislar cada regla, en vez de depurar corriendo el
+# caso real completo (98 cajas) cada vez. --------------------------------
+
+def _reservar(por_sku, pendientes, capacidad_cama_por_sku=None, nivel_por_sku=None,
+              tope_pallet_por_sku=None, presupuesto=200.0, n_pallets=1):
+    pallets = [PalletV5(id=f"TEST-{i}", cd="BK31") for i in range(n_pallets)]
+    construcciones = [_PalletEnConstruccion(pallet=p) for p in pallets]
+    colocados_por_pallet = [{} for _ in range(n_pallets)]
+    nivel_por_sku = nivel_por_sku or {sku: 1 for sku in por_sku}
+    protegidos = _reservar_skus_grandes(
+        construcciones, colocados_por_pallet, pendientes, por_sku,
+        capacidad_cama_por_sku or {}, nivel_por_sku, tope_pallet_por_sku or {},
+        n_pallets, presupuesto,
+    )
+    return pallets, construcciones, colocados_por_pallet, protegidos
+
+
+def test_grandes_primero_alturas_incompatibles_no_pierde_el_sku_chico():
+    """[bug real encontrado con BK31: Vodka/KR Naranja/Gaseosa Oro/Altomayo
+    terminaban en 0 cajas colocadas] "ALTO" abre un estante usando la mayor
+    parte del ancho del pallet, dejando un resto de ancho que "CHICO" SÍ
+    calzaría por medidas -pero su alto de caja difiere de "ALTO" por más de
+    `TOLERANCIA_ALTURA_CAMA_CM`, así que no puede compartir ese estante. El
+    algoritmo debe abrir un estante NUEVO para "CHICO" en vez de rendirse
+    con 0 cajas colocadas."""
+    cand_alto = TorreCandidate(
+        sku="ALTO", cd="BK31", orientacion="L×A", largo=100.0, ancho=50.0, alto_caja=39.0,
+        max_cajas_verticales=5, cantidad_disponible=1, peso_unitario=1.0,
+    )
+    cand_chico = TorreCandidate(
+        sku="CHICO", cd="BK31", orientacion="L×A", largo=15.0, ancho=10.0, alto_caja=20.0,
+        max_cajas_verticales=5, cantidad_disponible=3, peso_unitario=1.0,
+    )
+    por_sku = {"ALTO": [cand_alto], "CHICO": [cand_chico]}
+    pendientes = {"ALTO": 1, "CHICO": 3}
+
+    _, _, colocados_por_pallet, _ = _reservar(por_sku, pendientes)
+
+    assert colocados_por_pallet[0].get("CHICO", 0) == 3, (
+        f"CHICO debería colocar sus 3 unidades en un estante propio, quedó en "
+        f"{colocados_por_pallet[0].get('CHICO', 0)}"
+    )
+    assert pendientes["CHICO"] == 0
+
+
+def test_grandes_primero_respeta_tope_de_capa_compartido_entre_columnas():
+    """[bug real: Vino con Cajas_Cama_Efectivo=15 se quedaba en 15/57 -
+    apilar una columna entera de una sola vez agotaba el tope compartido en
+    las primeras 2-3 columnas] Un SKU con tope de capa bajo y demanda que
+    necesita más columnas de las que el tope permite de una vez debe
+    terminar colocando TODA la demanda, repartida en varias capas
+    reutilizando las mismas columnas."""
+    cand = TorreCandidate(
+        sku="X", cd="BK31", orientacion="L×A", largo=10.0, ancho=10.0, alto_caja=20.0,
+        max_cajas_verticales=10, cantidad_disponible=20, peso_unitario=1.0,
+    )
+    por_sku = {"X": [cand]}
+    pendientes = {"X": 20}
+
+    _, _, colocados_por_pallet, _ = _reservar(
+        por_sku, pendientes, capacidad_cama_por_sku={"X": 3}, presupuesto=200.0,
+    )
+
+    assert pendientes["X"] == 0, f"deberían entrar las 20 unidades, quedan {pendientes['X']} pendientes"
+    assert colocados_por_pallet[0]["X"] == 20
+
+
+def test_grandes_primero_footprints_sin_multiplos_comunes_coexisten_al_100():
+    """[caso real BK31: Vino 24x31 y Picaras 28.5x30, sin múltiplos
+    comunes] Dos SKUs con footprints que no calzan en grilla entre sí deben
+    terminar AMBOS con su demanda 100% colocada, coordinados por el mismo
+    estante conjunto."""
+    cand_vino = TorreCandidate(
+        sku="VINO", cd="BK31", orientacion="A×L", largo=31.0, ancho=24.0, alto_caja=30.5,
+        max_cajas_verticales=10, cantidad_disponible=20, peso_unitario=1.0,
+    )
+    cand_pic = TorreCandidate(
+        sku="PIC", cd="BK31", orientacion="L×A", largo=28.5, ancho=30.0, alto_caja=39.0,
+        max_cajas_verticales=5, cantidad_disponible=10, peso_unitario=1.0,
+    )
+    por_sku = {"VINO": [cand_vino], "PIC": [cand_pic]}
+    pendientes = {"VINO": 20, "PIC": 10}
+
+    _, _, colocados_por_pallet, _ = _reservar(por_sku, pendientes)
+
+    assert pendientes["VINO"] == 0, f"VINO quedó con {pendientes['VINO']} sin colocar"
+    assert pendientes["PIC"] == 0, f"PIC quedó con {pendientes['PIC']} sin colocar"
+    assert colocados_por_pallet[0]["VINO"] == 20
+    assert colocados_por_pallet[0]["PIC"] == 10
+
+
+def test_grandes_primero_nunca_produce_geometria_invalida():
+    """Guardrail de seguridad -sea cual sea el resultado, nunca puede haber
+    solape real ni flotación: reusa el mismo dataset con alturas
+    incompatibles (el más propenso a errores de estante) y valida con
+    `validar_geometria_v5`, el mismo chequeo que usa el resto de la suite."""
+    cand_alto = TorreCandidate(
+        sku="ALTO", cd="BK31", orientacion="L×A", largo=100.0, ancho=50.0, alto_caja=39.0,
+        max_cajas_verticales=5, cantidad_disponible=1, peso_unitario=1.0,
+    )
+    cand_chico = TorreCandidate(
+        sku="CHICO", cd="BK31", orientacion="L×A", largo=15.0, ancho=10.0, alto_caja=20.0,
+        max_cajas_verticales=5, cantidad_disponible=3, peso_unitario=1.0,
+    )
+    por_sku = {"ALTO": [cand_alto], "CHICO": [cand_chico]}
+    pendientes = {"ALTO": 1, "CHICO": 3}
+
+    pallets, _, _, _ = _reservar(por_sku, pendientes)
+    assert validar_geometria_v5(pallets) == []

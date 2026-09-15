@@ -332,3 +332,7 @@ class ResultadoPipeline:
     benchmark_df: pd.DataFrame | None = None
     pallets_v5: list[PalletV5] | None = None
     cajas_no_colocadas_df: pd.DataFrame | None = None
+    # [regla explícita del usuario, sept-2026] Demanda de Cigarros/vapes -
+    # nunca entra al cubicaje (ver src/bat.py), se reporta acá por CD/SKU
+    # con la cantidad de cajas físicas de consolidación que hacen falta.
+    demanda_cigarros_df: pd.DataFrame | None = None

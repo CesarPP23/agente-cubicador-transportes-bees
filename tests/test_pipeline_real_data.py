@@ -28,20 +28,18 @@ def test_alturas_nunca_exceden_el_tope_duro():
     assert (alturas <= config.ALTURA_TOPE_DURO).all()
 
 
-def test_bat_nunca_abre_un_pallet_dedicado_si_hay_alternativa():
-    """Prioridad de negocio explícita: una caja BAT nunca es un pallet
-    físico aparte si hay lugar en uno ya armado -BAT entra como pseudo-SKU
-    en el mismo armado que el resto de la demanda (ver bat.py, sección "BAT
-    integrado"). Este test no afirma "cero dedicados jamás" -en datasets
-    donde un CD agota literalmente todo el margen físico de sus pallets, un
-    dedicado sigue siendo la única salida honesta- pero si aparece uno,
-    tiene que ser porque de verdad no había otra opción."""
+def test_cigarros_nunca_entran_al_cubicaje():
+    """[regla explícita del usuario, sept-2026] Cigarros/vapes ya no compiten
+    por espacio ni abren pallet propio -ni compartido ni dedicado: se separan
+    de la demanda ANTES del armado (ver bat.separar_bat) y se reportan aparte
+    en la hoja "Cigarros" (`resultado.demanda_cigarros_df`), nunca dentro de
+    `resultado.pallets`/`Plan_Picking`."""
     resultado = ejecutar_desde_archivo(ARCHIVO_REAL)
     dedicados = [p for p in resultado.pallets if p.id.startswith("PV5-BAT-")]
-    assert len(dedicados) < 30, (
-        f"{len(dedicados)} pallets BAT dedicados: la consolidación en pallets "
-        "ya armados no está funcionando como se espera."
-    )
+    assert dedicados == []
+    for pallet in resultado.pallets:
+        assert all(linea.categoria != "Cigarros" for linea in pallet.lineas)
+    assert not (resultado.plan_picking_df["Categoria"] == "Cigarros").any()
 
 
 def test_demanda_planificada_coincide_con_demanda_redondeada():
@@ -65,33 +63,26 @@ def test_demanda_planificada_coincide_con_demanda_redondeada():
     assert (diferencias == 0).all()
 
 
-def test_cigarros_despacha_la_demanda_real_no_la_redondeada():
-    """[Consolidación de Cigarros/vapes] Cigarros es la excepción a la regla
-    de arriba a propósito: se despacha la demanda REAL fraccionaria (vía la
-    caja de consolidación de 500 unidades), no ceil(Cajas Teóricas) por SKU.
-    Redondear cada línea a una caja completa inflaba la demanda real ~3.8x
-    (29.9 -> 114 cajas en este dataset) -ver config.CAJA_CONSOLIDACION_CIGARROS_*.
-
-    Lo que sí debe seguir cumpliéndose: nunca se despacha MÁS que la demanda
-    redondeada (eso lo cubre test_nunca_se_despacha_por_encima_de_la_demanda,
-    que usa Cajas Teóricas real, no redondeada) y el total planificado tiene
-    que acercarse a la demanda real, no quedarse en 0 ni excederla."""
+def test_cigarros_se_reporta_aparte_con_la_demanda_real():
+    """[Consolidación de Cigarros/vapes, regla explícita del usuario,
+    sept-2026] Cigarros/vapes ya no se despachan dentro de ningún pallet -se
+    reportan en `demanda_cigarros_df` (hoja "Cigarros" del Excel final) con
+    la demanda REAL en unidades, no ceil(Cajas Teóricas) por SKU (redondear
+    cada línea a caja completa infla la demanda real ~3.8x en este
+    dataset -ver config.CAJA_BAT_*)."""
     envios, maestro, uma = cargar_hojas(ARCHIVO_REAL)
     df_derivado, _ = _derivados(envios, maestro, uma)
     cigarros = df_derivado[df_derivado["Categoria_Normalizada"] == "Cigarros"]
-    demanda_real = cigarros["Cajas Teóricas"].sum()
-    demanda_redondeada = cigarros["Cajas_Teoricas_Redondeadas"].sum()
+    unidades_reales_esperadas = cigarros["Unidades"].sum()
 
     resultado = ejecutar_desde_archivo(ARCHIVO_REAL)
-    df = resultado.plan_picking_df
-    planificado = df[df["Categoria"] == "Cigarros"]["Cajas_Totales_Pallet"].sum()
+    assert resultado.demanda_cigarros_df is not None and not resultado.demanda_cigarros_df.empty
+    unidades_reportadas = resultado.demanda_cigarros_df["Unidades_Demanda"].sum()
 
-    assert demanda_real <= planificado <= demanda_redondeada + 1e-6
-    # No es una prueba de la inflación en sí (ver el docstring), es una señal
-    # de que la caja de consolidación está funcionando: el plan tiene que
-    # quedar mucho más cerca de la demanda real que de la redondeada.
-    punto_medio = (demanda_real + demanda_redondeada) / 2
-    assert planificado < punto_medio
+    assert unidades_reportadas == unidades_reales_esperadas
+    # Cero cajas de consolidación reportadas sería tan raro como demanda 0
+    # -confirma que consolidar_bat_por_cd corrió sobre esta demanda real.
+    assert (resultado.demanda_cigarros_df["Cajas_Consolidacion_Necesarias_CD"] > 0).all()
 
 
 def test_log_validacion_registra_los_hallazgos_conocidos():

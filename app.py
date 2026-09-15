@@ -1,5 +1,6 @@
 import streamlit as st
 
+import config
 from src.exportar import exportar_workbook
 from src.pipeline import ejecutar_pipeline
 from src.template import construir_template
@@ -81,8 +82,14 @@ cajas_no_colocadas_total = (
     if cajas_no_colocadas_df is not None and not cajas_no_colocadas_df.empty
     else 0
 )
+demanda_cigarros_df = resultado.demanda_cigarros_df
+cigarros_unidades_total = (
+    int(demanda_cigarros_df["Unidades_Demanda"].sum())
+    if demanda_cigarros_df is not None and not demanda_cigarros_df.empty
+    else 0
+)
 
-col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 col1.metric("Pallets totales", len(pallets))
 col2.metric("Homogéneos (base 1 SKU)", sum(1 for p in pallets if p.tipo.startswith("Homogéneo")))
 col3.metric("Mixtos", sum(1 for p in pallets if p.tipo == "Mixto"))
@@ -92,9 +99,13 @@ col5.metric(
     int(df["Cajas_Extra_Consolidacion"].sum()) if not df.empty else 0,
 )
 col6.metric("Cajas no colocadas", cajas_no_colocadas_total)
+col7.metric("Unidades Cigarros/Vapes (aparte)", cigarros_unidades_total)
 
-tab_plan, tab_log, tab_resumen, tab_no_colocadas, tab_inspector = st.tabs(
-    ["Plan de Picking", "Log de Validación", "Resumen por CD", "⚠ Cajas No Colocadas", "Inspector de Pallets"]
+tab_plan, tab_log, tab_resumen, tab_no_colocadas, tab_cigarros, tab_inspector = st.tabs(
+    [
+        "Plan de Picking", "Log de Validación", "Resumen por CD", "⚠ Cajas No Colocadas",
+        "🚬 Cigarros/Vapes", "Inspector de Pallets",
+    ]
 )
 
 with tab_plan:
@@ -116,6 +127,19 @@ with tab_no_colocadas:
             "no alcanza para toda la demanda."
         )
         st.dataframe(cajas_no_colocadas_df, use_container_width=True)
+
+with tab_cigarros:
+    if demanda_cigarros_df is None or demanda_cigarros_df.empty:
+        st.info("No hay demanda de Cigarros/Vapes en este archivo.")
+    else:
+        st.warning(
+            "Cigarros/Vapes no se cubican: se despachan tal cual los arma el personal en el hub, "
+            "consolidados por CD en la caja física fija de "
+            f"{config.CAJA_BAT_LARGO:g}x{config.CAJA_BAT_ANCHO:g}x{config.CAJA_BAT_ALTO:g}cm "
+            f"(hasta {config.CAJA_BAT_CAPACIDAD_UNIDADES} unidades c/u). Detalle de demanda y cajas "
+            "de consolidación necesarias por CD abajo."
+        )
+        st.dataframe(demanda_cigarros_df, use_container_width=True)
 
 with tab_inspector:
     if not pallets:

@@ -22,7 +22,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import pandas as pd
 
 import config
-from models import CajaBAT, Pallet, PalletLinea, PalletV5, ResultadoPipeline
+from models import Pallet, PalletLinea, PalletV5, ResultadoPipeline
 from src import (
     bat,
     benchmark,
@@ -154,21 +154,20 @@ PIPELINE_MAX_PROCESOS_CD = os.cpu_count() or 1
 
 
 def _procesar_cd(
-    cd: str, grupo: pd.DataFrame, cajas_bat: list[CajaBAT], pallets_objetivo: int | None, paralelo_lns: bool,
+    cd: str, grupo: pd.DataFrame, pallets_objetivo: int | None, paralelo_lns: bool,
 ) -> list[PalletV5]:
     """[worker de nivel de módulo -necesario para que `ProcessPoolExecutor`
     pueda picklearlo] Todo el trabajo de UN CD: arma los pallets (con un
     contador LOCAL, no el global de siempre -ver comentario arriba de por
-    qué es seguro), asigna las cajas BAT reales, y calcula estabilidad.
-    `paralelo_lns=False` cuando se llama desde acá -si cada uno de los N
-    CDs en paralelo ADEMÁS abriera su propio pool de 5 procesos para el
-    LNS, se terminaría con N×5 procesos peleando por los mismos núcleos
-    reales (satura en vez de acelerar)."""
+    qué es seguro) y calcula estabilidad. Cigarros/vapes ya no llegan acá
+    -se separaron antes de armar, ver bat.separar_bat. `paralelo_lns=False`
+    cuando se llama desde acá -si cada uno de los N CDs en paralelo ADEMÁS
+    abriera su propio pool de 5 procesos para el LNS, se terminaría con
+    N×5 procesos peleando por los mismos núcleos reales (satura en vez de
+    acelerar)."""
     pallets_cd = armar_pallets_bloques(
         grupo, cd, contador=[0], pallets_objetivo=pallets_objetivo, paralelo_lns=paralelo_lns,
     )
-    bat.renombrar_pallets_bat_puros(pallets_cd, cd)
-    bat.asignar_cajas_bat_a_torres(pallets_cd, cajas_bat)
     for p in pallets_cd:
         p.metadata["estabilidad"] = estabilidad.calcular_estabilidad(p)
     return pallets_cd
@@ -197,16 +196,17 @@ def ejecutar_core_sku_bloque(
     df_clasificado = df_clasificado.copy()
     df_clasificado["Cajas_Remanente"] = df_clasificado["Cajas_Teoricas_Redondeadas"].astype(int)
 
-    # BAT entra como pseudo-fila más -mismo mecanismo que V5-BAT-integrado,
-    # así compite por espacio en vez de perderse en un pase aparte.
+    # [regla explícita del usuario] Cigarros/vapes NUNCA entran al cubicaje:
+    # no compiten por espacio con el resto de la demanda, no ocupan pallet
+    # propio -se arma solo la demanda no-BAT. `cajas_bat_por_cd` (cuántas
+    # cajas físicas de consolidación hacen falta por CD) queda solo para la
+    # hoja de reporte "Cigarros" (ver exportar.construir_demanda_cigarros_df).
     cajas_bat_por_cd = bat.consolidar_bat_por_cd(df_bat)
-    df_bat_pseudo = bat.construir_filas_bat_pseudo_sku(cajas_bat_por_cd, info_sku)
-    df_armado = pd.concat([df_clasificado, df_bat_pseudo], ignore_index=True, sort=False)
+    df_armado = df_clasificado
 
     pallets_v5: list = []
     pallets_objetivo_por_cd = pallets_objetivo_por_cd or {}
     grupos_cd = list(df_armado.groupby("CD"))
-    cds_procesados: set[str] = {cd for cd, _ in grupos_cd}
 
     if len(grupos_cd) > 1:
         # [paralelo por CD, ver _procesar_cd/PIPELINE_MAX_PROCESOS_CD
@@ -216,9 +216,7 @@ def ejecutar_core_sku_bloque(
         contexto = multiprocessing.get_context("fork") if hasattr(os, "fork") else None
         with ProcessPoolExecutor(max_workers=n_procesos, mp_context=contexto) as executor:
             futuros = [
-                executor.submit(
-                    _procesar_cd, cd, grupo, cajas_bat_por_cd.get(cd, []), pallets_objetivo_por_cd.get(cd), False,
-                )
+                executor.submit(_procesar_cd, cd, grupo, pallets_objetivo_por_cd.get(cd), False)
                 for cd, grupo in grupos_cd
             ]
             for futuro in as_completed(futuros):
@@ -227,18 +225,7 @@ def ejecutar_core_sku_bloque(
         # [1 solo CD -sin paralelismo por CD, pero SÍ el del LNS interno
         # (paralelo_lns=True) si ese único CD lo necesita.]
         for cd, grupo in grupos_cd:
-            pallets_v5.extend(
-                _procesar_cd(cd, grupo, cajas_bat_por_cd.get(cd, []), pallets_objetivo_por_cd.get(cd), True)
-            )
-
-    for cd, cajas in cajas_bat_por_cd.items():
-        if cd not in cds_procesados and cajas:
-            pallets_cd = armar_pallets_bloques(
-                pd.DataFrame(columns=df_armado.columns), cd, contador=[0]
-            )
-            bat.renombrar_pallets_bat_puros(pallets_cd, cd)
-            bat.asignar_cajas_bat_a_torres(pallets_cd, cajas)
-            pallets_v5.extend(pallets_cd)
+            pallets_v5.extend(_procesar_cd(cd, grupo, pallets_objetivo_por_cd.get(cd), True))
 
     pallets_apilado = [_palletv5_a_pallet(p, info_sku) for p in pallets_v5]
     for pallet in pallets_apilado:
@@ -267,6 +254,7 @@ def ejecutar_core_sku_bloque(
     cajas_no_colocadas_df = exportar.construir_cajas_no_colocadas_df(
         pallets_v5, info_sku, demanda_excluida_geometria_df
     )
+    demanda_cigarros_df = exportar.construir_demanda_cigarros_df(df_bat, cajas_bat_por_cd, nombres_cd)
 
     return ResultadoPipeline(
         plan_picking_df=plan_picking_df,
@@ -278,4 +266,5 @@ def ejecutar_core_sku_bloque(
         benchmark_df=bench_df,
         pallets_v5=pallets_v5,
         cajas_no_colocadas_df=cajas_no_colocadas_df,
+        demanda_cigarros_df=demanda_cigarros_df,
     )

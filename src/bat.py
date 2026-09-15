@@ -1,12 +1,22 @@
 """BAT: Cigarros y vapes.
 
-Nunca se despachan por caja completa (96% de sus líneas de demanda son
-fraccionarias). El personal los consolida en una caja física FIJA
-(52.5x34x49cm, hasta 1000 unidades, ver config.CAJA_BAT_*) separada del
-cubicaje normal. Se agrega como una fila de demanda más (pseudo-SKU
-`BAT_SKU_MARCADOR`) al mismo armado que el resto de los SKUs -ver sección
-"BAT integrado" más abajo- en vez de una pasada aparte después.
-"""
+[regla explícita del usuario, sept-2026] Nunca se despachan por caja completa
+(96% de sus líneas de demanda son fraccionarias) NI entran al cubicaje: no
+compiten por espacio con el resto de la demanda, no ocupan pallet propio, no
+aparecen en `Plan_Picking`/`Pallets_3D_Data`. El personal los consolida tal
+cual los arma el hub, en una caja física FIJA por CD (52.5x34x49cm, hasta
+1000 unidades, ver config.CAJA_BAT_*), y se despachan como un envío
+adicional aparte. `separar_bat` los saca de la demanda ANTES de que lleguen
+al armado (`src/pipeline_sku_bloque.py`); `consolidar_bat_por_cd` calcula
+cuántas cajas físicas hacen falta por CD, y esa info va a la hoja "Cigarros"
+del Excel final (`src/exportar.construir_demanda_cigarros_df`) para que el
+operario sepa qué y cuánto consolidar.
+
+Las funciones de la sección "BAT integrado" más abajo (pseudo-SKU que compite
+por espacio y puede terminar de remate sobre un pallet host) implementan un
+mecanismo anterior -ya no lo usa el pipeline por defecto (ver
+PATCH_LOG.md)- pero se conservan intactas y probadas por si hiciera falta
+volver a ese modelo."""
 import math
 
 import pandas as pd
@@ -18,10 +28,19 @@ from src.reconciliacion_geometrica import capacidad_xy_max
 
 def separar_bat(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """[sección 9.1] Separa demanda BAT del resto usando la categoría
-    logística normalizada explícita (config.CATEGORIAS_BAT), no un valor
+    logística normalizada explícita (config.CATEGORIAS_BAT) O la
+    Subcategoría del Maestro (config.SUBCATEGORIAS_BAT -ej. Vapes
+    declarados bajo una Categoría distinta de "Cigarros"), no un valor
     numérico genérico compartido con otros productos. Devuelve
     (demanda_no_bat, demanda_bat)."""
-    es_bat = df["Categoria_Normalizada"].isin(config.CATEGORIAS_BAT)
+    es_categoria_bat = df["Categoria_Normalizada"].isin(config.CATEGORIAS_BAT)
+    if "Subcategoría" in df.columns:
+        es_subcategoria_bat = (
+            df["Subcategoría"].astype(str).str.strip().str.casefold().isin(config.SUBCATEGORIAS_BAT)
+        )
+    else:
+        es_subcategoria_bat = pd.Series(False, index=df.index)
+    es_bat = es_categoria_bat | es_subcategoria_bat
     return df[~es_bat].copy(), df[es_bat].copy()
 
 
