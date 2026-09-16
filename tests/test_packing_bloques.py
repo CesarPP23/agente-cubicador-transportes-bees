@@ -858,7 +858,7 @@ def test_desempate_no_le_gana_a_la_densidad_real():
 # --- Refinamiento 'tolerancia de sobresaliente' -pedido explícito del
 # usuario tras la sesión BK31: a mano se aceptó que Altomayo (25.7cm)
 # sobresaliera 1.7cm sobre una base de Vino de 24cm, siempre sobre aire
-# libre, nunca sobre otra caja. Apagada por defecto (0.0cm) -----------------
+# libre, nunca atravesando otra caja. Activa: 2 cm por lado ----------------
 
 def _cand_altomayo(es_flexible=True):
     return TorreCandidate(
@@ -867,10 +867,9 @@ def _cand_altomayo(es_flexible=True):
     )
 
 
-def test_tolerancia_overhang_apagada_por_defecto_no_cambia_nada():
-    """config.TOLERANCIA_OVERHANG_CM es 0.0 por defecto -mismo comportamiento
-    estricto de siempre, sin necesidad de tocar la config en el test."""
-    assert config.TOLERANCIA_OVERHANG_CM == 0.0
+def test_tolerancia_overhang_puede_desactivarse(monkeypatch):
+    """Configurar cero permite volver al apoyo estricto."""
+    monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 0.0)
     pallet = PalletV5(id="TEST", cd="BK31")
     c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)  # como el Vino real (24cm de ancho)
     assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
@@ -902,34 +901,30 @@ def test_tolerancia_overhang_rechaza_si_choca_con_otra_torre(monkeypatch):
     assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
 
 
-def test_tolerancia_overhang_rechaza_si_se_sale_del_pallet(monkeypatch):
-    """El cuboide libre está pegado al borde derecho del pallet -el
-    sobresaliente se saldría de PALLET_LARGO, debe rechazarse."""
+def test_tolerancia_overhang_permite_hasta_dos_cm_fuera_del_pallet(monkeypatch):
+    """El margen exterior es 2 cm, también sobre el borde derecho."""
     monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
     pallet = PalletV5(id="TEST", cd="BK31")
     c = _CuboidLibre(x=config.PALLET_LARGO - 24.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)
+    assert _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
+    c.x += 0.4  # 2.1 cm fuera del borde: supera el límite por lado.
     assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
 
 
-def test_tolerancia_overhang_no_aplica_a_categoria_no_flexible(monkeypatch):
-    """[pedido explícito del usuario] La tolerancia solo aplica a
-    Comestibles/Aseo (`CATEGORIAS_ORIENTACION_FLEXIBLE`) -un candidato de
-    Licores/NABs/etc. (`es_flexible=False`) nunca la recibe, ni con la
-    config activada."""
+def test_tolerancia_overhang_independiente_de_rotacion(monkeypatch):
+    """Sobresalir no habilita acostar una categoría rígida."""
     monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
     pallet = PalletV5(id="TEST", cd="BK31")
     c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=31.0, d=50.0)
-    assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo(es_flexible=False))
+    assert _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo(es_flexible=False))
 
 
-def test_tolerancia_overhang_nunca_en_dos_ejes_a_la_vez(monkeypatch):
-    """Solo UN eje puede sobresalir -si largo Y ancho exceden el cuboide a
-    la vez (aunque cada uno esté dentro de la tolerancia individualmente),
-    se rechaza."""
+def test_tolerancia_overhang_permite_dos_cm_en_ambos_ejes(monkeypatch):
+    """El límite se mide por lado, no por suma entre ejes."""
     monkeypatch.setattr(config, "TOLERANCIA_OVERHANG_CM", 2.0)
     pallet = PalletV5(id="TEST", cd="BK31")
     c = _CuboidLibre(x=0.0, y=0.0, z=0.0, w=24.0, h=25.0, d=50.0)  # 1.7cm y 1.0cm de exceso en cada eje
-    assert not _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
+    assert _fit_directo_o_con_tolerancia(pallet, c, _cand_altomayo())
 
 
 # --- "grandes primero" -pedido explícito del usuario: que el CUBICADOR

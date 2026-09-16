@@ -139,7 +139,7 @@ class _PalletEnConstruccion:
     pallet: PalletV5
     libres: list[_CuboidLibre] = field(
         default_factory=lambda: [
-            _CuboidLibre(0.0, 0.0, 0.0, config.PALLET_LARGO, config.PALLET_ANCHO, _altura_presupuesto())
+            _cuboide_inicial()
         ]
     )
 
@@ -251,12 +251,22 @@ def _altura_presupuesto() -> float:
     return config.ALTURA_MAX_OBSERVADA - config.ALTURA_PALLET_VACIO
 
 
+def _cuboide_inicial() -> _CuboidLibre:
+    """Margen simétrico: 2 cm por lado, nunca 4 cm en un solo extremo."""
+    margen = config.SOBRESALIENTE_MAX_CM
+    return _CuboidLibre(
+        -margen, -margen, 0.0,
+        config.PALLET_LARGO + 2 * margen, config.PALLET_ANCHO + 2 * margen,
+        _altura_presupuesto(),
+    )
+
+
 def _reconstruir_en_construccion(pallet: PalletV5) -> "_PalletEnConstruccion":
     """[usado por residual_search.py y bat.py] Recalcula los cuboides
     libres MaxRects de un pallet YA armado, a partir de las torres que ya
     tiene (incluyendo su `z`) -para poder seguir ofreciéndolo como destino
     de reinserción/host con la misma lógica de este módulo."""
-    libres = [_CuboidLibre(0.0, 0.0, 0.0, config.PALLET_LARGO, config.PALLET_ANCHO, _altura_presupuesto())]
+    libres = [_cuboide_inicial()]
     for t in pallet.torres:
         libres = _actualizar_libres_maxrects(libres, t.x, t.y, t.z, t.largo, t.ancho, t.altura)
     return _PalletEnConstruccion(pallet=pallet, libres=libres)
@@ -323,7 +333,7 @@ def armar_pallets_columnar(
     Reglas (DOCUMENTACION_LOGICA_V5.md sección 9-10):
     - base 120x100, torres de altura independiente, ahora también con
       base Z independiente (apiladas unas sobre otras si hace falta);
-    - <= ALTURA_MAX_OBSERVADA (215cm) de producto total por pallet;
+    - <= ALTURA_MAX_OBSERVADA (220cm) de altura total con parihuela;
     - mismo CD (df_cd ya viene filtrado a un solo CD -no se valida acá);
     - orientación XY válida (ambas, `generar_torres_candidatas`);
     - demanda exacta -se agota `Cajas_Remanente` por completo o el SKU queda

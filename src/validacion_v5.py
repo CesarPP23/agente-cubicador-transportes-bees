@@ -9,6 +9,8 @@ algo verificable además de los conteos.
 válido, no overlap- siempre que sus rangos de Z (altura) no se crucen.
 Overlap real es AABB en 3D (X, Y, Z simultáneamente), no solo en XY como
 antes de que las torres pudieran apilarse unas sobre otras."""
+from dataclasses import replace
+
 import config
 from models import PalletV5, Torre
 
@@ -60,6 +62,26 @@ def _area_cubierta_por_soporte(t: Torre, soportes: list[Torre]) -> float:
     return area
 
 
+def _tiene_soporte_admisible(t: Torre, soportes: list[Torre]) -> bool:
+    """Solo el borde de la huella puede volar hasta el margen permitido.
+
+    El interior (huella menos una franja de 2 cm por lado) debe estar
+    íntegramente apoyado. No se expanden los soportes: así un hueco
+    interior entre cajas no se convierte artificialmente en apoyo.
+    """
+    margen = max(0.0, config.TOLERANCIA_OVERHANG_CM)
+    if not soportes:
+        return False
+    dx = min(margen, max(0.0, (t.largo - 0.01) / 2))
+    dy = min(margen, max(0.0, (t.ancho - 0.01) / 2))
+    interior = replace(t, x=t.x + dx, y=t.y + dy, largo=t.largo - 2 * dx, ancho=t.ancho - 2 * dy)
+    if any(s.x <= interior.x + TOLERANCIA_CM and s.y <= interior.y + TOLERANCIA_CM
+           and s.x + s.largo >= interior.x + interior.largo - TOLERANCIA_CM
+           and s.y + s.ancho >= interior.y + interior.ancho - TOLERANCIA_CM for s in soportes):
+        return True
+    return _area_cubierta_por_soporte(interior, soportes) >= interior.largo * interior.ancho - TOLERANCIA_CM
+
+
 def validar_pallet_v5(pallet: PalletV5) -> list[str]:
     """Devuelve una lista de violaciones legibles (vacía si el pallet es
     geométricamente válido). No corrige nada -solo reporta, para que quien
@@ -68,29 +90,23 @@ def validar_pallet_v5(pallet: PalletV5) -> list[str]:
     torres = pallet.torres
 
     for t in torres:
-        # [anti-flotación, reporte real del usuario con foto del Inspector:
-        # "hay cajas que estan flotandoen el vacio, toda caja debe esta
-        # puesta sobre otra caja"] Toda torre que no arranca en el piso del
-        # pallet (z=0) tiene que tener, debajo de TODA su huella, torres
-        # reales cuyo tope quede exactamente en su z -no solo parcialmente.
+        # Apoyo real, con hasta 2 cm de sobresaliente en cada borde.
         if t.z > TOLERANCIA_CM:
             soportes = [o for o in torres if o is not t and abs((o.z + o.altura) - t.z) <= TOLERANCIA_CM]
             area_total = t.largo * t.ancho
             area_cubierta = _area_cubierta_por_soporte(t, soportes)
-            if area_cubierta < area_total - TOLERANCIA_CM:
+            if not _tiene_soporte_admisible(t, soportes):
                 violaciones.append(
                     f"{pallet.id}: torre {t.sku}@({t.x:.1f},{t.y:.1f},z={t.z:.1f}) no tiene soporte "
-                    f"real en toda su huella ({area_cubierta:.1f}/{area_total:.1f} cm² cubiertos) -caja flotando"
+                    f"real suficiente ({area_cubierta:.1f}/{area_total:.1f} cm² cubiertos; "
+                    f"sobresaliente máximo {config.TOLERANCIA_OVERHANG_CM:g} cm por lado) -caja flotando"
                 )
-        # [sobresaliente] El tope real es la base EXTENDIDA
-        # (PALLET_LARGO_EFECTIVO/ANCHO_EFECTIVO, +2.5cm por lado -estándar
-        # logístico ya confirmado), no la base estricta 120x100 -pallets
-        # dedicados a un solo SKU (ver packing_bloques._dedicar_por_sku)
-        # pueden usar ese margen a propósito.
+        # Margen simétrico respecto de la base física, no acumulado a la derecha.
         if (
-            t.x < -TOLERANCIA_CM or t.y < -TOLERANCIA_CM
-            or t.x + t.largo > config.PALLET_LARGO_EFECTIVO + TOLERANCIA_CM
-            or t.y + t.ancho > config.PALLET_ANCHO_EFECTIVO + TOLERANCIA_CM
+            t.x < -config.SOBRESALIENTE_MAX_CM - TOLERANCIA_CM
+            or t.y < -config.SOBRESALIENTE_MAX_CM - TOLERANCIA_CM
+            or t.x + t.largo > config.PALLET_LARGO + config.SOBRESALIENTE_MAX_CM + TOLERANCIA_CM
+            or t.y + t.ancho > config.PALLET_ANCHO + config.SOBRESALIENTE_MAX_CM + TOLERANCIA_CM
         ):
             violaciones.append(
                 f"{pallet.id}: torre {t.sku}@({t.x:.1f},{t.y:.1f}) "

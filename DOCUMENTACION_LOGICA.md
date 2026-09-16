@@ -1,235 +1,175 @@
 # Documentación lógica — Agente Cubicador
 
 **Repo:** `agente-cubicador-transportes-bees`
-**Estado documentado:** commit `d7051a9` (2026-08-21) — único motor activo: **SKU_BLOQUE, armado por camas (pisos)**. V4, V5 multi-start puro, AUTO, AUTO_CONSOLIDADO y SKU_CONSOLIDADO siguen borrados (ver sección 15); el modelo de "torres verticales" que reemplazó a esos motores también fue reemplazado, por el mismo motivo que ellos: no reproducía cómo se arma un pallet en la realidad.
+**Estado documentado:** commit `7f174ee` (2026-09-14, HEAD), 44 commits totales. Único motor activo: **SKU_BLOQUE, armado cama por cama** (`src/packing_bloques.py`).
 **Alcance:** qué reglas de negocio implementa el motor, por qué, y con qué evidencia se calibró cada una.
 
-> Este documento reemplaza toda versión anterior de `DOCUMENTACION_LOGICA*.md`. El detalle de código/módulos está en `DOCUMENTACION_TECNICA.md`. El historial completo, patch por patch, vive en `Parches/v5/PATCH_LOG.md` — no se repite acá, solo se resume.
+> Este documento reemplaza toda versión anterior de `DOCUMENTACION_LOGICA*.md`. El detalle de código/módulos está en `DOCUMENTACION_TECNICA.md`. El historial completo, patch por patch (más de 3900 líneas), vive en `Parches/v5/PATCH_LOG.md` — no se repite acá, solo se resume lo que sigue vigente.
 
 ---
 
-## 0. Prioridad de reglas
+> **Actualización operativa — 2026-09-15:** BK31 manual es la referencia de negocio. El usuario confirmó **220 cm de altura total (incluye parihuela)** y **2 cm máximos por cada lado**, tanto sobre el borde exterior como sobre el apoyo. Las métricas de corridas anteriores que aparecen abajo son históricas; estos cambios no demuestran todavía que el solver coloque automáticamente las 98 cajas.
+
+## 0. Qué cambió desde la última versión de este documento
+
+La versión anterior documentaba el rediseño "por camas" recién hecho (commit `d7051a9`). Desde entonces hubo ~30 commits más, con cuatro cambios de fondo que reemplazan partes de lo ya documentado:
+
+1. **Cigarros/vapes salen COMPLETAMENTE del cubicaje** (antes solo competían por espacio como pseudo-SKU BAT). Ahora nunca se arma un pallet con Cigarros — se reportan aparte (sección 8).
+2. **Las "bandas estrictas" por categoría se probaron y se revirtieron** con evidencia real (un pallet físico mezclaba Licores/Comestibles/Aseo/NABs libremente). Quedó un esquema de **jerarquía de peso/nivel**, no de exclusividad (sección 5).
+3. Apareció (y se conectó de punta a punta) un mecanismo de **`Pallets_Objetivo`**: la cantidad de pallets de un CD puede venir fija desde la planificación externa, en vez de que el motor decida cuántos abrir (sección 10).
+4. El camino **sin** `Pallets_Objetivo` (el 99% del uso real de la app) ahora **también** compacta cama por cama con un solver real (antes era un barrido voraz simple que dejaba franjas de aire vacías, sección 9.3).
+
+---
+
+## 1. Prioridad de reglas
 
 Cuando dos reglas compiten, en este orden:
 
-1. **La demanda se despacha exacta** (o con la política de redondeo explícita por categoría, sección 7) — nunca se pierde silenciosamente.
-2. **Restricciones físicas/operacionales duras**: la altura (~190-215cm, sección 3) y la geometría (una torre no se sale del pallet, dos torres no se solapan) son las únicas que bloquean el armado. Peso, orden de categorías y estabilidad son reportes/preferencias, no bloqueos (ver sección 1).
-3. **El pallet se arma cama por cama, nunca por columnas aisladas** (sección 9 — la corrección arquitectónica más reciente, con evidencia visual del Inspector de Pallets). Dentro de una cama, ningún SKU puede dejar un hueco de aire grande respecto al SKU ancla que abrió esa cama.
-4. **Minimizar la cantidad de pallets** que hay que armar y mover, llenando cada cama lo más posible antes de abrir la siguiente.
-5. Trazabilidad: toda geometría inferida/degradada queda marcada, nunca se inventa en silencio; toda demanda que no logra colocarse queda en `sin_colocar`, nunca desaparece.
+1. **La demanda se despacha exacta** (o queda explícitamente reportada como no colocada, sección 11) — nunca desaparece en silencio.
+2. **Restricciones físicas duras**: altura del pallet, geometría (una torre no se sale del pallet, dos torres no se solapan, y desde esta versión, **ninguna caja puede quedar sin apoyo admisible** — sección 7) son las únicas que bloquean el armado.
+3. **El pallet se arma cama por cama** (piso a techo), nunca por columnas verticales aisladas de un solo SKU.
+4. **Minimizar la cantidad de pallets** — salvo que `Pallets_Objetivo` fije la cantidad exacta para ese CD, en cuyo caso el objetivo pasa a ser colocar la MAYOR cantidad de demanda posible dentro de esa cantidad fija (sección 10).
+5. Peso, orden de categoría y estabilidad son **reportes/alertas**, nunca bloqueos.
+6. Trazabilidad: toda geometría inferida/degradada queda marcada; toda demanda no colocada queda listada por CD/SKU, nunca se pierde sin dejar rastro.
 
 ---
 
-## 1. Qué es y qué no es una restricción dura
-
-Confirmado con Omar viendo fotos de picking real: los operarios arman pallets con capas horizontales, mezclando categorías libremente dentro de cada capa. La instrucción de negocio fue explícita: restringir solo el tamaño (altura) y la geometría, y armar SIEMPRE por filas/capas — nunca por columnas verticales aisladas de un solo SKU.
+## 2. Qué es y qué no es una restricción dura
 
 | Regla | Estado |
 |---|---|
-| Altura del pallet (~190-215cm) | **Dura** — el único tope que decide cuándo dejar de apilar (`config.ALTURA_MAX_OBSERVADA`) |
-| Geometría (overlap, overflow de la base) | **Dura** — auditada aparte por `src/validacion_v5.py`, no solo confiada al packer |
-| El pallet se arma por capas horizontales, no por columnas | **Dura** — corrección arquitectónica explícita, ver sección 9 |
-| Dentro de una cama, el hueco entre SKUs distintos es acotado | **Dura**, tolerancia simétrica de 8cm (`TOLERANCIA_HUECO_CAMA_CM`) — ver sección 9 |
-| Peso máximo (1430kg) | Blanda — se calcula y alerta (`⚠ ALERTA DE PESO` sobre 1400kg), nunca bloquea el armado |
-| Orden por nivel de categoría / estabilidad física | Retirada como restricción de armado — el packer no agrupa ni ordena por categoría. `Nivel_Categoria` sigue viajando como metadata informativa en el plan de picking |
-| BAT/Cigarros como caja de consolidación aparte | **Dura**, sin cambios — nunca se despacha por caja completa, ver sección 8 |
-| Cajas siempre "de pie" | Dura para todas las categorías salvo Comestibles/Cigarros (pueden acostarse si conviene, sección 6) |
+| Altura del pallet (~190-220cm) | **Dura** — único tope que decide cuándo dejar de apilar (`config.ALTURA_MAX_OBSERVADA`) |
+| Geometría: overlap, overflow de la base | **Dura** — auditada aparte por `validacion_v5.py`, no solo confiada al packer |
+| **Anti-flotación**: soporte real en el interior de la huella; solo los bordes pueden sobresalir hasta 2 cm por lado | **Dura**, invariante permanente desde el bug real reportado con foto (sección 7) |
+| El pallet se arma por camas, no por columnas aisladas | **Dura** |
+| Cigarros/vapes nunca compiten por espacio en un pallet | **Dura**, sin excepción (sección 8) |
+| Peso máximo (1430kg) | Blanda — se calcula y alerta (`⚠ ALERTA DE PESO` sobre 1400kg), nunca bloquea |
+| Jerarquía de categoría (qué puede apoyarse sobre qué) | **Dura** para el "quién soporta a quién" columna por columna; **no** exige exclusividad de cama (sección 5) |
+| Cajas siempre "de pie" | Dura salvo Comestibles/Aseo, que pueden acostarse para llenar huecos (sección 6) |
+| Tope de `Cajas por PH` por pallet, por SKU | **Dura** — ningún SKU supera esa cantidad en un solo pallet |
+| Cantidad de pallets por CD (`Pallets_Objetivo`) | **Dura cuando el CD aparece en esa hoja opcional**; si no aparece, el motor decide cuántos abrir (sección 10) |
 
 ---
 
-## 2. El benchmark real
+## 3. Altura del pallet
 
-Fuente original: fotos de picking de operación real (~130 fotos, 42 pallets físicos con categorías mezcladas en casi todos los niveles) y `Plan de Movimientos - Pre Picking 18.08.xlsx` (demanda real de un día, 6 CDs, 48 pallets físicos armados por el hub, 0 dedicados BAT).
+Sin cambios respecto a la versión anterior — sigue siendo la ventana validada contra 42 pallets físicos reales (`ALTURA_TARGET=198.3`, rango observado original 190-215cm; tope operativo actualizado a 220cm):
 
-- **Benchmark de referencia principal**: 42 pallets físicos, altura media 198.3cm, rango 170-215cm (`src/benchmark.py`: `PALLETS_REALES=42`, `ALTURA_MEDIA_REAL=198.3`).
-- **Gate formal** (`benchmark.evaluar_gate_v5`, `GATE_V5_PALLETS_MIN/MAX = 42/45`): rango de pallets + demanda exacta + altura máxima ≤215 + cero violaciones geométricas, los cuatro obligatorios, ninguno se relaja para "hacer pasar" el benchmark.
-- **Estado actual** (dataset `Cubicaje18.07.2026.xlsx`): **47 pallets**, 0 violaciones geométricas, demanda exacta, altura media 193.9cm (9 pallets bajo 190cm, 8 bajo 170cm). El gate **no aprueba** — único motivo: `pallets=47, fuera del rango [42, 45]`. Ningún otro criterio falla. La brecha contra el gate bajó de 11 pallets (53 vs 42) a 5 (47 vs 42) con el rediseño de armado por camas (sección 9).
-- `PALET=0` en el dato real histórico significa "pendiente de consolidación BAT", no un pallet físico adicional — el benchmark de 42 ya lo excluye. El motor reproduce esto contando `PV5-BAT-*` (pallets dedicados solo a cajas BAT) como pallets físicos normales, nunca se esconden del conteo.
-
-> Ningún motor probado hasta ahora cerró la brecha contra 42-45 en el dataset grande — el mejor resultado del historial completo fue AUTO (V4+V5 combinados) con 48, y el armado por camas actual (47) ya lo iguala/supera sin necesitar dos motores corriendo en paralelo. Ver sección 10 para el detalle de cómo se llegó a esta cifra.
-
----
-
-## 3. Ventana de altura (190-215cm)
-
-| Zona | Rango | Estado de reporte |
-|---|---|---|
-| Óptimo | 195-200 | OK |
-| Nominal | 190-195 | OK |
-| Alto pero operativo | 200-210 | OK |
-| Tolerado | 185-190 | TOLERADO |
-| Excepción | 210-215 | ⚠ ALTURA EXCEPCIONAL |
-| Parcial operativo | 170-185 | ⚠ PALLET PARCIAL |
-| Residual | <170 | ⚠ PALLET PARCIAL |
-| No permitido | >215 | (el armado no debería dejar llegar hasta acá) |
-
-`ALTURA_TARGET=198.3` (promedio real) es una referencia de scoring, no un tope. Ninguno de estos números es un límite normativo validado (`config.ALTURA_HARD_VALIDADA=None`) — son el benchmark observado; `ALTURA_MAX_OBSERVADA=215` es el único tope que el motor usa operacionalmente para decidir cuándo dejar de apilar (`config.estado_altura`).
-
----
-
-## 4. Peso — blando, no validado
-
-`PESO_ALERTA_KG=1400` / `PESO_HARD_KG=1430` existen como umbrales de **reporte** (`validacion_peso.py` marca `⚠ ALERTA DE PESO` sobre 1400kg), pero no bloquean el armado en ningún punto del pipeline actual. No están validados contra capacidad real de montacargas/rack/transporte, y la instrucción de negocio fue explícita en que la única restricción dura de armado es el tamaño (altura + geometría).
-
----
-
-## 5. Reconciliación geométrica Maestro↔UMA
-
-Regla central: el Maestro (`Cajas por cama`) es la capacidad OPERACIONAL declarada; UMA (dimensiones medidas) valida la geometría. Si UMA contradice al Maestro, el sistema **no** reduce `Cajas por cama` automáticamente — el Maestro resultó más confiable que una grilla simple en la validación contra pallets reales. El resultado reconciliado (`Cajas_Cama_Efectivo`, `derivados.py`) es hoy el único número que el armado por camas usa como objetivo por capa (sección 9) — el packer ya no recalcula su propia grilla.
-
-### 5.1 Estados posibles por SKU (`Fuente_Geometria`)
-
-| Estado | Significado |
+| Rango | Etiqueta |
 |---|---|
-| `UMA_VALIDADA` | La geometría medida (parada o acostada) explica exactamente la capacidad del Maestro, o no hay techo declarado |
-| `UMA_SOBRECAPACIDAD` | La geometría permite más de lo que el Maestro declara — se respeta el Maestro como techo |
-| `UMA_VALIDADA_CON_SOBRESALIENTE` | La geometría medida (sin cambiar largo/ancho) explica al Maestro solo si se permite el sobresaliente de negocio (2.5cm/lado) — se usa la medida real tal cual, no un footprint inventado |
-| `MAESTRO_IMPOSIBLE_DEGRADADO` | El Maestro declara algo geométricamente imposible incluso con sobresaliente — se degrada al techo geométrico real en vez de inventar una geometría ficticia |
-| `DATO_INSUFICIENTE` | Sin Alto de caja, o sin Largo/Ancho — el SKU no se puede empacar de forma segura, queda "Requiere Revisión" |
+| 195-200 | ÓPTIMO |
+| 190-195 | NOMINAL |
+| 185-190 | TOLERADO |
+| 170-185 | PARCIAL OPERATIVO |
+| <170 | RESIDUAL |
+| 200-210 | ALTO PERO OPERATIVO |
+| 210-220 | EXCEPCIÓN |
+| >220 | NO PERMITIDO |
 
-### 5.2 Sobresaliente (2.5cm/lado) — hoy solo para validar datos, no para planificar
+`ALTURA_HARD_VALIDADA = None`: ninguno de estos umbrales es una norma de seguridad formal todavía — son el benchmark observado en operación real. 220cm es el tope operacional confirmado por el usuario y usado por el motor para decidir cuándo dejar de apilar.
 
-Cuánto puede volar la caja del borde del pallet antes de perder resistencia a la compresión (>20% más allá de ese margen). Medido sobre 458 SKUs remedidos: 0cm→73% del dato del Maestro alcanzable, 2.5cm→82% (elegido), 5cm→86% (fuera del estándar seguro).
+## 4. Peso
 
-**Estado actual, honesto**: el sobresaliente solo se usa para **validar** si un "Cajas por cama" del Maestro es creíble (`reconciliacion_geometrica.capacidad_xy_max_con_sobresaliente`). En el packing real, todas las camas usan hoy la base ESTRICTA 120×100 — se probó (durante el rediseño de sección 9) un criterio para que el sobresaliente aplicara solo cuando una cama termina dominada por un único SKU, pero la heurística para detectar ese caso resultó frágil (un SKU con demanda que coincide justo con su propia capacidad de grilla activaba el modo extendido aunque después hubiera quedado lugar de sobra para un SKU chico distinto compartiendo la cama). Se descartó por ahora en vez de forzar una regla no validada — el sobresaliente en packing real queda como mejora futura pendiente de un criterio más robusto (ver sección 10.3, "queda abierto").
+Sin cambios: `PESO_ES_RESTRICCION_DURA = False`. El peso se calcula y se reporta (`⚠ ALERTA DE PESO` sobre 1400kg, `PESO_HARD_KG=1430` como referencia, nunca como bloqueo) pero no impide ninguna combinación geométricamente válida. `PESO_PARAMETROS_VALIDADOS = False`: sigue siendo un valor heredado, no una norma confirmada con el negocio.
 
----
+## 5. Jerarquía de categorías — bandas estrictas probadas y revertidas
 
-## 6. Rotación acostada (Comestibles / Cigarros)
+**Historia relevante para no repetir el experimento**: se probó una reescritura completa a "bandas" estrictamente secuenciales (1=Licores, 2=Lácteos, 3=NABs, 4=remanente), donde categorías de bandas distintas nunca podían compartir una misma cama. Al inspeccionar línea por línea un pallet real (`PLAN 24,08,26`, Pallet 1 de BK34), Licores/Comestibles/Aseo/NABs aparecían **todos mezclados en la misma cama**, y 19 de 21 SKUs tenían demanda menor a su propio techo de cama — contradiciendo directamente el esquema de bandas. Se revirtió.
 
-Confirmado con fotos reales: Comestibles y Cigarros se acuestan para ahorrar espacio (una cara lateral como huella, no la base). Medido contra la demanda real: 94% de SKUs de Comestibles y ~21% de Cigarros caben más cajas por cama acostados que parados. El resto de las categorías (Licores, vidrio, Lácteos) se mantiene siempre parada — riesgo de derrame/quiebre (`config.CATEGORIAS_ROTACION_LIBRE`).
+**Lo que quedó, y sigue vigente**: una jerarquía de **peso/nivel** (`config.nivel_de_categoria`, 1=Licores el más pesado/base … hasta NABs, luego remate, luego Cigarros — aunque Cigarros ya no participa del armado, ver sección 8):
 
----
+- Una caja **nunca** puede apoyarse directamente sobre una categoría más pesada de lo que su propio nivel permite invertido — la restricción real es "qué puede quedar ENCIMA de qué en la misma columna" (`_soporte_viola_nivel`), no "qué categorías pueden compartir piso".
+- Categorías distintas **sí** pueden compartir la misma cama, siempre que la altura de sus cajas sea compatible (tolerancia simétrica de 8cm, `TOLERANCIA_ALTURA_CAMA_CM`) — la Z (el nivel del piso) es siempre el primer criterio de la cola de armado, el nivel de categoría solo desempata cuando dos SKUs podrían usar la misma Z.
+- SKUs marcados como frágiles (columna `Subcategoría` = "RTD" o "Energizante" en el Maestro, incluye Four Loko) se fuerzan al nivel de remate: nunca reciben nada apoyado encima.
 
-## 7. Redondeo de demanda por categoría
+## 6. Orientación de las cajas
 
-`ceil(Cajas Teóricas)` por línea puede sobre-despachar respecto de la demanda equivalente real — con Cigarros, donde 96% de las líneas son fraccionarias, redondear cada una hacia arriba inflaba la demanda ~3.8x. Política explícita por categoría (`src/demanda.py`):
+Sin cambios de fondo: Licores, Lácteos, NABs y el resto de categorías "rígidas" van siempre de pie (riesgo de derrame/quiebre). **Comestibles y Aseo** pueden acostarse (usar cualquiera de sus 3 caras como huella) cuando eso ayuda a llenar un hueco irregular que de otro modo quedaría vacío — confirmado contra fotos reales. NABs, explícitamente, **nunca** se acuesta, ni siquiera cuando eso resolvería un problema de capacidad conocido (ver hallazgo de Electrolight, sección 12).
 
-- **BAT (Cigarros/vapes)**: `UNIDADES_EXACTAS` — se despacha en unidades reales vía la caja de consolidación (sección 8), sin redondeo a caja completa.
-- **Resto de categorías**: `CAJA_COMPLETA` — sigue redondeando hacia arriba, pero el exceso que ese redondeo produce queda cuantificado (`Unidades_Exceso_Redondeo`) en vez de perderse en silencio.
+Un dato menor pero real, documentado para no perderlo: la degradación de capacidad de Electrolight (nunca pasa de ~18-20 cajas cuando el Maestro declara 24) resultó ser un dato de UMA con Largo/Ancho invertidos (la huella real parada es 26×19cm, no 26×22.5cm) — una corrección de dato fuente pendiente, no un problema de algoritmo.
 
----
+## 7. Anti-flotación — invariante permanente
 
-## 8. BAT (Cigarros/vapes) — consolidación integrada
+**Motivo real, con foto**: "siguen habiendo camas por debajo de 170cm... hay cajas que están flotando en el vacío, toda caja debe estar puesta sobre otra caja." La causa técnica era que el fragmento de cuboide libre "arriba en Z" usaba la huella completa del cuboide padre en vez de la intersección XY real con la caja recién colocada.
 
-Cigarros/vapes nunca se despachan por caja completa. El personal los consolida en una caja física fija (52.5×34×49cm, hasta 1000 unidades) separada del cubicaje normal.
+Desde entonces, **toda torre que no arranca en el piso del pallet (z=0) debe tener soporte real en el interior de su huella, con sobresaliente de hasta 2 cm por cada borde**, verificado por `validacion_v5.validar_pallet_v5` contra torres cuyo tope de Z coincide exactamente con la base de la torre en cuestión. Esta verificación:
 
-Diseño ("BAT integrado"): la demanda BAT de cada CD se agrega como **una fila más de demanda** (pseudo-SKU `__BAT__`, `bat.construir_filas_bat_pseudo_sku`) al mismo `df_cd` que arma `packing_bloques.armar_pallets_bloques` — compite por espacio en el MISMO pase que cualquier otro SKU, dentro de la lógica de camas. Después de armar, `asignar_cajas_bat_a_torres` mapea la cantidad colocada de vuelta a objetos `CajaBAT` reales (son fungibles entre sí — mismo footprint fijo, el mapeo es por orden estable). Un pallet cuyas torres son TODAS BAT se renombra a `PV5-BAT-{cd}-NNN` y cuenta como pallet físico normal en el benchmark, nunca se excluye.
+- Es independiente del motor de armado (auditoría, no una segunda implementación del mismo algoritmo).
+- Se volvió a violar y se volvió a corregir una vez más durante el diseño del solver LNS (la "ruina" sacaba SKUs elegidos al azar sin sacar en cascada lo que quedaba apoyado encima) — el fix (`_romper_skus_con_cascada`) remueve en cascada cualquier torre que quede sin soporte, y tiene su propio test de regresión.
+- Es, junto con overlap/overflow y el tope de altura, uno de los tres chequeos que el gate de geometría trata como bloqueantes.
 
-**Nota sobre el estado actual**: con el armado por torres (arquitectura anterior a sección 9), BAT integrado llegó a dar `bat_dedicados=0` en el dataset real. Con el rediseño a camas, el dataset real vuelve a mostrar **2 pallets BAT dedicados** (los dos pallets de menor altura del resultado actual, ~64cm). No se investigó a fondo si es un efecto esperable de que el armado por camas deja menos aire "suelto" en posiciones intermedias para que BAT encuentre host natural, o si hay margen de mejora — queda como observación abierta, no bloquea nada (BAT nunca deja de despacharse, solo puede terminar en su propio pallet en vez de compartir uno existente).
+## 8. Cigarros y vapes — excluidos por completo del cubicaje
 
----
+**Regla de negocio explícita (sept-2026), la más reciente del proyecto**: Cigarros/vapes nunca se despachan por caja completa (96% de sus líneas de demanda son fraccionarias) **ni entran al cubicaje en absoluto**. No compiten por espacio con el resto de la demanda, no ocupan pallet propio, no aparecen en `Plan_Picking` ni en `Pallets_3D_Data`.
 
-## 9. El pallet se arma por CAMAS, no por torres verticales
+En su lugar: el personal consolida esa demanda tal cual la arma el hub, en una **caja física de tamaño fijo** por CD (52.5×34×49cm, hasta 1000 unidades — `config.CAJA_BAT_*`), y se despacha como un envío adicional aparte. El sistema calcula cuántas cajas físicas de consolidación hacen falta por CD y las reporta en una hoja "Cigarros" propia del Excel final (`Descripcion`, `Unidades_Demanda`, `Cajas_Consolidacion_Necesarias_CD`).
 
-### 9.1 Por qué se rediseñó (corrección arquitectónica del usuario)
+La identificación de qué demanda es Cigarros/vapes es explícita — la categoría logística `Cigarros`, o la Subcategoría del Maestro "Vapes" (si vinieran declarados bajo otra categoría) — nunca un umbral numérico genérico.
 
-La arquitectura anterior armaba el pallet por **torres**: cada SKU ocupaba una posición XY fija, apilado de piso a techo con su propia altura, independiente de las torres vecinas. Con capturas reales del Inspector de Pallets, se detectó el problema: una torre baja al lado de una torre alta que comparte huella deja un hueco de aire enorme por encima de la baja — nadie más podía usar ese espacio, porque el modelo de torres no permitía que otro SKU "se subiera" ahí sin abrir su propia columna aislada.
+> Nota técnica para quien lea el código: `src/bat.py` conserva, sin usar, un mecanismo anterior ("BAT integrado") donde Cigarros competía por espacio como un pseudo-SKU y terminaba de remate encima de un pallet ya armado. Ese mecanismo ya no lo llama el pipeline — se mantiene probado por si alguna vez se decide volver a ese modelo, pero **hoy Cigarros no toca el armado de pallets en ningún punto**.
 
-Instrucción textual del usuario: *"nunca pero nunca se empieza haciendo columnas, siempre primero se van llenando las filas de abajo hacia arriba construyendo un bloque de 120x100"* — y sobre qué tan parecidos tienen que ser los SKUs que comparten una capa: *"no puede haber huecos tan grandes entre ellos, máximo huecos que te permitan poner una cama encima y que sea estable"*.
+## 9. El pallet se arma cama por cama
 
-### 9.2 Diseño actual
+### 9.1 Motivo (sin cambios respecto a la versión anterior)
+Confirmado con capturas del propio Inspector de Pallets comparadas contra fotos físicas: la operación real tapiza cada cama de canto a canto mezclando SKUs, y recién sube de nivel cuando la cama está llena — nunca apila una columna de un solo SKU de piso a techo mientras el resto del piso queda vacío.
 
-El pallet se arma **cama por cama** (piso por piso), de abajo hacia arriba:
+### 9.2 Motor único, continuo, sin resets
+Cada pallet es UN solo `_PalletEnConstruccion` (MaxRects 3D, `packing_columnar.py`) de piso a techo — nunca se resetea a mitad de armado. Esto es lo que garantiza, por construcción, el 0% de flotación de la sección 7 (no hay una "segunda pasada" que pueda perder de vista lo que ya se colocó).
 
-1. **Ancla de la cama**: entre los SKUs con demanda pendiente cuya altura de caja todavía entra en lo que resta de altura del pallet, se elige el de **mayor demanda pendiente**. La altura de esa cama queda fijada por la altura de caja del ancla.
-2. **El ancla llena la huella 120×100 fila por fila**, con una única orientación fija para toda la cama (nunca mezclada — mezclar orientaciones caja a caja fragmentaba el espacio de una forma que después ninguna orientación podía volver a aprovechar bien). El objetivo de cuántas cajas entran por cama **no lo recalcula el packer**: es `Cajas_Cama_Efectivo` (sección 5), ya reconciliado contra el Maestro y la geometría UMA.
-3. **El resto de esa MISMA cama** se completa con otros SKUs pendientes cuya altura de caja esté dentro de `TOLERANCIA_HUECO_CAMA_CM` (8cm, heredado de la calibración V4 contra `Cubicaje18.07.2026.xlsx`: con 3cm el motor daba 91% de pallets parciales, con 8cm 76%, retorno decreciente después) de la altura de la cama — **en ambas direcciones** (ver bug en sección 10.2).
-4. Cuando la cama no admite más SKUs compatibles, se sube a la siguiente cama (nuevo `z`), repitiendo el proceso, hasta agotar la altura del pallet o la demanda.
+### 9.3 Dos caminos, dos motores, mismo resultado de calidad
+Esta es la actualización más importante desde la versión anterior de este documento. El motor tiene dos caminos posibles según si el CD tiene una cantidad de pallets fija (`Pallets_Objetivo`, sección 10) o no:
 
-Reusa el motor 3D de `packing_columnar.py` (MaxRects) sin tocarlo — la única diferencia frente al modelo de torres es que el cuboide libre inicial de cada cama tiene profundidad Z = **solo la altura de esa cama**, no el presupuesto de altura completo del pallet. El mismo best-fit que antes producía columnas de piso a techo ahora llena en el plano XY antes de subir.
+- **Sin `Pallets_Objetivo` (el 99% del uso real)**: hasta hace poco, este camino corría un barrido voraz puro, caja por caja, sin vuelta atrás — dos SKUs que podrían tapizar la misma cama de forma complementaria casi nunca calzaban, y quedaban franjas de aire vacías en cada cama (confirmado con una captura real al lado de una foto física: la captura mostraba franjas blancas grandes, la foto mostraba cada cama tapizada de canto a canto). **Ahora este camino también compacta**: reutiliza el mismo solver de backtracking + LNS que ya existía para `Pallets_Objetivo` (sección 10), haciendo una búsqueda binaria acotada de la menor cantidad de pallets que sigue colocando el 100% de la demanda original. Nunca puede terminar peor que el barrido voraz (hay un fallback explícito).
+- **Con `Pallets_Objetivo`**: reparte la demanda en exactamente esa cantidad de pallets, con el mismo solver.
 
-### 9.3 Qué reemplaza
+Verificado contra el archivo real completo de un usuario (12 CDs, sin `Pallets_Objetivo`): 100% de la demanda colocada, **56 pallets** (contra 59 del barrido voraz solo, con MENOS demanda total en la corrida de comparación), ocupación de huella real entre 78% y 95% (la mayoría 85-90%), en 99.7 segundos.
 
-El diseño anterior ("SKU_BLOQUE" por torres) tenía dos fases: (1) dedicar pallets 100% completos usando `Cajas por PH` cuando la demanda de un SKU superaba la capacidad de un pallet entero, y (2) armar el resto combinando "bloques" enteros de distintos SKUs, partiendo uno solo como último recurso. **Esa distinción de fases ya no existe**: `Cajas por PH` no se usa en ningún punto del armado actual — el único número relevante es `Cajas_Cama_Efectivo` (capacidad de UNA cama, no de un pallet completo), y un SKU con mucha demanda simplemente ocupa varias camas apiladas del mismo pallet (o de varios pallets) de forma natural, sin una fase de "dedicación" separada.
+### 9.4 Desempate "seguir la misma torre"
+Ajuste puntual pedido tras replicar a mano un pallet real (BK31): el solver no tenía ninguna preferencia por continuar una torre propia — una caja nueva competía en igualdad de condiciones contra cualquier otro SKU incluso cuando caía justo encima de su propia pila. Se agregó como criterio de desempate (nunca antepuesto a la densidad real ya lograda, solo para romper empates genuinos de área).
 
----
+### 9.5 Sobresaliente sobre soporte — 2 cm por lado
 
-## 10. Hallazgos y correcciones
+Activo por decisión del usuario al tomar BK31 como referencia: `config.TOLERANCIA_OVERHANG_CM = 2.0`. Se permite hasta 2 cm por cada borde en ambos ejes. Esto no cambia las orientaciones permitidas por categoría. El interior de la huella debe estar apoyado en cajas cuyo tope coincida con la base de la caja superior; no se rellenan huecos interiores con soporte ficticio. El motor, la reconstrucción LNS y la auditoría aplican este criterio. Las colisiones se comprueban para todo el lote colocado.
 
-### 10.1 Pérdida de demanda silenciosa en pallets dedicados (arquitectura anterior, ya no aplica)
+## 10. `Pallets_Objetivo` — cantidad fija de pallets por CD
 
-En la arquitectura por torres, `_dedicar_por_sku` asumía que la capacidad declarada por el Maestro siempre entraba completa en un pallet fresco; cuando el packer real no lograba completarla, el faltante se perdía en silencio. Corregido en su momento (bajó el total de 60 a 53 pallets); la función entera dejó de existir con el rediseño de sección 9, pero se documenta acá porque fue el bug que motivó, en cadena, revisar a fondo cómo se estaba armando cada pallet.
+**Regla de negocio explícita**: "esa cantidad de pallet total no puede variar, siempre tiene que ser la que dice en la planificación" — los camiones se programan en base a ese número real (validado exacto contra 9 CDs de un cubicaje manual real: Callao=5, Cono Norte=7, Cono Sur=7, Rímac=5, Chanchamayo=5, Huánuco=4, Satipo=3, Tingo María=5, Pucallpa=9).
 
-### 10.2 Tolerancia de hueco asimétrica (bug real, corregido en el rediseño por camas)
+- Es un **input que sube el usuario** (hoja opcional "Pallets_Objetivo" en el mismo Excel, columnas `CD`/`Pallets_Objetivo`) — nunca algo que el sistema calcule solo.
+- Si un CD no aparece en esa hoja, se comporta exactamente igual que siempre (el motor decide cuántos pallets abrir).
+- Si aparece, el motor reparte TODA la demanda de ese CD en exactamente esa cantidad de pallets, usando un solver de backtracking real (DFS con poda) más una fase de LNS ("ruina y reconstrucción": rompe algunos SKUs ya colocados al azar y los reconstruye, se queda con lo mejor de varias semillas) cuando el backtracking solo no coloca toda la demanda.
+- **Costo real, documentado sin maquillar**: puede tardar minutos por pallet cuando la compresión exigida es alta. El sistema pone un tope de reloj real (no solo de nodos de búsqueda) para evitar corridas de horas — si el tiempo se agota, devuelve el mejor resultado encontrado hasta ese punto, nunca falla ni da un resultado inválido. La app avisa en pantalla, ANTES de procesar, qué CDs quedaron con cantidad fija (por el costo real involucrado).
+- **Limitación conocida, no resuelta**: en el caso más exigente probado (BK31, 98 cajas en 1 solo pallet, replicando un armado manual real), el motor coloca 87/98 cajas — 11 cajas de un solo SKU de footprint grande (Picaras) quedan sin ubicar porque SKUs de footprint chico fragmentan el piso antes de que le toque competir. Se investigó a fondo (7 iteraciones de diseño distintas, incluyendo reserva de territorio y empaquetado por estantes) sin encontrar un criterio de orden que no perjudique a algún SKU — es una limitación estructural de cualquier heurística secuencial de asignación de territorio, no un bug puntual. Queda documentada como **pendiente de decisión** (invertir en un solver de reparto de área simultáneo, o cambiar el criterio de éxito para priorizar cobertura de SKUs sobre cantidad cruda de cajas) — el comportamiento de producción hoy sigue siendo el resultado del backtracking+LNS normal (87/98 en ese caso), sin ningún cambio activado.
 
-Primera versión del filtro de compatibilidad dentro de una cama: `alto_caja_secundario <= altura_cama + tolerancia` — asimétrico, solo evitaba que un SKU **más alto** se saliera de la cama. Un SKU **mucho más bajo** pasaba el filtro igual (ej. una caja de 20cm compartiendo una cama de 100cm: físicamente sí entra en la profundidad disponible) pero dejaba exactamente el hueco de 80cm que se estaba tratando de eliminar. Atrapado por un test escrito a propósito para reproducir el caso de una captura real que mandó el usuario. Corregido a un chequeo **simétrico**: `abs(alto_caja_secundario - altura_cama) <= tolerancia`.
+## 11. Demanda que no se logra colocar
 
-### 10.3 Sobresaliente por cama dominada — probado y descartado
+Antes se perdía en silencio (un bug real: el motor la calculaba internamente pero nunca llegaba a ningún reporte). Ahora, toda demanda que no encuentra lugar — sea porque no cabe en ningún pallet abierto, o porque los pallets fijos de `Pallets_Objetivo` genuinamente se llenan, o porque quedó excluida antes de llegar al armado (una caja que no entra en el pallet en ninguna orientación) — se reporta en una hoja **"Cajas_No_Colocadas"** del Excel final: CD, SKU, descripción, categoría, cajas y unidades no colocadas. La hoja solo aparece si hay algo que reportar.
 
-Se probó una versión donde, si el SKU ancla llenaba la cama entera él solo, se le permitía usar la base extendida con sobresaliente (125×105). La heurística para decidir "esta cama va a quedar sola" resultó frágil: un SKU con demanda que coincidía justo con su propia capacidad de grilla activaba el modo extendido aunque después hubiera quedado lugar de sobra para que un SKU chico distinto se sumara a esa misma cama con la base estricta. Se descartó — queda como mejora futura pendiente de un criterio más robusto (por ejemplo, intentar la versión extendida y confirmar que de verdad no hay ningún otro SKU pendiente compatible antes de comprometerse a esa base).
+## 12. Reconciliación geométrica Maestro ↔ UMA
 
-### 10.4 Resultado medido del rediseño
+Sin cambios de fondo respecto a la versión anterior: el Maestro (`Cajas por cama`) manda si es geométricamente creíble; solo si ni la geometría medida ni la geometría medida + sobresaliente de negocio (2cm/lado) alcanzan a explicarlo, se degrada al techo geométrico real — nunca se inventa un footprint artificial solo para que el número del Maestro "cierre" matemáticamente. El sobresaliente de 2cm/lado se usa tanto para la plausibilidad del Maestro como para el armado real.
 
-| | Antes (torres) | Después (camas) |
-|---|---|---|
-| Dataset grande (`Cubicaje18.07.2026.xlsx`) | 53 pallets | **47 pallets** |
-| Dataset real 18.08 | 60 pallets | **52 pallets** |
+Un bug real corregido en esta ventana de trabajo: SKUs con una dimensión declarada en 0.0 en UMA (dato real, no vacío) desaparecían del plan sin ningún aviso — 18 SKUs, ~295 cajas perdidas en silencio en el dataset de producción. Se corrigió tratando cualquier dimensión `<= 0` como insuficiente, igual que un dato faltante.
 
-0 violaciones geométricas, demanda exacta, y — el invariante central que motivó el rediseño — **0 camas con hueco mayor a `TOLERANCIA_HUECO_CAMA_CM` en todo el dataset real** (no solo en los tests sintéticos, verificado explícitamente contra ambos datasets).
+## 13. Sobresaliente de negocio (borde exterior del pallet)
 
----
+`SOBRESALIENTE_MAX_CM = 2.0`, confirmado por el usuario. La base física sigue siendo 120×100 cm. El área permitida es 124×104 cm, centrada sobre la parihuela: X de -2 a 122 cm y Y de -2 a 102 cm. No se pueden acumular los 4 cm en un solo extremo. El armado, la validación de entrada, la auditoría y el inspector utilizan estos límites.
 
-## 11. Estabilidad — informativa, nunca bloquea
+## 14. Paralelización — por qué la app ya no tarda lo mismo
 
-`src/estabilidad.py` calcula, sobre cada pallet ya armado: centro de masa XY (ponderado por peso de cada torre) y su desviación del centro geométrico, peso por cuadrante, torres "esbeltas" (altura / lado más corto > 4), y fracción de peso en la mitad superior (centro de masa vertical ponderado, normalizado contra la altura de producto real). Estados `OK` / `WARN_COG` / `WARN_TORRE_ESBELTA` / `WARN_PESO_SUPERIOR` — nunca bloquea el armado, es un reporte para que operación audite manualmente un pallet específico si hace falta. Umbrales sin validar contra operación real: un punto de partida razonable, no una norma.
+Pedido explícito tras ver que un cubicaje real de 12 CDs con `Pallets_Objetivo` iba a tardar horas: cada CD es 100% independiente (ni comparte demanda ni el contador de IDs de pallet), así que ahora se procesan varios CDs a la vez en procesos separados. Cuando un único CD necesita LNS (varias semillas independientes), esas semillas también se paralelizan — pero nunca los dos niveles a la vez (evita saturar los núcleos reales con N×5 procesos peleando por el mismo hardware). Esto bajó una corrida real de 12 CDs de "colgada más de 21 horas" (antes del tope de reloj) a 152 segundos, y una corrida de un solo pallet forzado de 324s a 118.5s.
 
----
+## 15. El benchmark real y motores descartados (sin cambios de fondo)
 
-## 12. Validación geométrica dura
+Se mantiene todo lo documentado en versiones anteriores: el benchmark de 42 pallets físicos reales (`src/benchmark.py`), los motores V3/V4/V4b/V4c/torres/AUTO/AUTO_CONSOLIDADO/SKU_CONSOLIDADO ya eliminados del repo, y **`packing_ph_fraccion.py`** (motor aproximado por fracción de PH, calibrado contra un cubicaje real) — se probó, se conectó, se debuggeó, y finalmente **se revirtió**: el usuario, viendo el resultado real en la app, encontró camas con hasta 21% de cobertura de soporte faltante en promedio (742 torres con menos del 50% de apoyo real, muchas con 0%) — "eso no puede pasar". El archivo sigue en el repo, probado, pero el pipeline no lo usa; se volvió al motor exacto (`packing_bloques.py`) con 2 ideas rescatadas de `packing_ph_fraccion.py` (orientación flexible y tope real de `Cajas por PH`).
 
-`src/validacion_v5.py` audita, sobre el resultado YA armado (no es una segunda implementación del packer, es una verificación independiente):
+## 16. Verificación en esta revisión
 
-- **Overflow**: ninguna torre se sale de la base del pallet. El chequeo permite hasta la base extendida (125×105) por si algún camino la usara, pero en la práctica hoy el armado por camas siempre usa la base estricta 120×100 (sección 5.2) — el margen extra queda sin uso.
-- **Overlap 3D**: ninguna pareja de torres del mismo pallet se superpone en X, Y y Z simultáneamente — dos torres pueden compartir el mismo (x,y) si sus rangos de altura no se cruzan (apilado válido, una cama encima de otra).
-- **Altura**: ningún pallet supera `ALTURA_TOPE_DURO` (215cm).
+Se corrió el motor en vivo, contra el dataset de referencia (`Cubicaje18.07.2026.xlsx`, 9 CDs reales), sobre 2 de los 9 CDs (BK41: 280 cajas → 4 pallets; BK65: 347 cajas → 5 pallets): **demanda exacta en ambos, 0 violaciones geométricas**, alturas entre 207.6cm y 214.5cm, ocupación de huella (`ocupacion_xy`) entre 75% y 94%. No se pudo completar una corrida de los 9 CDs en una sola sesión por el costo de tiempo real del solver actual (documentado en la sección 9.3 y 10) — el último número agregado verificado en `Parches/v5/PATCH_LOG.md` para el archivo de pruebas interno del proyecto (`ARCHIVO_REAL`, 12 CDs, tras excluir Cigarros y aplicar los refinamientos de la sección 9.4/9.5) es **49 pallets totales, 4 parciales (8%), 94% de aprovechamiento de altura, peso promedio 970.5/1430kg**, con la suite completa de 177 tests en verde.
 
-Estas violaciones son las que evalúa el gate del benchmark (sección 2) junto con el rango de pallets y la demanda exacta.
+## 17. Estado abierto / pendiente de decisión
 
----
-
-## 13. Estado actual (dataset real `Cubicaje18.07.2026.xlsx`)
-
-```
-pallets totales:          47
-por CD:                     BK31=4, BK41=4, BK43=4, BK65=5, BK68=4,
-                             SJ86=6, SJ87=7, SJ95=4, SJ97=9
-altura media:              193.9 cm  (rango 63.9 – 214.9)
-pallets bajo 190cm:         9
-pallets bajo 170cm:         8
-bat_dedicados:               2
-demanda_unidades_error:     0.0
-violaciones geométricas:    0
-peor hueco dentro de una cama: 8.0 cm (= tolerancia exacta, nunca la supera)
-gate 42-45:                  NO aprobado (único motivo: pallets fuera de rango)
-```
-
----
-
-## 14. Invariantes
-
-1. La demanda nunca se pierde en silencio — se despacha, o queda explícitamente en `sin_colocar` / "Requiere Revisión".
-2. Ningún pallet supera `ALTURA_TOPE_DURO` (215cm).
-3. Ninguna torre se sale de su base permitida ni se superpone con otra en 3D.
-4. El pallet se arma cama por cama — nunca una columna aislada de piso a techo que le quite aire disponible a otro SKU.
-5. Dentro de una misma cama, la diferencia de altura entre el SKU ancla y cualquier otro SKU que la comparte nunca supera `TOLERANCIA_HUECO_CAMA_CM` (8cm), en ninguna dirección.
-6. BAT nunca se despacha por caja completa; se consolida en unidades reales en la caja física fija, compitiendo por espacio junto con el resto de la demanda del CD.
-7. Toda geometría inferida/degradada queda trazada (`Fuente_Geometria`) — nunca se inventa una medida en silencio.
-8. La corrida es determinística: mismo input, mismo Excel byte a byte (sin aleatoriedad en ningún punto del pipeline actual).
-
----
-
-## 15. Historial resumido (de V3 a hoy)
-
-El detalle completo, patch por patch, vive en `Parches/v5/PATCH_LOG.md` (no se repite acá). Resumen de las etapas mayores:
-
-- **V3/V4**: motor por "camas" de categoría (capas horizontales uniformes por nivel de estabilidad), reglas duras de altura/peso/orden de categorías. No confundir con el armado por camas actual (sección 9) — aquella agrupaba por categoría, esta agrupa por altura de caja compatible, sin importar la categoría.
-- **V4b/V4c**: mezcla libre por geometría en vez de por categoría, peso pasa a blando, rotación acostada para Comestibles/Cigarros.
-- **V5 (P0-P14)**: motor columnar por "torres" (posición XY con altura independiente), multi-start, residual search, BAT integrado, gate formal 42-45. Mejor resultado propio: 49 pallets, sin aprobar el gate.
-- **AUTO / AUTO_CONSOLIDADO**: correr V4 y V5 y quedarse con el mejor resultado por CD. Mejor resultado medido: 48 pallets.
-- **SKU_CONSOLIDADO / SKU_BLOQUE (torres)**: pivote a "un SKU nunca queda repartido en más pallets de los necesarios" como prioridad de negocio, con fase de "dedicar" pallets completos + "bloques" enteros combinados.
-- **Limpieza (`1c5f68e`)**: se borró todo motor salvo SKU_BLOQUE (V4 completo, V5 multi-start puro, AUTO, AUTO_CONSOLIDADO, SKU_CONSOLIDADO, `legacy/`) — `src/` -45% líneas. Encontró el bug de pérdida de demanda de sección 10.1.
-- **Fix de orientación + sobresaliente en dedicados (`506285c`)**: corrigió una fragmentación de orientación y aplicó sobresaliente a pallets 100% dedicados — superado por el punto siguiente, que eliminó el concepto de "dedicado".
-- **Rediseño por camas (`d7051a9`, commit actual)**: reemplaza el modelo de torres por armado cama-por-cama (sección 9), tras detectar con capturas reales que las torres dejaban huecos de aire grandes. Recuperó `src/layout_solver.py` (borrado por error en la limpieza anterior, no cableado todavía — ver `DOCUMENTACION_TECNICA.md`). Bajó el dataset grande de 53 a 47 pallets y el dataset real 18.08 de 60 a 52.
-
-**Decisión de negocio explícita y vigente**: el pallet se arma por capas horizontales con huecos acotados, priorizando estabilidad física real (evidenciada en fotos/capturas) por sobre cualquier heurística de empaque que no reproduzca cómo se arma un pallet en la operación. Cualquier intento futuro de acercarse más al benchmark de 42-45 tiene que respetar esa forma de armado, no relajarla.
+- **"Grandes primero" en `Pallets_Objetivo`** (sección 10): investigación seria, sin cerrar. Tres caminos posibles, ninguno tomado todavía: invertir en un solver de reparto de área real, cambiar el criterio de éxito para priorizar cobertura de SKUs, o dejarlo como está (documentado, sin activar).
+- **Mecanismo de carga de `Pallets_Objetivo`**: ya conectado end-to-end (hoja opcional en el Excel); no hay pendiente de diseño acá, solo de uso.
+- **Dato fuente de Electrolight y posibles SKUs similares** (sección 6): Largo/Ancho de UMA posiblemente invertidos para más de un SKU del Maestro de este cliente — pendiente de auditoría del dato fuente, fuera del alcance del algoritmo.
+- **`layout_solver.py`**: sigue en el repo, probado, sin ningún llamador de producción — disponible si se decide usarlo en el futuro.

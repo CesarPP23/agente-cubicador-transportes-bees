@@ -273,7 +273,8 @@ def reconciliar_sku(row) -> GeometriaSKU:
     # footprint (aunque sea uno "cercano" a lo medido, vía
     # inferir_footprint_desde_cajas_cama), se chequea si la geometría REAL
     # MEDIDA (sin tocar largo/ancho) ya explica al Maestro con el sobresaliente
-    # de negocio (2,5cm/lado). Regla explícita (DOCUMENTACION_LOGICA_V5.md
+    # de negocio (config.SOBRESALIENTE_MAX_CM, 2cm/lado desde PATCH V6.01
+    # -BK31, antes 2,5cm/lado). Regla explícita (DOCUMENTACION_LOGICA_V5.md
     # sección 5.3): "no sustituir una medición física por footprint artificial
     # si el dato operacional puede explicarse con sobresaliente validado".
     # Antes (V4/P3) se saltaba directo a `inferir_footprint_desde_cajas_cama`

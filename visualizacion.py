@@ -24,8 +24,8 @@ COLOR_TEXTO = "#0b0b0b"
 
 def dibujar_cama(cama: Cama, info_sku: dict) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(5, 4.3))
-    ax.set_xlim(0, config.PALLET_LARGO)
-    ax.set_ylim(0, config.PALLET_ANCHO)
+    ax.set_xlim(-config.SOBRESALIENTE_MAX_CM, config.PALLET_LARGO + config.SOBRESALIENTE_MAX_CM)
+    ax.set_ylim(-config.SOBRESALIENTE_MAX_CM, config.PALLET_ANCHO + config.SOBRESALIENTE_MAX_CM)
     ax.set_aspect("equal")
     ax.set_facecolor(COLOR_SUPERFICIE)
     ax.set_title(
@@ -150,8 +150,8 @@ def dibujar_pallet_v5_3d(pallet: PalletV5, info_sku: dict, vista: str = "isometr
     ax.view_init(elev=elev, azim=azim)
 
     altura_max = max(pallet.altura_final, config.ALTURA_TOTAL_MAX) + 10
-    ax.set_xlim(0, config.PALLET_LARGO)
-    ax.set_ylim(0, config.PALLET_ANCHO)
+    ax.set_xlim(-config.SOBRESALIENTE_MAX_CM, config.PALLET_LARGO + config.SOBRESALIENTE_MAX_CM)
+    ax.set_ylim(-config.SOBRESALIENTE_MAX_CM, config.PALLET_ANCHO + config.SOBRESALIENTE_MAX_CM)
     ax.set_zlim(0, altura_max)
     ax.set_xlabel("Largo (cm)")
     ax.set_ylabel("Ancho (cm)")

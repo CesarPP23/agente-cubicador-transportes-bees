@@ -25,10 +25,8 @@ class TorreCandidate:
     cantidad_disponible: int
     peso_unitario: float
     fuente_geometria: str = ""
-    # [Refinamiento 'tolerancia de sobresaliente'] True solo para candidatas
-    # de generar_torres_candidatas_todas_orientaciones (Comestibles/Aseo/
-    # Cigarros) -config.TOLERANCIA_OVERHANG_CM (packing_bloques._cuboide_
-    # admite_candidato) solo aplica a estas, nunca a Licores/Lácteos/NABs.
+    # Marca candidatas con orientación libre; el sobresaliente es una
+    # regla geométrica independiente de la posibilidad de acostar la caja.
     es_flexible: bool = False
 
 

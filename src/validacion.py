@@ -45,8 +45,8 @@ def _normalizar_sku(serie: pd.Series) -> pd.Series:
 def _cabe_en_pallet(largo, ancho) -> bool:
     if pd.isna(largo) or pd.isna(ancho):
         return False
-    orientacion_a = largo <= config.PALLET_LARGO and ancho <= config.PALLET_ANCHO
-    orientacion_b = ancho <= config.PALLET_LARGO and largo <= config.PALLET_ANCHO
+    orientacion_a = largo <= config.PALLET_LARGO_EFECTIVO and ancho <= config.PALLET_ANCHO_EFECTIVO
+    orientacion_b = ancho <= config.PALLET_LARGO_EFECTIVO and largo <= config.PALLET_ANCHO_EFECTIVO
     return orientacion_a or orientacion_b
 
 

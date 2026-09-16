@@ -70,7 +70,7 @@ def test_detecta_overlap_vertical_si_los_rangos_de_z_se_cruzan():
 
 
 def test_detecta_overflow_fuera_de_la_base():
-    torre = _torre("A", 100, 0, largo=30, ancho=20)  # 100+30=130 > 125 (base extendida)
+    torre = _torre("A", 100, 0, largo=30, ancho=20)  # 100+30=130 > 122 (borde derecho permitido)
     pallet = PalletV5(id="P4", cd="BK31", torres=[torre], altura_final=config.ALTURA_PALLET_VACIO + 25)
     violaciones = validar_pallet_v5(pallet)
     assert len(violaciones) == 1
@@ -79,10 +79,9 @@ def test_detecta_overflow_fuera_de_la_base():
 
 def test_sobresaliente_dentro_del_margen_no_es_violacion():
     """[sobresaliente] Una torre que sobresale de la base estricta 120x100
-    pero queda dentro de la extendida 125x105 (2.5cm/lado, estándar
-    logístico ya confirmado) NO es una violación -la usan los pallets
+    pero queda dentro de la extendida 124x104 (2 cm por lado) NO es una violación -la usan los pallets
     dedicados a un solo SKU (ver packing_bloques._dedicar_por_sku)."""
-    torre = _torre("A", 96, 0, largo=27, ancho=20)  # 96+27=123: > 120, <= 125
+    torre = _torre("A", 95, 0, largo=27, ancho=20)  # 95+27=122: exactamente 2 cm sobre el borde derecho
     pallet = PalletV5(id="P10", cd="BK31", torres=[torre], altura_final=config.ALTURA_PALLET_VACIO + 25)
     assert validar_pallet_v5(pallet) == []
 

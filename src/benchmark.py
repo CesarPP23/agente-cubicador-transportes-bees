@@ -206,8 +206,8 @@ def evaluar_gate_v5(resultado: BenchmarkResultado, violaciones_geometria: list[s
         )
     if resultado.demanda_unidades_error != 0:
         razones.append(f"demanda_unidades_error={resultado.demanda_unidades_error} (debe ser 0)")
-    if resultado.altura_max > ALTURA_MAX_REAL:
-        razones.append(f"altura_max={resultado.altura_max} supera el tope real {ALTURA_MAX_REAL}")
+    if resultado.altura_max > config.ALTURA_TOPE_DURO:
+        razones.append(f"altura_max={resultado.altura_max} supera el tope operativo {config.ALTURA_TOPE_DURO}")
     if violaciones_geometria:
         razones.append(f"{len(violaciones_geometria)} violaciones geométricas (overlap/overflow)")
 

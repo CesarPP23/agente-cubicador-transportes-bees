@@ -15,29 +15,11 @@ PALLET_ANCHO = 100
 # Pallets_Objetivo (nunca en el camino abierto por defecto, ver ahí mismo).
 PRIORIZAR_GRANDES_FRACCION_AREA_PALLET = 0.05
 
-# [V4 / Parches/v4_cubicaje_mixto/PARCHES_V4.md, P2] Sobresaliente aceptado:
-# cuánto puede volar la caja del borde del pallet. Confirmado con Omar. 2,5 cm
-# por lado es el límite del estándar logístico -más allá la caja pierde sobre
-# 20% de resistencia a la compresión porque su esquina queda sin apoyo.
-# Poner 0.0 vuelve al criterio estricto de V3.
-#
-# Medido sobre 458 SKUs, cuánto del dato declarado por la operación resulta
-# geométricamente alcanzable según el sobresaliente que se acepte:
-#     0,0 cm/lado -> 73%
-#     1,0 cm/lado -> 78%
-#     2,0 cm/lado -> 81%
-#     2,5 cm/lado -> 82%   <- elegido
-#     5,0 cm/lado -> 86%   (fuera del estándar seguro)
-#
-# Uso: SÍ en la validación/reconciliación de "Cajas por cama" (¿es creíble el
-# dato del Maestro?, ver reconciliacion_geometrica.capacidad_xy_max_con_sobresaliente).
-# NO en el packing real (packing_2d) -si el motor planifica asumiendo
-# sobresaliente en todos lados, dos camas que sobresalen en direcciones
-# distintas dan un pallet con perfil irregular difícil de estibar y envolver.
-# Es una decisión de negocio de PLANIFICACIÓN todavía no confirmada con Omar.
-SOBRESALIENTE_MAX_CM = 2.5
-PALLET_LARGO_EFECTIVO = PALLET_LARGO + 2 * SOBRESALIENTE_MAX_CM  # 125
-PALLET_ANCHO_EFECTIVO = PALLET_ANCHO + 2 * SOBRESALIENTE_MAX_CM  # 105
+# Regla operativa confirmada con BK31: máximo 2 cm EN CADA LADO.
+# Coordenadas respecto de la parihuela: X [-2, 122], Y [-2, 102].
+SOBRESALIENTE_MAX_CM = 2.0
+PALLET_LARGO_EFECTIVO = PALLET_LARGO + 2 * SOBRESALIENTE_MAX_CM  # 124
+PALLET_ANCHO_EFECTIVO = PALLET_ANCHO + 2 * SOBRESALIENTE_MAX_CM  # 104
 
 # [V4c / fotos de los 42 pallets reales] Confirmado con Omar viendo las fotos:
 # Comestibles y Cigarros se acuestan para ahorrar espacio -no se dejan siempre
@@ -66,8 +48,8 @@ ALTURA_PALLET_VACIO = 14.92
 #   170-185  PARCIAL OPERATIVO
 #   <170     RESIDUAL / REVISAR
 #   200-210  ALTO PERO OPERATIVO
-#   210-215  EXCEPCIÓN / VALIDAR
-#   >215     NO PERMITIDO hasta validación adicional
+#   210-220  EXCEPCIÓN / VALIDAR
+#   >220     NO PERMITIDO
 ALTURA_TARGET = 198.3
 ALTURA_OPTIMA_MIN = 195.0
 ALTURA_OPTIMA_MAX = 200.0
@@ -75,16 +57,10 @@ ALTURA_NOMINAL_MIN = 190.0
 ALTURA_TOLERADO_MIN = 185.0
 ALTURA_PARCIAL_OPERATIVA_MIN = 170.0
 ALTURA_ALERTA_ALTA = 210.0
-ALTURA_MAX_OBSERVADA = 215.0
+ALTURA_MAX_OBSERVADA = 220.0  # tope operativo total, incluye la parihuela
 
-# [V3] Ninguno de los umbrales de arriba es un límite normativo validado -son
-# el benchmark observado. Mientras ALTURA_HARD_VALIDADA sea None, el sistema
-# NO debe tratar 210 ni 215 como "techo físico absoluto": son alerta y
-# excepción/máximo observado respectivamente. El motor SÍ necesita un tope
-# operacional para decidir cuándo dejar de apilar -se usa ALTURA_MAX_OBSERVADA
-# (215) para eso, que es distinto de afirmar que 215 es un límite validado.
-# Si en algún momento hay una cifra formal (norma de seguridad, límite de
-# rack, etc.), fijarla acá para que se vuelva un bloqueo real.
+# Tope operativo confirmado con BK31: 220 cm incluyendo la parihuela.
+# ALTURA_HARD_VALIDADA se conserva como dato separado de normativa formal.
 ALTURA_HARD_VALIDADA: float | None = None
 
 # Altura útil de producto = altura total - pallet vacío.
@@ -103,7 +79,7 @@ PESO_PARAMETROS_VALIDADOS = False
 
 # [V4b / fotos de los 42 pallets reales] Confirmado con Omar: la única
 # restricción dura de armado es la altura (ver ALTURA_NOMINAL_MIN/
-# ALTURA_MAX_OBSERVADA, ~190-215cm); "buscar la mejor forma geométrica...
+# ALTURA_MAX_OBSERVADA, ~190-220cm); "buscar la mejor forma geométrica...
 # con el fin de mover la menor cantidad de pallets" no deja margen para que
 # el peso bloquee una combinación que geométricamente conviene. PESO_HARD_KG
 # se mantiene para el reporte/alerta de validacion_peso.py (ESTADO_ALERTA_PESO),
@@ -148,23 +124,9 @@ PESO_UMA_ES_POR_UNIDAD = False
 RECONCILIACION_PESO_DELTA_DIMENSIONES = 1.0
 RECONCILIACION_PESO_ESPACIO_VACIO = 0.5
 
-# [Tolerancia de sobresaliente SOBRE SOPORTE -pedido explícito del usuario
-# tras la sesión BK31: a mano se aceptó un sobresaliente chico caso por caso
-# (Altomayo, 25.7cm de ancho sobre una base de Vino de 24cm, sobresale 1.7cm
-# sobre AIRE libre, sin tocar el borde exterior del pallet)] Distinto de
-# `SOBRESALIENTE_MAX_CM` arriba -ese es sobre el BORDE EXTERIOR del pallet
-# (120x100, decisión de negocio todavía sin confirmar para el packing real);
-# este es sobre el borde de la CAJA DE ABAJO que sostiene, mientras la caja
-# de arriba se mantenga dentro de PALLET_LARGO x PALLET_ANCHO -no cambia el
-# perfil exterior del pallet, así que no aplica la misma objeción de "perfil
-# irregular difícil de estibar". Apagada por defecto (0.0 = comportamiento
-# idéntico a hoy, sin cambio en los pallets ya verificados) -subirla a un
-# valor > 0 permite que una caja de
-# src.packing_bloques.CATEGORIAS_ORIENTACION_FLEXIBLE sobresalga hasta esta
-# cantidad de cm, en UN solo eje, SOLO sobre aire completamente libre (nunca
-# sobre otra caja, nunca fuera del pallet -ver `_cuboide_admite_candidato`/
-# `_solapa_con_torres` en packing_bloques.py).
-TOLERANCIA_OVERHANG_CM = 0.0
+# Sobresaliente sobre la caja de apoyo: hasta 2 cm por lado en ambos ejes.
+# El interior de la huella debe quedar apoyado; no se admiten colisiones.
+TOLERANCIA_OVERHANG_CM = 2.0  # máximo por lado sobre el soporte, confirmado con BK31
 RECONCILIACION_PESO_ASPECT_RATIO = 0.25
 
 # --- BAT (Cigarros/vapes) -- V3, reestructurado [regla explícita del

@@ -166,7 +166,8 @@ from src.packing_columnar import (
     _PalletEnConstruccion,
     _reconstruir_en_construccion,
 )
-from src.validacion_v5 import _area_cubierta_por_soporte
+from src.validacion_v5 import _tiene_soporte_admisible
+from src import diagnostico_no_colocadas
 from src.torres import (
     TorreCandidate,
     crear_torre,
@@ -265,8 +266,8 @@ def _cabe_en_pallet(cand: TorreCandidate, presupuesto: float) -> bool:
     """Chequeo de geometría pura contra un pallet VACÍO -si ni siquiera acá
     entra, no va a entrar en ninguno más lleno (huella mayor a 120x100 en
     ambas orientaciones, o caja más alta que el presupuesto de altura)."""
-    cols = int(config.PALLET_LARGO // cand.largo)
-    filas = int(config.PALLET_ANCHO // cand.ancho)
+    cols = int(config.PALLET_LARGO_EFECTIVO // cand.largo)
+    filas = int(config.PALLET_ANCHO_EFECTIVO // cand.ancho)
     return cols > 0 and filas > 0 and cand.alto_caja <= presupuesto + TOL
 
 
@@ -342,36 +343,43 @@ def _solapa_con_torres(pallet: PalletV5, x: float, y: float, z: float, w: float,
 
 
 def _fit_directo_o_con_tolerancia(pallet: PalletV5, c, cand: TorreCandidate) -> bool:
-    """[Refinamiento 'tolerancia de sobresaliente' -pedido explícito del
-    usuario tras la sesión BK31: a mano se aceptó que Altomayo (25.7cm)
-    sobresaliera 1.7cm sobre una base de Vino de 24cm, siempre sobre aire
-    libre, nunca sobre otra caja] Primero el chequeo estricto de siempre. Si
-    no entra por poco Y el candidato es de categoría flexible
-    (`cand.es_flexible` -Comestibles/Aseo, ver `CATEGORIAS_ORIENTACION_
-    FLEXIBLE`) Y `config.TOLERANCIA_OVERHANG_CM > 0` (apagada por defecto,
-    cero cambio de comportamiento hasta que se active a propósito), se
-    prueba una segunda vez permitiendo que UN SOLO eje (largo O ancho,
-    nunca los dos, nunca la altura) sobresalga hasta esa tolerancia -solo
-    se acepta si el footprint EXPANDIDO (a) sigue dentro de
-    `config.PALLET_LARGO` x `config.PALLET_ANCHO`, y (b) no se solapa con
-    ninguna Torre ya colocada (`_solapa_con_torres`)."""
-    if cand.largo <= c.w + TOL and cand.ancho <= c.h + TOL and cand.alto_caja <= c.d + TOL:
-        return True
-    if not cand.es_flexible or config.TOLERANCIA_OVERHANG_CM <= 0:
+    """Admite hasta 2 cm por lado, con apoyo real y sin colisiones.
+
+    El margen de soporte se aplica a ambos ejes y es independiente de
+    si la categoría permite acostar la caja. La posición debe respetar
+    además el margen exterior de la parihuela.
+    """
+    margen = config.SOBRESALIENTE_MAX_CM
+    if (c.x < -margen - TOL or c.y < -margen - TOL
+            or c.x + cand.largo > config.PALLET_LARGO + margen + TOL
+            or c.y + cand.ancho > config.PALLET_ANCHO + margen + TOL
+            or cand.alto_caja > c.d + TOL):
         return False
-    if cand.alto_caja > c.d + TOL:
-        return False  # la tolerancia nunca aplica en Z -altura siempre exacta
-    exceso_largo = max(0.0, cand.largo - c.w)
-    exceso_ancho = max(0.0, cand.ancho - c.h)
-    if exceso_largo > TOL and exceso_ancho > TOL:
-        return False  # solo UN eje puede sobresalir a la vez
-    if exceso_largo > config.TOLERANCIA_OVERHANG_CM + TOL or exceso_ancho > config.TOLERANCIA_OVERHANG_CM + TOL:
-        return False
-    if c.x + cand.largo > config.PALLET_LARGO + TOL or c.y + cand.ancho > config.PALLET_ANCHO + TOL:
+    directo = cand.largo <= c.w + TOL and cand.ancho <= c.h + TOL
+    if directo:
+        return True  # MaxRects ya garantiza espacio libre y apoyo en el cuboide.
+    tolerancia = config.TOLERANCIA_OVERHANG_CM
+    if (cand.largo > c.w + tolerancia + TOL
+            or cand.ancho > c.h + tolerancia + TOL):
         return False
     if _solapa_con_torres(pallet, c.x, c.y, c.z, cand.largo, cand.ancho, cand.alto_caja):
         return False
+    if c.z > TOL:
+        soportes = [t for t in pallet.torres if abs(t.z + t.altura - c.z) <= TOL]
+        torre = crear_torre(cand, x=c.x, y=c.y, z=c.z, cantidad=1)
+        if not _tiene_soporte_admisible(torre, soportes):
+            return False
     return True
+
+
+def _cantidad_sin_solape(pallet, c, cand, cantidad):
+    """Acota el lote completo: el vuelo puede chocar con una caja más arriba."""
+    for t in pallet.torres:
+        if (t.x < c.x + cand.largo - TOL and c.x < t.x + t.largo - TOL
+                and t.y < c.y + cand.ancho - TOL and c.y < t.y + t.ancho - TOL
+                and t.z + t.altura > c.z + TOL):
+            cantidad = min(cantidad, max(0, int((t.z - c.z + TOL) // cand.alto_caja)))
+    return cantidad
 
 
 def _cuboide_admite_candidato(
@@ -1153,6 +1161,7 @@ def _candidatos_lote(
                     _capacidad_restante_en_capa(pallet, sku, libre.z, tope_capa),
                     int((libre.d + TOL) // cand.alto_caja),
                 )
+                cantidad = _cantidad_sin_solape(pallet, libre, cand, cantidad)
                 if cantidad <= 0:
                     continue
                 area = cand.largo * cand.ancho
@@ -1224,6 +1233,7 @@ def _candidatos_lote(
                             _capacidad_restante_en_capa(pallet, sku, c.z, tope_capa),
                             int((c.d + TOL) // cand_op.alto_caja),
                         )
+                        cantidad = _cantidad_sin_solape(pallet, c, cand_op, cantidad)
                         if cantidad <= 0:
                             continue
                         # [Refinamiento 'seguir la misma torre'] Mismo
@@ -1397,8 +1407,8 @@ def _romper_skus_con_cascada(
     un SKU distinto, no elegido) sin soporte real debajo si estaba
     apoyada justo encima de una de las removidas -acá se remueve en
     CASCADA: después de sacar las elegidas, cualquier torre que quede sin
-    soporte real en TODA su huella (mismo criterio exacto que
-    `validacion_v5._area_cubierta_por_soporte`, el que usa el gate de
+    soporte real admisible (mismo margen por lado que
+    `validacion_v5._tiene_soporte_admisible`, el que usa el gate de
     geometría) también se saca, devolviendo su SKU a `pendientes` -y se
     repite hasta que no quede ninguna inestable (puede haber cadenas de
     más de 1 nivel). Modifica `construcciones`/`colocados_por_pallet`/
@@ -1419,8 +1429,7 @@ def _romper_skus_con_cascada(
                         o for o in restantes
                         if o is not t and o.sku not in elegidos_pallet and abs((o.z + o.altura) - t.z) <= TOL
                     ]
-                    area_cubierta = _area_cubierta_por_soporte(t, soportes)
-                    if area_cubierta < t.largo * t.ancho - TOL:
+                    if not _tiene_soporte_admisible(t, soportes):
                         elegidos_pallet.add(t.sku)  # se agrega a la ronda de remoción, cascada
                         cambio = True
                         continue
@@ -1763,8 +1772,43 @@ def _empacar_n_pallets(
         > sum(_area_union_xy(p.torres) for p in pallets_greedy)
     ):
         sin_colocar_bt = {sku: cant for sku, cant in pendientes_bt.items() if cant > 0}
-        return pallets_bt, sin_colocar_bt
-    return pallets_greedy, sin_colocar_greedy
+        pallets_final, sin_colocar_final = pallets_bt, sin_colocar_bt
+    else:
+        pallets_final, sin_colocar_final = pallets_greedy, sin_colocar_greedy
+
+    # [PATCH V6.02, sección 3] Rescue mode -SOLO cuando quedó demanda sin
+    # colocar. Nunca reemplaza el camino normal: intenta mejorarlo, y el
+    # resultado solo se acepta si el score final es estrictamente mejor
+    # (ver `rescue_solver._score_solucion`) -de lo contrario se conserva
+    # `pallets_final`/`sin_colocar_final` de arriba tal cual, sin ningún
+    # cambio de comportamiento.
+    if sin_colocar_final:
+        from src.rescue_solver import RESCUE_TIME_MAX_SECONDS, _score_solucion, rescue_solver
+
+        # [ojo -aliasing] `rescue_solver` recibe los MISMOS objetos
+        # `PalletV5` de `pallets_final` (los envuelve, no los copia) y los
+        # muta in-place mientras explora -por eso el score "de antes" se
+        # calcula ACÁ, con los datos de ESTE momento, no releyendo
+        # `pallets_final` después de la llamada (para entonces ya puede
+        # estar mutado a lo que sea que el rescue haya dejado puesto).
+        total_final = demanda_total - sum(sin_colocar_final.values())
+        pendientes_actual = {**{sku: 0 for sku in por_sku}, **sin_colocar_final}
+        score_actual = _score_solucion(total_final, pendientes_actual, por_sku, pallets_final)
+
+        deadline_rescue = time.time() + RESCUE_TIME_MAX_SECONDS
+        pallets_rescue, sin_colocar_rescue, stats_rescue = rescue_solver(
+            pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+            tope_pallet_por_sku, n_pallets, presupuesto, deadline=deadline_rescue,
+        )
+        total_rescue = demanda_total - sum(sin_colocar_rescue.values())
+        pendientes_rescue = {**{sku: 0 for sku in por_sku}, **sin_colocar_rescue}
+        score_rescue = _score_solucion(total_rescue, pendientes_rescue, por_sku, pallets_rescue)
+        if score_rescue > score_actual:
+            pallets_final, sin_colocar_final = pallets_rescue, sin_colocar_rescue
+        if pallets_final:
+            pallets_final[-1].metadata["rescue_stats"] = stats_rescue
+
+    return pallets_final, sin_colocar_final
 
 
 # [camino abierto, sin Pallets_Objetivo -pedido explícito del usuario tras
@@ -2134,5 +2178,13 @@ def armar_pallets_bloques(
     elif sin_colocar:
         contador[0] += 1
         pallets.append(PalletV5(id=f"PV5-{cd}-{contador[0]:03d}", cd=cd, metadata={"sin_colocar": sin_colocar}))
+
+    if sin_colocar:
+        # [sección 5] Diagnóstico de motivo de rechazo -puramente de
+        # lectura sobre el resultado ya congelado, no cambia `pallets` ni
+        # ninguna decisión de armado (ver src/diagnostico_no_colocadas.py).
+        pallets[-1].metadata["diagnostico_no_colocadas"] = diagnostico_no_colocadas.diagnosticar(
+            pallets, sin_colocar, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+        )
 
     return pallets

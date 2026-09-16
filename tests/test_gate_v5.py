@@ -33,7 +33,7 @@ def test_rechaza_por_demanda_no_exacta():
 
 
 def test_rechaza_por_altura_sobre_tope_real():
-    gate = evaluar_gate_v5(_resultado(altura_max=220.0))
+    gate = evaluar_gate_v5(_resultado(altura_max=220.01))
     assert gate.aprobado is False
     assert any("altura_max" in r for r in gate.razones)
 
@@ -45,5 +45,9 @@ def test_rechaza_por_violaciones_geometricas():
 
 
 def test_acumula_todas_las_razones_de_rechazo_sin_detenerse_en_la_primera():
-    gate = evaluar_gate_v5(_resultado(pallets=61, demanda_unidades_error=1.0, altura_max=220.0))
+    gate = evaluar_gate_v5(_resultado(pallets=61, demanda_unidades_error=1.0, altura_max=220.01))
     assert len(gate.razones) == 3
+
+
+def test_tope_operativo_actual_admite_220_aunque_el_benchmark_historico_sea_215():
+    assert evaluar_gate_v5(_resultado(altura_max=220.0)).aprobado
