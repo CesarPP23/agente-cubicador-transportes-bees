@@ -42,9 +42,13 @@ def test_bk31_respeta_cajas_por_ph():
         "Picaras/Altomayo/KR de las camas 5-6). La reconstrucción viene de una "
         "sesión de chat sin medición exacta -son imprecisiones de la "
         "reconstrucción, no evidencia de que el patrón de armado sea "
-        "físicamente inviable. Según sección 10 del patch: NO tocar DFS/LNS "
-        "hasta reconciliar esto (corregir las coordenadas de la reconstrucción "
-        "manual, con más precisión, o confirmar con fotos reales)."
+        "físicamente inviable. La composición física BK31 (98 cajas / 1 "
+        "pallet) ya fue reproducida exitosamente por el solver con una "
+        "geometría alternativa válida (ver PATCH V6.02, "
+        "test_bk31_rescue_solver_98_de_98). Este xfail aplica únicamente a la "
+        "reconstrucción manual aproximada de coordenadas, que conserva 35 "
+        "violaciones por falta de medición física exacta -no representa una "
+        "limitación del solver ni una duda sobre la factibilidad del pallet."
     ),
     strict=True,
 )

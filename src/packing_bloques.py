@@ -1783,7 +1783,7 @@ def _empacar_n_pallets(
     # `pallets_final`/`sin_colocar_final` de arriba tal cual, sin ningún
     # cambio de comportamiento.
     if sin_colocar_final:
-        from src.rescue_solver import RESCUE_TIME_MAX_SECONDS, _score_solucion, rescue_solver
+        from src.rescue_solver import RESCUE_TIME_MAX_SECONDS, _score_solucion, rescue_solver, skus_completos
 
         # [ojo -aliasing] `rescue_solver` recibe los MISMOS objetos
         # `PalletV5` de `pallets_final` (los envuelve, no los copia) y los
@@ -1793,7 +1793,11 @@ def _empacar_n_pallets(
         # estar mutado a lo que sea que el rescue haya dejado puesto).
         total_final = demanda_total - sum(sin_colocar_final.values())
         pendientes_actual = {**{sku: 0 for sku in por_sku}, **sin_colocar_final}
-        score_actual = _score_solucion(total_final, pendientes_actual, por_sku, pallets_final)
+        # [PATCH V6.04, sección 3] SKUs completos en el camino normal -el
+        # mismo "baseline protegido" que usa rescue_solver puertas adentro,
+        # acá para la comparación de aceptar/rechazar el resultado ENTERO.
+        skus_protegidos_cd = skus_completos(pendientes_actual, por_sku)
+        score_actual = _score_solucion(total_final, pendientes_actual, por_sku, pallets_final, skus_protegidos_cd)
 
         deadline_rescue = time.time() + RESCUE_TIME_MAX_SECONDS
         pallets_rescue, sin_colocar_rescue, stats_rescue = rescue_solver(
@@ -1802,11 +1806,99 @@ def _empacar_n_pallets(
         )
         total_rescue = demanda_total - sum(sin_colocar_rescue.values())
         pendientes_rescue = {**{sku: 0 for sku in por_sku}, **sin_colocar_rescue}
-        score_rescue = _score_solucion(total_rescue, pendientes_rescue, por_sku, pallets_rescue)
-        if score_rescue > score_actual:
+        score_rescue = _score_solucion(total_rescue, pendientes_rescue, por_sku, pallets_rescue, skus_protegidos_cd)
+        aceptado = score_rescue > score_actual
+        if aceptado:
             pallets_final, sin_colocar_final = pallets_rescue, sin_colocar_rescue
+
+        # [PATCH V6.04, sección 14] Si el rescue V6.02 no llegó al 100%,
+        # intentar el Repair Solver v2 (coverage-aware LNS + neighborhoods
+        # iterativos + ejection chains) sobre lo que haya quedado -nunca
+        # reemplaza al rescue, solo lo mejora con el mismo criterio de
+        # score de arriba.
+        if sin_colocar_final:
+            from src.repair_solver import RESCUE_TIME_MAX_SECONDS as REPAIR_TIME_MAX_SECONDS
+            from src.repair_solver import repair_solver
+
+            total_pre_repair = demanda_total - sum(sin_colocar_final.values())
+            pendientes_pre_repair = {**{sku: 0 for sku in por_sku}, **sin_colocar_final}
+            score_pre_repair = _score_solucion(
+                total_pre_repair, pendientes_pre_repair, por_sku, pallets_final, skus_protegidos_cd,
+            )
+            deadline_repair = time.time() + REPAIR_TIME_MAX_SECONDS
+            pallets_repair, sin_colocar_repair, stats_repair = repair_solver(
+                pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+                tope_pallet_por_sku, n_pallets, presupuesto, skus_protegidos_cd, deadline=deadline_repair,
+            )
+            total_repair = demanda_total - sum(sin_colocar_repair.values())
+            pendientes_repair = {**{sku: 0 for sku in por_sku}, **sin_colocar_repair}
+            score_repair = _score_solucion(
+                total_repair, pendientes_repair, por_sku, pallets_repair, skus_protegidos_cd,
+            )
+            if score_repair > score_pre_repair:
+                pallets_final, sin_colocar_final = pallets_repair, sin_colocar_repair
+            if pallets_final:
+                pallets_final[-1].metadata["repair_stats"] = stats_repair
+
+        # [PATCH V6.04, sección 14] Último fallback: Exact Local Repair
+        # (OR-Tools CP-SAT) sobre un vecindario chico y acotado -solo si
+        # el Repair Solver v2 tampoco llegó al 100%. Se prueba contra CADA
+        # pallet del CD (la demanda faltante no está atada a uno en
+        # particular) y se conserva solo si mejora el score global.
+        if sin_colocar_final:
+            from src.exact_repair import EXACT_REPAIR_TIME_MAX_SECONDS, exact_repair_orquestado
+
+            deadline_exact = time.time() + EXACT_REPAIR_TIME_MAX_SECONDS * 3
+            stats_exact_total = {"activado": True, "intentos": 0, "exitos": 0, "cajas_recuperadas": 0}
+            for idx in range(len(pallets_final)):
+                if not sin_colocar_final or time.time() > deadline_exact:
+                    break
+                total_pre_exact = demanda_total - sum(sin_colocar_final.values())
+                pendientes_pre_exact = {**{sku: 0 for sku in por_sku}, **sin_colocar_final}
+                score_pre_exact = _score_solucion(
+                    total_pre_exact, pendientes_pre_exact, por_sku, pallets_final, skus_protegidos_cd,
+                )
+                pallet_exact, sin_colocar_exact, stats_exact = exact_repair_orquestado(
+                    pallets_final[idx], por_sku, sin_colocar_final, tope_pallet_por_sku, presupuesto,
+                    deadline=deadline_exact,
+                )
+                total_exact = total_pre_exact + stats_exact.get("cajas_recuperadas", 0)
+                pallets_intento = list(pallets_final)
+                pallets_intento[idx] = pallet_exact
+                score_exact = _score_solucion(
+                    total_exact, {**{sku: 0 for sku in por_sku}, **sin_colocar_exact}, por_sku,
+                    pallets_intento, skus_protegidos_cd,
+                )
+                stats_exact_total["intentos"] += stats_exact.get("intentos", 0)
+                stats_exact_total["exitos"] += stats_exact.get("exitos", 0)
+                stats_exact_total["cajas_recuperadas"] += stats_exact.get("cajas_recuperadas", 0)
+                if score_exact > score_pre_exact:
+                    pallets_final = pallets_intento
+                    sin_colocar_final = sin_colocar_exact
+            if pallets_final:
+                pallets_final[-1].metadata["exact_repair_stats"] = stats_exact_total
+
+        # [PATCH V6.03, sección 12] Instrumentación de uso del rescue, con
+        # los nombres de campo exactos que pide el patch -para que el
+        # reporte multi-CD (src/validacion_multicd.py) pueda leerla sin
+        # adivinar convenciones.
         if pallets_final:
-            pallets_final[-1].metadata["rescue_stats"] = stats_rescue
+            cajas_despues = total_rescue if aceptado else total_final
+            pallets_final[-1].metadata["rescue_stats"] = {
+                **stats_rescue,
+                "rescue_activado": True,
+                "rescue_motivo": (
+                    f"{demanda_total - total_final} cajas sin colocar tras el camino normal "
+                    f"(greedy+DFS+LNS) con pallets_objetivo={n_pallets} fijado"
+                ),
+                "rescue_cajas_antes": total_final,
+                "rescue_cajas_despues": cajas_despues,
+                "rescue_cajas_recuperadas": cajas_despues - total_final,
+                "rescue_tiempo_s": stats_rescue.get("tiempo_segundos"),
+                "rescue_conflictos_evaluados": stats_rescue.get("conflictos_evaluados"),
+                "rescue_blockers_retirados": stats_rescue.get("blockers_retirados"),
+                "rescue_skus_faltantes_antes": sorted(sku for sku, cant in pendientes_actual.items() if cant > 0),
+            }
 
     return pallets_final, sin_colocar_final
 

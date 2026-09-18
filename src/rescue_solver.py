@@ -434,17 +434,43 @@ def _volumen_sin_colocar(pendientes: dict[str, int], por_sku: dict[str, list[Tor
     return total
 
 
+def skus_completos(pendientes: dict[str, int], por_sku: dict[str, list[TorreCandidate]]) -> frozenset[str]:
+    """[PATCH V6.04, sección 3] SKUs 100% colocados en un estado dado -se
+    usa para capturar `skus_completos_en_baseline` ANTES de que rescue/
+    repair toquen nada, y así poder detectar en el score si una solución
+    "swapea" uno de esos SKUs por otro sin ganancia real."""
+    return frozenset(sku for sku in por_sku if pendientes.get(sku, 0) <= 0)
+
+
 def _score_solucion(
     total_colocado: int, pendientes: dict[str, int], por_sku: dict[str, list[TorreCandidate]],
-    pallets: list[PalletV5],
+    pallets: list[PalletV5], skus_protegidos: frozenset[str] = frozenset(),
 ) -> tuple:
-    """[sección 11] Primario: demanda total colocada. Desempate: menor
-    volumen sin colocar, menor altura máxima. (La "demanda crítica sin
-    colocar" del ejemplo conceptual del patch es, en este diseño, siempre
-    el mismo conjunto que `pendientes` -no se introduce una noción
-    separada y redundante de "crítico" acá.)"""
+    """[PATCH V6.04, sección 2] Score lexicográfico coverage-aware.
+    Primario: demanda total colocada (nunca cambia -sigue siendo lo que
+    manda). Desempates, en orden: 1) más SKUs completamente satisfechos,
+    2) menos SKUs con faltantes, 3) menos cajas de SKUs que ESTABAN
+    completos en baseline (`skus_protegidos`) y pasaron a faltantes -sin
+    esto, dos soluciones con el mismo total podían preferir una que
+    "cambia" un SKU ya resuelto por otro, en vez de simplemente sumar
+    cobertura (bug real encontrado en BK52: el rescue V6.02 recuperó 10
+    SKUs pero rompió 3 que ya estaban completos, y el score viejo no tenía
+    forma de penalizar eso), 4) menos volumen sin colocar, 5) menor altura
+    máxima."""
+    skus_con_faltantes = {sku for sku, cant in pendientes.items() if cant > 0}
+    skus_completamente_satisfechos = len(por_sku) - len(skus_con_faltantes)
+    cajas_nuevos_faltantes = sum(
+        cant for sku, cant in pendientes.items() if cant > 0 and sku in skus_protegidos
+    )
     altura_max = max((p.altura_final for p in pallets), default=0.0)
-    return (total_colocado, -_volumen_sin_colocar(pendientes, por_sku), -altura_max)
+    return (
+        total_colocado,
+        skus_completamente_satisfechos,
+        -len(skus_con_faltantes),
+        -cajas_nuevos_faltantes,
+        -_volumen_sin_colocar(pendientes, por_sku),
+        -altura_max,
+    )
 
 
 def rescue_solver(
@@ -492,10 +518,18 @@ def rescue_solver(
     ]
     pendientes: dict[str, int] = {sku: 0 for sku in por_sku}
     pendientes.update(sin_colocar)
+    # [PATCH V6.04, sección 3] Capturado ANTES de que rescue toque nada
+    # -"protegido" no significa "congelado": estos SKUs SÍ pueden romperse
+    # temporalmente durante una ruina, pero una solución FINAL que deja
+    # alguno de ellos con faltantes nuevos no debe preferirse sobre otra
+    # con la misma cantidad total y mejor cobertura (ver `_score_solucion`).
+    skus_protegidos = skus_completos(pendientes, por_sku)
 
     total_inicial = sum(sum(d.values()) for d in colocados_por_pallet)
     mejor_total = total_inicial
-    mejor_score = _score_solucion(total_inicial, pendientes, por_sku, [pc.pallet for pc in construcciones])
+    mejor_score = _score_solucion(
+        total_inicial, pendientes, por_sku, [pc.pallet for pc in construcciones], skus_protegidos,
+    )
     mejor_snapshot = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
 
     for sku, cant in sin_colocar.items():
@@ -539,7 +573,7 @@ def rescue_solver(
                 # revierte ESTE progreso real por no haber quedado guardado.]
                 progreso_en_ronda = True
                 total_actual = sum(sum(d.values()) for d in colocados_por_pallet)
-                score_actual = _score_solucion(total_actual, pendientes, por_sku, [pc.pallet for pc in construcciones])
+                score_actual = _score_solucion(total_actual, pendientes, por_sku, [pc.pallet for pc in construcciones], skus_protegidos)
                 if score_actual > mejor_score:
                     mejor_score = score_actual
                     mejor_total = total_actual
@@ -563,7 +597,7 @@ def rescue_solver(
                     construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                     nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, sku, blocker_skus, limite_tiempo,
                 )
-                score_resultante = _score_solucion(total_resultante, pendientes, por_sku, [pc.pallet for pc in construcciones])
+                score_resultante = _score_solucion(total_resultante, pendientes, por_sku, [pc.pallet for pc in construcciones], skus_protegidos)
                 if score_resultante > mejor_score:
                     mejor_score = score_resultante
                     mejor_total = total_resultante
