@@ -83,13 +83,31 @@ from src.validacion_v5 import validar_pallet_v5
 
 TOL = 1e-6
 
-# [sección 11] Ancho de haz -primera fase conservador, para no pagar el
-# costo de clonar N pallets x 32 estados por nivel si el problema es fácil.
-GLOBAL_BEAM_WIDTH = 32
-# [sección 11] Segunda fase, SOLO si el primer reinicio (beam 32) no llegó
-# al 100% -no se amplía indiscriminadamente, se usa nada más en los
-# reinicios 2 y 3 del multi-start (sección 17).
-GLOBAL_BEAM_WIDTH_HARD = 64
+# [PATCH V6.10, secciones 2-3 -"Beam por Estrategia"] Única fuente de
+# verdad para el ancho de haz de CADA reinicio del multi-start -antes
+# (V6.05-V6.09) la regla vivía duplicada e implícita en el propio loop de
+# `global_rescue()` ("intento==0 -> 32, resto -> 64"), sin espacio para
+# que una estrategia pidiera un valor distinto a las demás. Evidencia
+# V6.09-S1 (BK52, corrida real vía harness): `footprint`=32 y
+# `altura_critica`=64 seguían siendo los mejores valores para esos dos
+# reinicios (subir su beam no cambiaba su resultado); `demanda`=128 sí
+# marcó la diferencia -pasó de 101 (mismo tope que V6.08) a 114/114,
+# dentro del presupuesto compartido de 180s (165.179s medidos). Ningún
+# otro parámetro (TOP_K, score, MRV, batch, Zero-Only Structural, Critical
+# Lookahead, poda, transposition, timeout, estrategias del multi-start)
+# cambia en este parche -ver sección 13, "primero generalizar, después
+# optimizar".
+GLOBAL_BEAM_WIDTH_BY_STRATEGY: dict[str, int] = {
+    "footprint": 32,
+    "altura_critica": 64,
+    "demanda": 128,
+}
+# [sección 3] Fallback seguro -mismo valor "duro" que V6.05-V6.09 ya usaban
+# para cualquier reinicio que no fuera el primero. Nunca debería activarse
+# con `GLOBAL_MULTI_START_ESTRATEGIAS` actual (las 3 claves de arriba lo
+# cubren), pero evita un `KeyError` silencioso si se agrega una estrategia
+# nueva sin actualizar el mapa.
+GLOBAL_BEAM_WIDTH_FALLBACK = 64
 # [sección 9] Candidatos DIVERSOS (no casi-idénticos) por SKU elegido en
 # cada nivel del árbol.
 GLOBAL_BRANCH_TOP_K = 5
@@ -174,6 +192,17 @@ def _clonar_estado(estado: _EstadoGlobal) -> _EstadoGlobal:
         pendientes=dict(estado.pendientes),
         cajas_colocadas=estado.cajas_colocadas,
     )
+
+
+def _beam_width_para_estrategia(estrategia: str) -> int:
+    """[PATCH V6.10, sección 3] Única fuente de verdad para el ancho de
+    haz de un reinicio -reemplaza la regla anterior, implícita en el loop
+    de `global_rescue()` ("intento==0 -> 32, resto -> 64"), que no podía
+    darle a una estrategia un valor propio. `GLOBAL_BEAM_WIDTH_FALLBACK`
+    cubre cualquier estrategia no listada en `GLOBAL_BEAM_WIDTH_BY_
+    STRATEGY` -nunca debería activarse con `GLOBAL_MULTI_START_
+    ESTRATEGIAS` actual, es una red de seguridad, no un caso esperado."""
+    return GLOBAL_BEAM_WIDTH_BY_STRATEGY.get(estrategia, GLOBAL_BEAM_WIDTH_FALLBACK)
 
 
 def _reconstruir_demanda_total(
@@ -1404,7 +1433,7 @@ def global_rescue(
         limite_tiempo = min(limite_tiempo, deadline)
 
     stats: dict = {
-        "activado": True, "cd": cd, "beam_width": GLOBAL_BEAM_WIDTH,
+        "activado": True, "cd": cd, "beam_width_por_estrategia": dict(GLOBAL_BEAM_WIDTH_BY_STRATEGY),
         "estados_generados": 0, "estados_pruned_no_moves": 0, "duplicados": 0, "transposition_hits": 0,
         "max_frontier": 0, "max_deferred_skus": 0,
         "raw_candidates_generados": 0, "candidates_retenidos_top_k": 0,
@@ -1456,9 +1485,9 @@ def global_rescue(
         # dejaría `mejor_global` en None.
         if intento > 0 and time.time() > limite_tiempo:
             break
-        # [sección 11] Beam width chico primero -solo se amplía en los
-        # reinicios siguientes, si el primero no alcanzó el 100%.
-        beam_width = GLOBAL_BEAM_WIDTH if intento == 0 else GLOBAL_BEAM_WIDTH_HARD
+        # [PATCH V6.10, sección 3] Única fuente de verdad -ver
+        # `_beam_width_para_estrategia` y `GLOBAL_BEAM_WIDTH_BY_STRATEGY`.
+        beam_width = _beam_width_para_estrategia(estrategia)
         estado_inicial = _crear_estado_inicial(n_pallets, cd, contador, demanda_total)
         resultado, motivo_stop = _beam_search(
             estado_inicial, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
