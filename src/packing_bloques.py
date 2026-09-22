@@ -1878,6 +1878,50 @@ def _empacar_n_pallets(
             if pallets_final:
                 pallets_final[-1].metadata["exact_repair_stats"] = stats_exact_total
 
+        # [PATCH V6.05, Fase 2] Último fallback: Global Rescue -reconstruye
+        # el CD ENTERO desde `n_pallets` pallets vacíos con Beam Search
+        # (`src/global_rescue.py`), cuando NINGUNA capa de reparación local
+        # (Rescue V6.02, Repair V6.04, Exact Local Repair, todas arriba)
+        # llegó al 100%. Se activa únicamente si, después de TODAS esas
+        # capas, sigue quedando demanda sin colocar (`sin_colocar_final`
+        # no vacío, equivalente a `cajas_colocadas < demanda_total`) -no
+        # reemplaza ninguna capa previa, no se toca nada de lo de arriba.
+        if sin_colocar_final:
+            from src.global_rescue import GLOBAL_RESCUE_TIME_SECONDS, global_rescue
+            from src.validacion_v5 import validar_pallet_v5
+
+            total_pre_global = demanda_total - sum(sin_colocar_final.values())
+            pendientes_pre_global = {**{sku: 0 for sku in por_sku}, **sin_colocar_final}
+            score_pre_global = _score_solucion(
+                total_pre_global, pendientes_pre_global, por_sku, pallets_final, skus_protegidos_cd,
+            )
+            deadline_global = time.time() + GLOBAL_RESCUE_TIME_SECONDS
+            pallets_global, sin_colocar_global, stats_global = global_rescue(
+                pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+                tope_pallet_por_sku, n_pallets, cd, presupuesto, deadline=deadline_global, contador=contador,
+            )
+            total_global = demanda_total - sum(sin_colocar_global.values())
+            pendientes_global = {**{sku: 0 for sku in por_sku}, **sin_colocar_global}
+            score_global = _score_solucion(
+                total_global, pendientes_global, por_sku, pallets_global, skus_protegidos_cd,
+            )
+            # [fallback obligatorio, pedido explícito del usuario: "el
+            # resultado de Global Rescue nunca puede empeorar el mejor
+            # resultado anterior"] Doble red de seguridad antes de aceptar
+            # el reemplazo: (a) el score debe ser ESTRICTAMENTE mejor que
+            # el incumbent -igual o peor conserva `pallets_final`/
+            # `sin_colocar_final` tal cual, sin tocar nada; (b) TODOS los
+            # pallets candidatos deben pasar `validar_pallet_v5` -Global
+            # Rescue ya valida internamente (`stats_global["errores_
+            # geometricos"]`), pero se re-verifica acá, en la frontera del
+            # pipeline, sin confiar ciegamente en el resultado de un módulo
+            # ajeno para decidir qué se devuelve como resultado final.
+            geometria_valida = all(validar_pallet_v5(p) == [] for p in pallets_global)
+            if score_global > score_pre_global and geometria_valida:
+                pallets_final, sin_colocar_final = pallets_global, sin_colocar_global
+            if pallets_final:
+                pallets_final[-1].metadata["global_rescue_stats"] = stats_global
+
         # [PATCH V6.03, sección 12] Instrumentación de uso del rescue, con
         # los nombres de campo exactos que pide el patch -para que el
         # reporte multi-CD (src/validacion_multicd.py) pueda leerla sin
