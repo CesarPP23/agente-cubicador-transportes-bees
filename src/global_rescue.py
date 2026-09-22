@@ -120,6 +120,16 @@ GLOBAL_MULTI_START_MAX = len(GLOBAL_MULTI_START_ESTRATEGIAS)
 # MaxRects>0 se tratará DESPUÉS como decisión de SEARCH, no como corrección
 # de validez" -no en esta versión).
 STRUCTURAL_ZERO_RESCUE_MAXRECTS_MAXIMO = 0
+# [PATCH V6.09, secciones 1/6 -"Critical Precedence Lookahead"] Tope de
+# víctimas a probar por evento de lookahead -evidencia S3: MRV eligió
+# 22351 (rank 1, 2 candidatos) sobre 22353/23510 (rank 2-3, 4 candidatos
+# cada uno) y ese ÚNICO candidato de 22351 mató a los DOS SKUs restantes a
+# la vez (100% de sus hijos normales condenados); forzar 22353 primero, y
+# devolver el control al solver normal, llegó a 114/114. El mecanismo es
+# GENERAL (nunca referencia SKUs concretos) -este tope solo evita analizar
+# el CD entero cuando una expansión normal muere por varias víctimas a la
+# vez (sección 6: "no analizar todos los SKUs del CD").
+CRITICAL_LOOKAHEAD_MAX_VICTIMS = 3
 
 
 @dataclass
@@ -667,6 +677,39 @@ def _expandir_estado(
     )
     sku = orden[0]
 
+    hijos = _expandir_sku_en_estado(
+        estado, sku, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, stats,
+        cache_estructural,
+    )
+    if not hijos:
+        return []
+
+    # [PATCH V6.09, secciones 1-3 -"Critical Precedence Lookahead"] Solo en
+    # modo híbrido (`presupuesto is not None`, igual que Zero-Only
+    # Structural -sección 2: "no aumentar beam, no cambiar MRV normal").
+    # Fase 1/1.1/1.2/2.1 (sin `presupuesto`) quedan bit-a-bit sin cambios.
+    if presupuesto is not None:
+        hijos = _critical_precedence_lookahead(
+            estado, sku, hijos, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+            presupuesto, stats, cache_estructural,
+        )
+    return hijos
+
+
+def _expandir_sku_en_estado(
+    estado: _EstadoGlobal, sku: str, por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int], nivel_por_sku: dict[str, int], tope_pallet_por_sku: dict[str, int],
+    presupuesto: float | None, stats: dict | None, cache_estructural: CacheEstructural | None,
+) -> list[_EstadoGlobal]:
+    """[PATCH V6.09, sección 5 -extraído SIN cambios de comportamiento del
+    cuerpo que `_expandir_estado` ya usaba para expandir el sku elegido por
+    MRV] Candidatos híbridos + TOP_K diverso + lotes + placement, para UN
+    sku ya decidido -mismo generador de candidatos, mismo TOP_K, mismo
+    batch que usa la expansión normal. Compartido por dos llamadores: la
+    expansión normal (`sku` = elegido por MRV) y Critical Precedence
+    Lookahead (`sku` = víctima -sección 5 del parche: "usando exactamente
+    el candidate generator productivo... No inventar un generador
+    especial")."""
     opciones = _generar_candidatos_multi_pallet_hibrido(
         estado, sku, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         presupuesto, stats, cache_estructural,
@@ -713,6 +756,146 @@ def _expandir_estado(
                     por_sku_rescates[sku] = por_sku_rescates.get(sku, 0) + 1
             hijos.append(hijo)
     return hijos
+
+
+def _critical_precedence_lookahead(
+    estado: _EstadoGlobal, sku_s: str, hijos_normales: list[_EstadoGlobal], por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int], nivel_por_sku: dict[str, int], tope_pallet_por_sku: dict[str, int],
+    presupuesto: float, stats: dict | None, cache_estructural: CacheEstructural | None,
+) -> list[_EstadoGlobal]:
+    """[PATCH V6.09 -evidencia S3, secciones 0-9] Rescue de UN paso: se
+    activa ÚNICAMENTE cuando TODOS los hijos normales de `sku_s` (el SKU
+    que MRV ya eligió) quedan permanentemente muertos por OTRO SKU
+    pendiente (`sección 9`: nunca por simple escasez -un SKU con pocos
+    candidatos, o poca demanda restante, NO dispara esto por sí solo).
+
+    [sección 3, costo] La primera verificación (`¿hay al menos un hijo
+    normal vivo?`) corta apenas encuentra uno -en el caso normal (la
+    inmensa mayoría de las expansiones de toda la búsqueda) esto cuesta
+    UNA llamada extra a `_evaluar_viabilidad` por expansión, nada más. El
+    análisis de víctimas (mucho más caro -revisa TODOS los SKUs pendientes
+    de TODOS los hijos muertos) solo corre en el caso raro donde ya se
+    sabe que la rama normal está 100% condenada.
+
+    [sección 8, anti-loop] Esta función corre UNA vez por llamada a
+    `_expandir_estado` (para el `sku_s` de ESA expansión); los hijos
+    `victim-first` que genera se devuelven como hijos normales más -en la
+    SIGUIENTE profundidad, si a alguno de ellos le toca expandirse, corre
+    su propia llamada independiente a `_expandir_estado`/MRV/lookahead,
+    sin ningún estado compartido con esta invocación. No hay recursión
+    directa ni indirecta dentro de esta función."""
+    from src.packing_bloques import _capacidad_instalada
+
+    veredictos: list[tuple[_EstadoGlobal, CacheEstructural]] = []
+    algun_viable = False
+    for hijo in hijos_normales:
+        cache_hijo = CacheEstructural()
+        muerto, _sku_causante = _evaluar_viabilidad(
+            hijo, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, stats,
+            None, cache_hijo,
+        )
+        veredictos.append((hijo, cache_hijo))
+        if not muerto:
+            algun_viable = True
+            break  # [sección 3] al menos un hijo normal vive -> comportamiento existente, sin más costo
+
+    if algun_viable:
+        return hijos_normales
+
+    if stats is not None:
+        stats["critical_lookahead_calls"] = stats.get("critical_lookahead_calls", 0) + 1
+
+    # [sección 4] TODOS los hijos normales evaluados (siempre son TODOS
+    # acá -si hubiera habido uno vivo, ya se hubiera retornado arriba)
+    # están muertos -identificar qué SKU(s), distintos de `sku_s`, causan
+    # esa muerte en cada uno (`dead_skus`), y con qué frecuencia.
+    victim_frequency: dict[str, int] = {}
+    for hijo, cache_hijo in veredictos:
+        for sku_v, cantidad in hijo.pendientes.items():
+            if cantidad <= 0 or sku_v == sku_s:
+                continue
+            candidatos = _contar_candidatos_y_registrar(
+                hijo, sku_v, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, stats,
+                max_count=1, presupuesto=presupuesto, cache_estructural=cache_hijo,
+            )
+            if candidatos > 0:
+                continue
+            capacidad_residual = sum(_capacidad_instalada(pc.pallet, sku_v, presupuesto) for pc in hijo.construcciones)
+            if capacidad_residual <= 0:
+                victim_frequency[sku_v] = victim_frequency.get(sku_v, 0) + 1
+
+    if not victim_frequency:
+        # Todos los hijos normales mueren, pero no por otro SKU rescatable
+        # -son permanentemente inviables por sí mismos (o por `sku_s`
+        # mismo, excluido a propósito). No hay víctima que probar primero.
+        return hijos_normales
+
+    n_hijos = len(veredictos)
+
+    def _clave_orden(sku_v: str) -> tuple:
+        # [sección 6] 1) mayor % de hijos normales que mata (más fuerte
+        # primero) 2) menor candidate_count en el PARENT (más restringido)
+        # 3) mayor footprint 4) mayor pendiente.
+        kill_pct = victim_frequency[sku_v] / n_hijos
+        candidate_count_parent = _contar_candidatos_y_registrar(
+            estado, sku_v, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, None,
+            max_count=4, presupuesto=presupuesto, cache_estructural=cache_estructural,
+        )
+        footprint = _footprint_maximo(por_sku.get(sku_v, []))
+        pendiente = estado.pendientes.get(sku_v, 0)
+        return (-kill_pct, candidate_count_parent, -footprint, -pendiente)
+
+    victimas_ordenadas = sorted(victim_frequency, key=_clave_orden)[:CRITICAL_LOOKAHEAD_MAX_VICTIMS]
+
+    hijos_rescate: list[_EstadoGlobal] = []
+    for victima in victimas_ordenadas:
+        if stats is not None:
+            stats["victims_considered"] = stats.get("victims_considered", 0) + 1
+        # [sección 5] "expandir V primero, desde el MISMO parent, usando
+        # exactamente: candidate generator productivo, Zero-Only
+        # Structural, TOP_K existente, batch existente" -reusa el MISMO
+        # helper que la expansión normal, sin ningún generador especial.
+        hijos_v = _expandir_sku_en_estado(
+            estado, victima, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+            presupuesto, stats, cache_estructural,
+        )
+        n_viables = 0
+        for hv in hijos_v:
+            cache_hv = CacheEstructural()
+            muerto_hv, _ = _evaluar_viabilidad(
+                hv, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, stats,
+                None, cache_hv,
+            )
+            if not muerto_hv:
+                n_viables += 1
+        if stats is not None:
+            stats["victim_first_children_generated"] = stats.get("victim_first_children_generated", 0) + len(hijos_v)
+            stats["victim_first_children_viable"] = stats.get("victim_first_children_viable", 0) + n_viables
+            if n_viables > 0:
+                # [sección 10] "detectada" = confirmada con evidencia -al
+                # menos un hijo victim-first sobrevive la MISMA poda que
+                # mataba al 100% de los hijos normales.
+                stats["precedence_constraints_detected"] = stats.get("precedence_constraints_detected", 0) + 1
+            eventos = stats.setdefault("critical_lookahead_events", [])
+            eventos.append({
+                "depth": stats.get("_depth_actual", 0), "selected_sku": sku_s, "victim_sku": victima,
+                "normal_children": n_hijos, "normal_children_killing_victim": victim_frequency[victima],
+                "victim_parent_candidates": _contar_candidatos_y_registrar(
+                    estado, victima, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, None,
+                    max_count=4, presupuesto=presupuesto, cache_estructural=cache_estructural,
+                ),
+                "victim_first_children": len(hijos_v), "victim_first_children_viable": n_viables,
+            })
+        hijos_rescate.extend(hijos_v)
+
+    # [sección 7] Los hijos normales (TODOS muertos, por construcción de
+    # esta rama) se conservan en el resultado -no se les da trato especial
+    # acá: `_beam_search` ya los saca de la frontera vía la MISMA poda sin
+    # cambios (siguen compitiendo por `mejor_estado`, igual que cualquier
+    # estado podado hoy). Los victim-first se agregan al mismo pool, sin
+    # marca especial (sección 16: "entran al mismo score/transposition/
+    # beam que cualquier otro hijo").
+    return hijos_normales + hijos_rescate
 
 
 def _signature_torres(pc: _PalletEnConstruccion) -> tuple:
@@ -1244,6 +1427,9 @@ def global_rescue(
         "zero_rescue_successes": 0, "zero_rescue_failures": 0, "zero_rescue_by_sku": {},
         "placements_from_maxrects": 0, "placements_from_structural_zero_rescue": 0,
         "structural_rescues_used": {},
+        # [PATCH V6.09, sección 10 -"Critical Precedence Lookahead"]
+        "critical_lookahead_calls": 0, "precedence_constraints_detected": 0, "victims_considered": 0,
+        "victim_first_children_generated": 0, "victim_first_children_viable": 0, "critical_lookahead_events": [],
     }
 
     demanda_total = _reconstruir_demanda_total(pallets, sin_colocar, por_sku)
