@@ -137,8 +137,17 @@ def _motivo_para_cuboide(
             if nivel_por_sku.get(t.sku, 0) > nivel_sku:
                 return CATEGORY_LEVEL
     if c.z > TOL:
+        # [fix bug real, EXPERIMENTO V6.08-S2 sección 0] `TOLERANCIA_ALTURA_
+        # CAMA_CM` vive en `packing_bloques.py` (junto a `_altura_compatible_
+        # con_cama`, la función real que este chequeo replica -ver línea 322
+        # de ese archivo), NUNCA existió en `config.py`. Import local -no
+        # module-level- porque `packing_bloques.py` ya importa este módulo
+        # (`from src import diagnostico_no_colocadas`, línea 170); un import
+        # a nivel de módulo acá crearía un ciclo.
+        from src.packing_bloques import TOLERANCIA_ALTURA_CAMA_CM
+
         for t in pallet.torres:
-            if abs(t.z - c.z) <= TOL and abs(t.alto_caja - cand.alto_caja) > config.TOLERANCIA_ALTURA_CAMA_CM + TOL:
+            if abs(t.z - c.z) <= TOL and abs(t.alto_caja - cand.alto_caja) > TOLERANCIA_ALTURA_CAMA_CM + TOL:
                 return LAYER_HEIGHT
     return None
 
