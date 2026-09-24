@@ -121,7 +121,7 @@ GLOBAL_VISITED_MAX = 100_000
 # desempate MRV distinto como criterio secundario dominante (sección 7 sigue
 # mandando "menor cantidad de candidatos" como criterio 1 SIEMPRE -esto solo
 # reordena 2-4). Nombres, no índices, para que quede legible en `stats`.
-GLOBAL_MULTI_START_ESTRATEGIAS = ("footprint", "altura_critica", "demanda")
+GLOBAL_MULTI_START_ESTRATEGIAS = ("demanda", "altura_critica", "footprint")
 GLOBAL_MULTI_START_MAX = len(GLOBAL_MULTI_START_ESTRATEGIAS)
 # [PATCH V6.08, sección 1/3/4/5 -"Zero-Only Structural Rescue"] Hasta V6.07,
 # Structural se consultaba con MaxRects <= 1 (0 obligatorio + 1 opcional

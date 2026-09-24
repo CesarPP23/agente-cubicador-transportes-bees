@@ -212,15 +212,36 @@ def ejecutar_core_sku_bloque(
         # [paralelo por CD, ver _procesar_cd/PIPELINE_MAX_PROCESOS_CD
         # arriba] paralelo_lns=False en cada worker -ya estamos
         # paralelizando en este nivel, no anidar otro pool de procesos.
+        #
+        # [PATCH V6.11-R4, ensamblado determinista] `as_completed()` sigue
+        # gobernando CUÁNDO se recoge cada resultado (el paralelismo real
+        # no cambia), pero YA NO decide en qué ORDEN queda cada bloque de
+        # CD en `pallets_v5` -antes se hacía `pallets_v5.extend(...)`
+        # directo dentro del loop de `as_completed`, así que el orden de
+        # los bloques de CD en el output final dependía de qué proceso
+        # terminaba primero (confirmado: mismo contenido canonicalizado,
+        # pero filas en distinto orden entre corridas -ver CIERRE
+        # V6.11-R1/R3, `test_determinismo`). Ahora cada resultado se
+        # guarda en `resultados_por_cd` apenas termina, y recién DESPUÉS
+        # se ensambla siguiendo el orden de `grupos_cd` (el mismo orden,
+        # determinista, que ya usa el camino de 1 solo CD más abajo -
+        # `groupby("CD")` de pandas ordena las claves, no depende de qué
+        # tan rápido corra cada proceso). Esto NO reordena las filas
+        # DENTRO de cada CD -esas ya las decide el propio solver
+        # (determinista desde V6.11-R3), acá solo se fija el orden de los
+        # BLOQUES completos.
         n_procesos = min(PIPELINE_MAX_PROCESOS_CD, len(grupos_cd))
         contexto = multiprocessing.get_context("fork") if hasattr(os, "fork") else None
+        resultados_por_cd: dict[str, list[PalletV5]] = {}
         with ProcessPoolExecutor(max_workers=n_procesos, mp_context=contexto) as executor:
-            futuros = [
-                executor.submit(_procesar_cd, cd, grupo, pallets_objetivo_por_cd.get(cd), False)
+            futuro_a_cd = {
+                executor.submit(_procesar_cd, cd, grupo, pallets_objetivo_por_cd.get(cd), False): cd
                 for cd, grupo in grupos_cd
-            ]
-            for futuro in as_completed(futuros):
-                pallets_v5.extend(futuro.result())
+            }
+            for futuro in as_completed(futuro_a_cd):
+                resultados_por_cd[futuro_a_cd[futuro]] = futuro.result()
+        for cd, _grupo in grupos_cd:
+            pallets_v5.extend(resultados_por_cd[cd])
     else:
         # [1 solo CD -sin paralelismo por CD, pero SÍ el del LNS interno
         # (paralelo_lns=True) si ese único CD lo necesita.]

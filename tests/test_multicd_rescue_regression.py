@@ -7,7 +7,6 @@ PATCH V6.04 agrega, al final de este archivo, los gates de BK52/BK53
 import time
 
 import pandas as pd
-import pytest
 
 from fixtures.bk31_manual import DEMANDA_TOTAL_CAJAS, demanda_solver_df
 from fixtures.multicd_validation import cargar_dataset
@@ -154,27 +153,13 @@ def _evaluar_real(cd: str):
     return evaluar_cd(cd, df_cd, maestro, pobj[cd])
 
 
-@pytest.mark.xfail(
-    reason=(
-        "ADDENDUM V6.04-R1: BK52 tiene factibilidad física confirmada -114 "
-        "cajas deben caber en exactamente 1 pallet según Pallets_Objetivo "
-        "validado operacionalmente. PATCH V6.04, sección 21: BK52 mejoró de "
-        "89/114 (baseline) a 105/114 tras Rescue V6.02 + Repair V6.04 "
-        "(coverage-aware LNS, neighborhoods iterativos, ejection chains) + "
-        "Exact Local Repair (CP-SAT), alcanzando 105/114 con geometría "
-        "válida -pero NO llega a 114/114. Los 9 faltantes restantes resisten "
-        "las 4 técnicas: el conflict-directed LNS y el exact repair, al "
-        "intentar liberar espacio, cascadean sistemáticamente hacia un SKU de "
-        "15 unidades (22714) cuyo desalojo cuesta más de lo que libera. Este "
-        "xfail documenta una limitación pendiente del algoritmo de "
-        "búsqueda/modelado, no una posible inviabilidad física. V6.05 debe "
-        "seguir persiguiendo 114/114. Diagnóstico completo en el reporte "
-        "final de V6.04, no se sigue ampliando el neighborhood "
-        "indefinidamente."
-    ),
-    strict=True,
-)
 def test_bk52_repair_114_de_114():
+    """[CIERRE V6.11-R1] Gate real, ya no `xfail`: el `xfail(strict=True)`
+    de V6.04-R1 documentaba que BK52 tope aba en 105/114. Desde V6.09
+    (Critical Precedence Lookahead) + V6.10/V6.11 (beam por estrategia,
+    orden demanda-first) BK52 alcanza 114/114 de forma reproducible en
+    producción -ver checkpoint `v6.10-bk52-114` y el gate productivo de
+    V6.11, sección 7."""
     fila = _evaluar_real("BK52")
     print(f"\nBK52: baseline={fila['Cajas_Baseline']}/{fila['Demanda_Cajas']}, "
           f"final={fila['Cajas_Final']}/{fila['Demanda_Cajas']}, gate={fila['Gate_CD']}")
@@ -195,24 +180,13 @@ def test_bk52_no_empeora_y_mejora_sobre_baseline_v603():
     assert fila["Errores_Validacion_Total"] == 0
 
 
-@pytest.mark.xfail(
-    reason=(
-        "ADDENDUM V6.04-R1: BK53 tiene factibilidad física confirmada -208 "
-        "cajas deben caber en exactamente 2 pallets según Pallets_Objetivo "
-        "validado operacionalmente. PATCH V6.04, sección 21: BK53 se queda "
-        "en 207/208 (1 SKU, 22787, 1 caja) tanto con Rescue V6.02 como con "
-        "Repair V6.04 (0 blockers retirados, 0 ejection chains exitosas) y "
-        "con Exact Local Repair (CP-SAT explorado en AMBOS pallets del CD, 0 "
-        "mejoras encontradas) -NO_FREE_RECT_FIT domina el diagnóstico, sin "
-        "señal de que sea un problema de presupuesto de tiempo (BK53 corre "
-        "en segundos, no agota ningún deadline). El resultado 207/208 "
-        "documenta una limitación pendiente del solver, no una posible "
-        "inviabilidad física. Diagnóstico completo en el reporte final de "
-        "V6.04."
-    ),
-    strict=True,
-)
 def test_bk53_repair_208_de_208():
+    """[CIERRE V6.11-R1] Gate real, ya no `xfail`: el `xfail(strict=True)`
+    de V6.04-R1 documentaba que BK53 tope aba en 207/208 (1 SKU, 22787).
+    Desde V6.09 (Critical Precedence Lookahead) + V6.10/V6.11 (beam por
+    estrategia, orden demanda-first) BK53 alcanza 208/208 de forma
+    reproducible en producción -ver V6.10-S2 (3/3 corridas) y el gate
+    productivo de V6.11, sección 8."""
     fila = _evaluar_real("BK53")
     print(f"\nBK53: baseline={fila['Cajas_Baseline']}/{fila['Demanda_Cajas']}, "
           f"final={fila['Cajas_Final']}/{fila['Demanda_Cajas']}, gate={fila['Gate_CD']}")
