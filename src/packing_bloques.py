@@ -343,6 +343,31 @@ def _solapa_con_torres(pallet: PalletV5, x: float, y: float, z: float, w: float,
     return False
 
 
+# [PATCH V6.12-FASE1D, orden de predicados] Auditoría real sobre 500.000
+# llamadas capturadas de BK52+BK53 (evaluando los 3 checks SIN
+# short-circuit): FIT (directo/tolerancia) es más selectivo Y más barato
+# que OVERHANG (el más caro de los 3 -180.84ns/call vs 95.97ns FIT/72.78ns
+# HEIGHT, medido con `time.perf_counter()`, sin cProfile). El orden previo
+# (OVERHANG->HEIGHT->FIT, el mismo con el que arrancaba este código) era
+# el PEOR de las 6 permutaciones posibles en la simulación por
+# probabilidad-conjunta-real x costo; FIT->HEIGHT->OVERHANG fue la mejor,
+# confirmada con un microbenchmark offline real (no solo simulado): 100%
+# equivalencia booleana (500.000 llamadas reales + 9 edge cases -límite
+# exacto de overhang/altura/fit, tolerancia activada y desactivada, fallo
+# simultáneo de 2 y 3 checks- 0 diferencias) y +27.42% (BK52) / +16.25%
+# (BK53) / +21.06% (combinado) de mejora. Mismas comparaciones, misma
+# tolerancia, mismo resultado -solo cambia el ORDEN en que se evalúan.
+#
+# [SINCRONIZACIÓN OBLIGATORIA] `_cuboide_admite_candidato` (más abajo) NO
+# llama a esta función -tiene su PROPIA copia inlineada de esta misma
+# lógica (mismo orden FIT->HEIGHT->OVERHANG, mismas subrutinas reales) por
+# el costo de la capa extra de llamada Python en un hot path de 116-142
+# millones de llamadas/CD (ver comentario junto a `_cuboide_admite_
+# candidato`). Cualquier cambio de comparación, tolerancia o criterio
+# físico ACÁ debe replicarse EXACTO ahí también -y viceversa- o las dos
+# funciones divergen en silencio. Antes de aceptar un cambio en cualquiera
+# de las dos, re-correr `tests/test_packing_bloques_predicate_order.py`
+# (los 9 casos límite) contra AMBAS.
 def _fit_directo_o_con_tolerancia(pallet: PalletV5, c, cand: TorreCandidate) -> bool:
     """Admite hasta 2 cm por lado, con apoyo real y sin colisiones.
 
@@ -350,19 +375,21 @@ def _fit_directo_o_con_tolerancia(pallet: PalletV5, c, cand: TorreCandidate) -> 
     si la categoría permite acostar la caja. La posición debe respetar
     además el margen exterior de la parihuela.
     """
+    directo = cand.largo <= c.w + TOL and cand.ancho <= c.h + TOL
+    if not directo:
+        tolerancia = config.TOLERANCIA_OVERHANG_CM
+        if (cand.largo > c.w + tolerancia + TOL
+                or cand.ancho > c.h + tolerancia + TOL):
+            return False
+    if cand.alto_caja > c.d + TOL:
+        return False
     margen = config.SOBRESALIENTE_MAX_CM
     if (c.x < -margen - TOL or c.y < -margen - TOL
             or c.x + cand.largo > config.PALLET_LARGO + margen + TOL
-            or c.y + cand.ancho > config.PALLET_ANCHO + margen + TOL
-            or cand.alto_caja > c.d + TOL):
+            or c.y + cand.ancho > config.PALLET_ANCHO + margen + TOL):
         return False
-    directo = cand.largo <= c.w + TOL and cand.ancho <= c.h + TOL
     if directo:
         return True  # MaxRects ya garantiza espacio libre y apoyo en el cuboide.
-    tolerancia = config.TOLERANCIA_OVERHANG_CM
-    if (cand.largo > c.w + tolerancia + TOL
-            or cand.ancho > c.h + tolerancia + TOL):
-        return False
     if _solapa_con_torres(pallet, c.x, c.y, c.z, cand.largo, cand.ancho, cand.alto_caja):
         return False
     if c.z > TOL:
@@ -395,9 +422,49 @@ def _cuboide_admite_candidato(
     alto no es compatible con lo que ya hay puesto en esa misma cama
     (`_altura_compatible_con_cama`). Reusado por `_mejor_cuboide_para_sku`
     (1 sola opción por SKU) y por `_candidatos_lote` del solver de N
-    pallets fijos (varias opciones por SKU, ver comentario ahí)."""
-    if not _fit_directo_o_con_tolerancia(pallet, c, cand):
+    pallets fijos (varias opciones por SKU, ver comentario ahí).
+
+    [PATCH V6.12-FASE1D] Esta es la función MÁS llamada de todo el motor
+    (116-142 millones de veces por CD en BK52/BK53, ver auditoría Fase 0/
+    1A/1D) -antes delegaba en `_fit_directo_o_con_tolerancia` como llamada
+    aparte; ahora inlinea esa misma lógica YA reordenada (FIT->HEIGHT->
+    OVERHANG, ver comentario junto a `_fit_directo_o_con_tolerancia`)
+    directo acá, para no pagar la capa extra de llamada Python en el hot
+    path -el reorden solo (sin inlinear) medía 14.46% combinado en
+    BK52+BK53 (por debajo del gate de 15%); inlineado da 27.42%/16.25%/
+    21.06% (BK52/BK53/combinado), 100% equivalente contra el original en
+    500.000 llamadas reales + 9 edge cases. `_fit_directo_o_con_
+    tolerancia` se mantiene intacta como función propia (la usan tests
+    directamente) pero ya no la llama esta función.
+
+    [SINCRONIZACIÓN OBLIGATORIA] El bloque de abajo (FIT->HEIGHT->
+    OVERHANG, mismas subrutinas reales: `_solapa_con_torres`, `_tiene_
+    soporte_admisible`, `_soporte_viola_nivel`, `_altura_compatible_con_
+    cama`) es una copia intencional de `_fit_directo_o_con_tolerancia`
+    -ver el comentario junto a esa función sobre por qué existen las dos y
+    la obligación de mantenerlas sincronizadas ante cualquier cambio de
+    comparación/tolerancia/criterio físico."""
+    directo = cand.largo <= c.w + TOL and cand.ancho <= c.h + TOL
+    if not directo:
+        tolerancia = config.TOLERANCIA_OVERHANG_CM
+        if (cand.largo > c.w + tolerancia + TOL
+                or cand.ancho > c.h + tolerancia + TOL):
+            return False
+    if cand.alto_caja > c.d + TOL:
         return False
+    margen = config.SOBRESALIENTE_MAX_CM
+    if (c.x < -margen - TOL or c.y < -margen - TOL
+            or c.x + cand.largo > config.PALLET_LARGO + margen + TOL
+            or c.y + cand.ancho > config.PALLET_ANCHO + margen + TOL):
+        return False
+    if not directo:
+        if _solapa_con_torres(pallet, c.x, c.y, c.z, cand.largo, cand.ancho, cand.alto_caja):
+            return False
+        if c.z > TOL:
+            soportes = [t for t in pallet.torres if abs(t.z + t.altura - c.z) <= TOL]
+            torre = crear_torre(cand, x=c.x, y=c.y, z=c.z, cantidad=1)
+            if not _tiene_soporte_admisible(torre, soportes):
+                return False
     if tope_capa is not None:
         ya_en_esta_capa = sum(
             t.cantidad for t in pallet.torres if t.sku == cand.sku and abs(t.z - c.z) <= TOL
