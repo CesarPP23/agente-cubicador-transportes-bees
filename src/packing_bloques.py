@@ -1924,6 +1924,13 @@ def _empacar_n_pallets(
     if sin_colocar_final:
         from src.rescue_solver import RESCUE_TIME_MAX_SECONDS, _score_solucion, rescue_solver, skus_completos
 
+        # [PATCH V6.12-R2-A1] Los deadlines de rescue/repair/exact/global
+        # (abajo) pasan a CPU-time (`time.process_time()`) -mismo dominio
+        # temporal que sus `reloj` internos (rescue_solver.py,
+        # repair_solver.py, global_rescue.py, y el orquestador de
+        # exact_repair.py), corregido tras la auditoría R2-A0/R2-A1: antes
+        # eran `time.time()` (reloj de pared), sensible a la contención de
+        # otros CDs corriendo en paralelo en el mismo host.
         # [ojo -aliasing] `rescue_solver` recibe los MISMOS objetos
         # `PalletV5` de `pallets_final` (los envuelve, no los copia) y los
         # muta in-place mientras explora -por eso el score "de antes" se
@@ -1938,7 +1945,7 @@ def _empacar_n_pallets(
         skus_protegidos_cd = skus_completos(pendientes_actual, por_sku)
         score_actual = _score_solucion(total_final, pendientes_actual, por_sku, pallets_final, skus_protegidos_cd)
 
-        deadline_rescue = time.time() + RESCUE_TIME_MAX_SECONDS
+        deadline_rescue = time.process_time() + RESCUE_TIME_MAX_SECONDS
         pallets_rescue, sin_colocar_rescue, stats_rescue = rescue_solver(
             pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
             tope_pallet_por_sku, n_pallets, presupuesto, deadline=deadline_rescue,
@@ -1964,7 +1971,7 @@ def _empacar_n_pallets(
             score_pre_repair = _score_solucion(
                 total_pre_repair, pendientes_pre_repair, por_sku, pallets_final, skus_protegidos_cd,
             )
-            deadline_repair = time.time() + REPAIR_TIME_MAX_SECONDS
+            deadline_repair = time.process_time() + REPAIR_TIME_MAX_SECONDS
             pallets_repair, sin_colocar_repair, stats_repair = repair_solver(
                 pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
                 tope_pallet_por_sku, n_pallets, presupuesto, skus_protegidos_cd, deadline=deadline_repair,
@@ -1987,10 +1994,10 @@ def _empacar_n_pallets(
         if sin_colocar_final:
             from src.exact_repair import EXACT_REPAIR_TIME_MAX_SECONDS, exact_repair_orquestado
 
-            deadline_exact = time.time() + EXACT_REPAIR_TIME_MAX_SECONDS * 3
+            deadline_exact = time.process_time() + EXACT_REPAIR_TIME_MAX_SECONDS * 3
             stats_exact_total = {"activado": True, "intentos": 0, "exitos": 0, "cajas_recuperadas": 0}
             for idx in range(len(pallets_final)):
-                if not sin_colocar_final or time.time() > deadline_exact:
+                if not sin_colocar_final or time.process_time() > deadline_exact:
                     break
                 total_pre_exact = demanda_total - sum(sin_colocar_final.values())
                 pendientes_pre_exact = {**{sku: 0 for sku in por_sku}, **sin_colocar_final}
@@ -2034,7 +2041,7 @@ def _empacar_n_pallets(
             score_pre_global = _score_solucion(
                 total_pre_global, pendientes_pre_global, por_sku, pallets_final, skus_protegidos_cd,
             )
-            deadline_global = time.time() + GLOBAL_RESCUE_TIME_SECONDS
+            deadline_global = time.process_time() + GLOBAL_RESCUE_TIME_SECONDS
             pallets_global, sin_colocar_global, stats_global = global_rescue(
                 pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
                 tope_pallet_por_sku, n_pallets, cd, presupuesto, deadline=deadline_global, contador=contador,

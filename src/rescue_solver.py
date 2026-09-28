@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 
 import config
 from models import PalletV5
@@ -177,6 +178,7 @@ def _colocar_critico_backtracking(
     nivel_por_sku: dict[str, int], tope_pallet_por_sku: dict[str, int],
     opciones_max: int = RESCUE_OPCIONES_SKU_CRITICO, max_nodos: int = RESCUE_MAX_NODOS_CRITICO,
     limite_tiempo: float | None = None,
+    reloj: Callable[[], float] = time.process_time,
 ) -> int:
     """[secciones 5, 6, 7] Backtracking chico, dedicado a UN sku -en cada
     nodo prueba hasta `opciones_max` cuboides distintos (branching
@@ -185,7 +187,13 @@ def _colocar_critico_backtracking(
     siempre una columna completa"). Deja `construcciones`/`colocados_por_
     pallet`/`pendientes` en el MEJOR estado encontrado (mismo mecanismo de
     snapshot/restore que el backtracking general). Devuelve cuántas
-    unidades de `sku` logró colocar."""
+    unidades de `sku` logró colocar.
+
+    [PATCH V6.12-R2-A1] `reloj` default `time.process_time` -mismo dominio
+    temporal que `limite_tiempo` (calculado por el caller, `rescue_solver`,
+    con ESTE mismo `reloj`). `deadline` y `reloj` deben pertenecer siempre
+    al mismo dominio: nunca pasar `limite_tiempo` sin también pasar el
+    `reloj` que lo produjo."""
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 
     inicial = pendientes.get(sku, 0)
@@ -196,7 +204,7 @@ def _colocar_critico_backtracking(
     }
 
     def _tiempo_agotado() -> bool:
-        return limite_tiempo is not None and time.time() > limite_tiempo
+        return limite_tiempo is not None and reloj() > limite_tiempo
 
     def _dfs(colocado: int) -> None:
         nodos[0] += 1
@@ -350,6 +358,7 @@ def _aplicar_ruina_dirigida(
     por_sku: dict[str, list[TorreCandidate]], capacidad_cama_por_sku: dict[str, int],
     nivel_por_sku: dict[str, int], tope_pallet_por_sku: dict[str, int], presupuesto: float, n_pallets: int,
     sku_critico: str, blocker_skus: set[str], limite_tiempo: float | None,
+    reloj: Callable[[], float] = time.process_time,
 ) -> int:
     """[sección 9.4] Retira `blocker_skus` (con cascada anti-flotación,
     `_romper_skus_con_cascada`), prueba distintos lotes del `sku_critico`
@@ -358,7 +367,17 @@ def _aplicar_ruina_dirigida(
     conserva la variante con más cajas colocadas EN TOTAL al final
     (sección 10: la comparación se hace después de reconstruir todo, nunca
     a mitad de camino). El caller decide si este resultado mejora el
-    incumbente o si revierte."""
+    incumbente o si revierte.
+
+    [PATCH V6.12-R2-A1, cierre R2-A0] `reloj` default `time.process_time`
+    -antes de este patch, las dos llamadas a `_resolver_pallets_
+    backtracking` de abajo NO pasaban `reloj=`, heredando ese mismo default
+    mientras `limite_tiempo` (calculado en `rescue_solver`/`repair_solver`)
+    era de `time.time()` -mismatch de dominio que dejaba inerte el corte
+    por tiempo ahí (ver auditoría R2-A0: en la práctica equivalente, porque
+    `max_nodos` ya cortaba antes en todos los casos medidos, aislado y bajo
+    contención). Ahora `reloj` se pasa explícito, sin depender del
+    default -mismo dominio temporal en todo el camino."""
     from src.packing_bloques import (
         COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION,
         _resolver_pallets_backtracking,
@@ -394,6 +413,7 @@ def _aplicar_ruina_dirigida(
             construcciones, colocados_por_pallet, pendientes, por_sku,
             capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
             max_nodos=COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION, limite_tiempo=limite_tiempo,
+            reloj=reloj,
         )
         return _total_colocado()
 
@@ -409,12 +429,13 @@ def _aplicar_ruina_dirigida(
             construcciones, colocados_por_pallet, pendientes, por_sku,
             capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
             max_nodos=COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION, limite_tiempo=limite_tiempo,
+            reloj=reloj,
         )
         total_actual = _total_colocado()
         if total_actual > mejor_total:
             mejor_total = total_actual
             mejor_snapshot = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
-        if limite_tiempo is not None and time.time() > limite_tiempo:
+        if limite_tiempo is not None and reloj() > limite_tiempo:
             break
 
     _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
@@ -493,11 +514,26 @@ def rescue_solver(
     encima.
 
     Devuelve (pallets, sin_colocar, stats) -`stats` es la instrumentación
-    de la sección 16."""
+    de la sección 16.
+
+    [PATCH V6.12-R2-A1] `reloj = time.process_time` explícito -mismo
+    patrón de V6.11-R3 (`_search_budget_now`), corregido para este módulo
+    tras la auditoría R2-A0: antes, `limite_tiempo` se calculaba con
+    `time.time()` (reloj de pared) mientras `_resolver_pallets_
+    backtracking` (llamada desde `_aplicar_ruina_dirigida`) usaba su
+    default `reloj=time.process_time` -mismatch de dominio que dejaba
+    inerte el corte por tiempo ahí. Ahora `reloj` se calcula UNA vez acá y
+    se pasa explícito a TODO lo que recibe `limite_tiempo`
+    (`_colocar_critico_backtracking`, `_aplicar_ruina_dirigida`, y de ahí
+    a `_resolver_pallets_backtracking`) -deadline y checker siempre en el
+    mismo dominio temporal, nunca por default implícito. `deadline`
+    (parámetro externo, ver `packing_bloques._empacar_n_pallets`) también
+    debe venir ya en este mismo dominio (CPU-time)."""
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 
-    t0 = time.time()
-    limite_tiempo = t0 + RESCUE_TIME_MAX_SECONDS
+    reloj: Callable[[], float] = time.process_time
+    t0_wall = time.time()  # solo para stats["tiempo_segundos"] (diagnóstico humano, no budget)
+    limite_tiempo = reloj() + RESCUE_TIME_MAX_SECONDS
     if deadline is not None:
         limite_tiempo = min(limite_tiempo, deadline)
 
@@ -538,7 +574,7 @@ def rescue_solver(
             nivel_por_sku, tope_pallet_por_sku,
         ), "candidatos_despues_ruina": 0, "colocadas": 0}
 
-    while time.time() < limite_tiempo:
+    while reloj() < limite_tiempo:
         criticos = _identificar_skus_criticos(pendientes)
         if not criticos:
             break  # [sección 12] 100% de demanda -detenerse ya, sin seguir "optimizando"
@@ -551,7 +587,7 @@ def rescue_solver(
 
         progreso_en_ronda = False
         for sku in orden:
-            if time.time() > limite_tiempo:
+            if reloj() > limite_tiempo:
                 break
             if pendientes.get(sku, 0) <= 0:
                 continue
@@ -562,7 +598,7 @@ def rescue_solver(
             _colocar_critico_backtracking(
                 construcciones, colocados_por_pallet, pendientes, sku, por_sku,
                 capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
-                limite_tiempo=limite_tiempo,
+                limite_tiempo=limite_tiempo, reloj=reloj,
             )
             if pendientes[sku] < antes:
                 # [bug real encontrado escribiendo esto: un progreso PARCIAL
@@ -590,12 +626,13 @@ def rescue_solver(
             )
 
             for _, pidx, x, y, z, cand, blocker_skus in conflictos:
-                if time.time() > limite_tiempo:
+                if reloj() > limite_tiempo:
                     break
                 snap = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
                 total_resultante = _aplicar_ruina_dirigida(
                     construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                     nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, sku, blocker_skus, limite_tiempo,
+                    reloj=reloj,
                 )
                 score_resultante = _score_solucion(total_resultante, pendientes, por_sku, [pc.pallet for pc in construcciones], skus_protegidos)
                 if score_resultante > mejor_score:
@@ -624,7 +661,7 @@ def rescue_solver(
     stats["skus_criticos"] = sorted(stats["skus_criticos"])
     stats["mejor_mejora"] = mejor_total - total_inicial
     stats["colocadas"] = mejor_total
-    stats["tiempo_segundos"] = round(time.time() - t0, 3)
+    stats["tiempo_segundos"] = round(time.time() - t0_wall, 3)
     for sku, d in stats["por_sku_critico"].items():
         pendiente_final = sin_colocar_final.get(sku, 0)
         d["pendiente_final"] = pendiente_final

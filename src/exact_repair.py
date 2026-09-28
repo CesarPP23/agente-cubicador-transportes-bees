@@ -424,11 +424,24 @@ def exact_repair_orquestado(
     colocado -nunca peor que lo que recibió (bug real encontrado probando
     esto: un conflicto puede cascadear a un vecindario grande que el
     CP-SAT no logra recuperar del todo, perdiendo más de lo que gana -acá
-    se revierte y se prueba otro conflict set en vez de aceptarlo)."""
+    se revierte y se prueba otro conflict set en vez de aceptarlo).
+
+    [PATCH V6.12-R2-A1] El `deadline` de ESTE orquestador (el bucle
+    Python de arriba hacia abajo, que decide cuántos conflict sets
+    probar) pasa a CPU-time (`time.process_time()`), mismo patrón que
+    rescue_solver/repair_solver/global_rescue -`deadline` (calculado en
+    `packing_bloques._empacar_n_pallets`) debe venir ya en este dominio.
+    Esto NO toca `solver.parameters.max_time_in_seconds` (línea de
+    `exact_local_repair` más abajo): ese es el límite NATIVO de CP-SAT,
+    wall-clock por diseño de la librería (confirmado: la versión
+    instalada de OR-Tools SÍ expone `max_deterministic_time` como
+    alternativa, ver auditoría R2-A1 -no se activa todavía, cambio fuera
+    de alcance de este parche)."""
     from src.packing_columnar import _reconstruir_en_construccion
     from src.rescue_solver import _rankear_conflictos
 
-    t0 = time.time()
+    reloj = time.process_time
+    t0 = time.time()  # solo para stats["tiempo_s"] (diagnóstico humano, no budget)
     stats = {
         "activado": True, "intentos": 0, "exitos": 0, "excedio_max_boxes": 0,
         "cajas_recuperadas": 0, "skus_resueltos": [],
@@ -448,7 +461,7 @@ def exact_repair_orquestado(
         candidatos_pendientes = {s: c for s, c in pendientes.items() if c > 0 and s not in skus_agotados}
         if not candidatos_pendientes:
             break
-        if deadline is not None and time.time() > deadline:
+        if deadline is not None and reloj() > deadline:
             break
         sku_objetivo = min(candidatos_pendientes, key=lambda s: candidatos_pendientes[s])
         candidatas_sku = por_sku.get(sku_objetivo, [])
@@ -462,7 +475,7 @@ def exact_repair_orquestado(
 
         resuelto = False
         for _, _pidx, _x, _y, _z, _cand, blocker_skus in conflictos:
-            if deadline is not None and time.time() > deadline:
+            if deadline is not None and reloj() > deadline:
                 break
             stats["intentos"] += 1
             total_antes = sum(t.cantidad for t in pallet_actual.torres)

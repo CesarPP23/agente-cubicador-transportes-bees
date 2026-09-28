@@ -61,6 +61,7 @@ pendiente explícita por seguridad redundante."""
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import config
@@ -1200,6 +1201,7 @@ def _beam_search(
     estado_inicial: _EstadoGlobal, por_sku: dict[str, list[TorreCandidate]], capacidad_cama_por_sku: dict[str, int],
     nivel_por_sku: dict[str, int], tope_pallet_por_sku: dict[str, int], presupuesto: float,
     limite_tiempo: float, beam_width: int, estrategia: str, stats: dict, oracle_sampler=None,
+    reloj: Callable[[], float] = time.process_time,
 ) -> tuple[_EstadoGlobal, str]:
     """[secciones 6, 11, 16] Un reinicio completo del multi-start (sección
     17 orquesta varios). Mantiene hasta `beam_width` estados vivos por
@@ -1225,7 +1227,12 @@ def _beam_search(
     `stats["first_depth_frontier_zero_por_reinicio"]`. Ver el reporte de
     Fase 2.1 para el significado exacto de cada etapa (`children_raw` ->
     `children_after_candidate_filter` -> `children_after_pruning` ->
-    `children_after_transposition` -> `beam_kept`/`beam_dropped`)."""
+    `children_after_transposition` -> `beam_kept`/`beam_dropped`).
+
+    [PATCH V6.12-R2-A1] `reloj` default `time.process_time` -mismo dominio
+    temporal que `limite_tiempo` (calculado por `global_rescue` con este
+    mismo `reloj`); antes de este patch, `limite_tiempo` venía de
+    `time.time()` (reloj de pared)."""
     visited: dict[tuple, tuple] = {}
     frontera = [estado_inicial]
     mejor_estado = estado_inicial
@@ -1248,7 +1255,7 @@ def _beam_search(
         stats["_depth_actual"] = profundidad
         frontier_in = len(frontera)
 
-        if time.time() > limite_tiempo:
+        if reloj() > limite_tiempo:
             motivo_stop = "timeout"
             break
         if all(sum(c for c in e.pendientes.values() if c > 0) == 0 for e in frontera):
@@ -1426,9 +1433,17 @@ def global_rescue(
 
     [Fase 2.1] `oracle_sampler`: hook de diagnóstico opcional, ver
     `_evaluar_viabilidad`. `None` (default, siempre en el pipeline real) ->
-    cero cambio de comportamiento ni de costo."""
-    t0 = time.time()
-    limite_tiempo = t0 + GLOBAL_RESCUE_TIME_SECONDS
+    cero cambio de comportamiento ni de costo.
+
+    [PATCH V6.12-R2-A1] `reloj = time.process_time` explícito, mismo
+    patrón de V6.11-R3/rescue_solver/repair_solver -antes `limite_tiempo`
+    se calculaba con `time.time()` (reloj de pared, sensible a contención
+    de otros CDs corriendo en paralelo). `deadline` (parámetro externo,
+    ver `packing_bloques._empacar_n_pallets`) también debe venir ya en
+    este dominio (CPU-time)."""
+    reloj: Callable[[], float] = time.process_time
+    t0_wall = time.time()  # solo para stats["tiempo_s"] (diagnóstico humano, no budget)
+    limite_tiempo = reloj() + GLOBAL_RESCUE_TIME_SECONDS
     if deadline is not None:
         limite_tiempo = min(limite_tiempo, deadline)
 
@@ -1467,7 +1482,7 @@ def global_rescue(
 
     if n_pallets <= 0 or not any(cantidad > 0 for cantidad in demanda_total.values()):
         stats.update({
-            "tiempo_s": round(time.time() - t0, 3), "mejor_colocado": 0,
+            "tiempo_s": round(time.time() - t0_wall, 3), "mejor_colocado": 0,
             "faltantes": {sku: cantidad for sku, cantidad in demanda_total.items() if cantidad > 0},
             "motivo_stop": "sin_demanda_o_sin_pallets", "errores_geometricos": 0,
         })
@@ -1483,7 +1498,7 @@ def global_rescue(
         # su primera iteración, devuelve el estado inicial sin crashear).
         # Sin este intento garantizado, un deadline vencido de entrada
         # dejaría `mejor_global` en None.
-        if intento > 0 and time.time() > limite_tiempo:
+        if intento > 0 and reloj() > limite_tiempo:
             break
         # [PATCH V6.10, sección 3] Única fuente de verdad -ver
         # `_beam_width_para_estrategia` y `GLOBAL_BEAM_WIDTH_BY_STRATEGY`.
@@ -1492,6 +1507,7 @@ def global_rescue(
         resultado, motivo_stop = _beam_search(
             estado_inicial, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
             presupuesto, limite_tiempo, beam_width, estrategia, stats, oracle_sampler,
+            reloj=reloj,
         )
         score = _score_estado(
             resultado, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, stats, presupuesto,
@@ -1516,7 +1532,7 @@ def global_rescue(
     for pallet in pallets_final:
         errores_geometricos.extend(validar_pallet_v5(pallet))
 
-    stats["tiempo_s"] = round(time.time() - t0, 3)
+    stats["tiempo_s"] = round(time.time() - t0_wall, 3)
     stats["mejor_colocado"] = mejor_global.cajas_colocadas
     stats["faltantes"] = dict(sin_colocar_final)
     stats["motivo_stop"] = motivo_stop_global

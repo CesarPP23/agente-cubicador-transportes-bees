@@ -851,14 +851,18 @@ def test_sku_permanentemente_bloqueado_no_impide_completar_otro_sku_disponible()
 def test_global_rescue_respeta_deadline_ya_vencido_sin_crashear():
     """Un `deadline` ya vencido al momento de la llamada debe cortar la
     búsqueda de inmediato -sin colgarse, sin crashear, devolviendo pallets
-    vacíos pero geométricamente válidos (nada se llegó a colocar)."""
+    vacíos pero geométricamente válidos (nada se llegó a colocar).
+
+    [PATCH V6.12-R2-A1] `deadline` ahora vive en el dominio de
+    `time.process_time()` (CPU-time), no `time.time()` -ver `global_rescue`.
+    `-1.0` sigue siendo "ya vencido" en ambos dominios."""
     por_sku = {"A": [_cand("A", 40, 30, 20, cantidad_disponible=3)]}
     nivel_por_sku = {"A": 6}
 
     pallets, faltantes, stats = gr.global_rescue(
         pallets=[], sin_colocar={"A": 3}, por_sku=por_sku,
         capacidad_cama_por_sku={}, nivel_por_sku=nivel_por_sku, tope_pallet_por_sku={},
-        n_pallets=1, cd="TIMEOUT_CD", presupuesto=PRESUPUESTO, deadline=time.time() - 1.0,
+        n_pallets=1, cd="TIMEOUT_CD", presupuesto=PRESUPUESTO, deadline=time.process_time() - 1.0,
     )
 
     assert faltantes == {"A": 3}

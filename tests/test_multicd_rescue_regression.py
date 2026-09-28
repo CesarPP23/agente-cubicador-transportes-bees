@@ -84,13 +84,16 @@ def test_c_dos_cds_independientes_no_se_afectan():
 def test_d_fallback_con_presupuesto_agotado_nunca_empeora():
     """Rescue con deadline YA vencido -no debe explorar nada, y debe
     devolver exactamente el mismo estado que recibió (nunca peor que
-    baseline, sección 10/D)."""
+    baseline, sección 10/D).
+
+    [PATCH V6.12-R2-A1] `deadline` ahora vive en el dominio de
+    `time.process_time()` (CPU-time), no `time.time()` -ver rescue_solver."""
     from test_rescue_solver import _escenario_grande_bloqueado_por_dos_chicos
 
     pallet, por_sku, nivel_por_sku, presupuesto, _grande = _escenario_grande_bloqueado_por_dos_chicos()
     sin_colocar = {"GRANDE": 1}
 
-    deadline_vencido = time.time() - 1.0
+    deadline_vencido = time.process_time() - 1.0
     pallets_final, sin_colocar_final, stats = rescue_solver(
         [pallet], sin_colocar, por_sku, capacidad_cama_por_sku={}, nivel_por_sku=nivel_por_sku,
         tope_pallet_por_sku={}, n_pallets=1, presupuesto=presupuesto, deadline=deadline_vencido,

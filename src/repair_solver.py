@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import time
+from collections.abc import Callable
 
 import config
 from models import PalletV5
@@ -123,18 +124,23 @@ def _rankear_conflictos_por_nivel(
 def _intentar_neighborhoods_iterativos(
     construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku,
     tope_pallet_por_sku, presupuesto, n_pallets, sku_critico, limite_tiempo, shortlist: int = 8,
+    reloj: Callable[[], float] = time.process_time,
 ) -> bool:
     """[sección 5] Prueba niveles 1..RESCUE_NEIGHBORHOOD_LEVELS EN ORDEN,
     deteniéndose apenas alguno resuelve del todo al SKU crítico -no
     destruye arbitrariamente más de lo necesario. Devuelve True si mejoró
     ALGO (parcial o total); el estado queda tal cual lo dejó el último
-    intento aceptado (el caller compara score, no revierte acá)."""
+    intento aceptado (el caller compara score, no revierte acá).
+
+    [PATCH V6.12-R2-A1] `reloj` -mismo dominio temporal que `limite_tiempo`
+    (calculado por `repair_solver`); se pasa explícito a `_aplicar_ruina_
+    dirigida`, nunca por default."""
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 
     candidatas_sku = por_sku.get(sku_critico, [])
     mejoro_algo = False
     for nivel in range(1, RESCUE_NEIGHBORHOOD_LEVELS + 1):
-        if limite_tiempo is not None and time.time() > limite_tiempo:
+        if limite_tiempo is not None and reloj() > limite_tiempo:
             break
         if pendientes.get(sku_critico, 0) <= 0:
             break
@@ -142,14 +148,14 @@ def _intentar_neighborhoods_iterativos(
             construcciones, sku_critico, candidatas_sku, presupuesto, nivel, shortlist,
         )
         for _, pidx, x, y, z, cand, blocker_skus in conflictos:
-            if limite_tiempo is not None and time.time() > limite_tiempo:
+            if limite_tiempo is not None and reloj() > limite_tiempo:
                 break
             antes = pendientes.get(sku_critico, 0)
             snap = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
             _aplicar_ruina_dirigida(
                 construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                 nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, sku_critico, blocker_skus,
-                limite_tiempo,
+                limite_tiempo, reloj=reloj,
             )
             if pendientes.get(sku_critico, 0) < antes:
                 mejoro_algo = True
@@ -165,6 +171,7 @@ def _intentar_neighborhoods_iterativos(
 def _buscar_ejection_chain(
     construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku,
     tope_pallet_por_sku, presupuesto, n_pallets, sku_critico, limite_tiempo, max_depth: int = EJECTION_CHAIN_MAX_DEPTH,
+    reloj: Callable[[], float] = time.process_time,
 ) -> bool:
     """[sección 8, 9] Para un SKU crítico sin blockers directos ni
     vecinos que ayuden (típicamente cuando el problema es entre pallets,
@@ -208,7 +215,7 @@ def _buscar_ejection_chain(
         combinaciones += list(itertools.combinations(skus_presentes[:10], 2))
 
     for combo in combinaciones:
-        if limite_tiempo is not None and time.time() > limite_tiempo:
+        if limite_tiempo is not None and reloj() > limite_tiempo:
             break
         snap = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
         _romper_skus_con_cascada(construcciones, colocados_por_pallet, pendientes, set(combo), n_pallets)
@@ -217,6 +224,7 @@ def _buscar_ejection_chain(
         _colocar_critico_backtracking(
             construcciones, colocados_por_pallet, pendientes, sku_critico, por_sku,
             capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, limite_tiempo=limite_tiempo,
+            reloj=reloj,
         )
         if pendientes.get(sku_critico, 0) < antes:
             # [sección 9] Reconstruir lo ejectado -si algo de `combo` no
@@ -226,6 +234,7 @@ def _buscar_ejection_chain(
                 construcciones, colocados_por_pallet, pendientes, por_sku,
                 capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
                 max_nodos=COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION, limite_tiempo=limite_tiempo,
+                reloj=reloj,
             )
             return True
         _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap)
@@ -236,6 +245,7 @@ def _buscar_ejection_chain(
 def _reconstruccion_multi_critica(
     construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku,
     tope_pallet_por_sku, presupuesto, n_pallets, skus_top_k: list[str], limite_tiempo,
+    reloj: Callable[[], float] = time.process_time,
 ) -> bool:
     """[sección 7] Ataca los `skus_top_k` SKUs más restringidos EN
     CONJUNTO -sin revertir entre uno y otro- para que la reconstrucción
@@ -244,7 +254,7 @@ def _reconstruccion_multi_critica(
     incumbente por score, no a mitad de camino."""
     progreso = False
     for sku in skus_top_k:
-        if limite_tiempo is not None and time.time() > limite_tiempo:
+        if limite_tiempo is not None and reloj() > limite_tiempo:
             break
         if pendientes.get(sku, 0) <= 0:
             continue
@@ -252,6 +262,7 @@ def _reconstruccion_multi_critica(
         _colocar_critico_backtracking(
             construcciones, colocados_por_pallet, pendientes, sku, por_sku,
             capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, limite_tiempo=limite_tiempo,
+            reloj=reloj,
         )
         if pendientes.get(sku, 0) < antes:
             progreso = True
@@ -259,6 +270,7 @@ def _reconstruccion_multi_critica(
             if _intentar_neighborhoods_iterativos(
                 construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                 nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, sku, limite_tiempo,
+                reloj=reloj,
             ):
                 progreso = True
     return progreso
@@ -315,11 +327,17 @@ def repair_solver(
     con `skus_protegidos` -SKUs completos en el baseline ORIGINAL, antes
     de rescue Y de repair) y trata de mejorarlo con neighborhoods
     iterativos, reconstrucción multi-crítica y ejection chains. Nunca
-    peor: el caller compara por score antes de aceptar el resultado."""
+    peor: el caller compara por score antes de aceptar el resultado.
+
+    [PATCH V6.12-R2-A1] Mismo patrón que `rescue_solver`: `reloj =
+    time.process_time` explícito, calculado UNA vez acá y pasado a todo lo
+    que recibe `limite_tiempo` -deadline y checker en el mismo dominio
+    temporal siempre, nunca por default implícito."""
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 
-    t0 = time.time()
-    limite_tiempo = t0 + REPAIR_TIME_MAX_SECONDS
+    reloj: Callable[[], float] = time.process_time
+    t0_wall = time.time()  # solo para stats["tiempo_segundos"] (diagnóstico humano, no budget)
+    limite_tiempo = reloj() + REPAIR_TIME_MAX_SECONDS
     if deadline is not None:
         limite_tiempo = min(limite_tiempo, deadline)
 
@@ -354,7 +372,7 @@ def repair_solver(
         total = sum(sum(d.values()) for d in colocados_por_pallet)
         return _score_solucion(total, pendientes, por_sku, [pc.pallet for pc in construcciones], skus_protegidos)
 
-    while time.time() < limite_tiempo:
+    while reloj() < limite_tiempo:
         criticos = _identificar_skus_criticos(pendientes)
         if not criticos:
             break  # 100% -detenerse ya, no seguir "optimizando" estética (sección 13)
@@ -375,6 +393,7 @@ def repair_solver(
             _reconstruccion_multi_critica(
                 construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                 nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, top_k, limite_tiempo,
+                reloj=reloj,
             )
             score_actual = _score_actual()
             archivo.considerar(score_actual, _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes))
@@ -388,7 +407,7 @@ def repair_solver(
         # alcanza (típicamente 0 blockers ni siquiera en nivel 3), ejection
         # chain entre pallets.
         for sku in orden:
-            if time.time() > limite_tiempo:
+            if reloj() > limite_tiempo:
                 break
             if pendientes.get(sku, 0) <= 0:
                 continue
@@ -398,6 +417,7 @@ def repair_solver(
             _intentar_neighborhoods_iterativos(
                 construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                 nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, sku, limite_tiempo,
+                reloj=reloj,
             )
             stats["neighborhoods_usados"].add(sku)
             # [bug real encontrado probando esto contra BK53: los
@@ -420,6 +440,7 @@ def repair_solver(
                 if _buscar_ejection_chain(
                     construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                     nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, sku, limite_tiempo,
+                    reloj=reloj,
                 ):
                     mejoro = _score_actual() > score_antes_sku
                     if mejoro:
@@ -447,11 +468,12 @@ def repair_solver(
             criticos_desde_segundo = _identificar_skus_criticos(pendientes)
             si_hubo_cambio = False
             for sku in sorted(criticos_desde_segundo):
-                if time.time() > limite_tiempo:
+                if reloj() > limite_tiempo:
                     break
                 if _intentar_neighborhoods_iterativos(
                     construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku,
                     nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, sku, limite_tiempo,
+                    reloj=reloj,
                 ):
                     si_hubo_cambio = True
             score_actual = _score_actual()
@@ -470,6 +492,6 @@ def repair_solver(
     stats["mejor_mejora"] = mejor_total - total_inicial
     stats["colocadas"] = mejor_total
     stats["pareto_alternativas_en_archivo"] = len(archivo.items)
-    stats["tiempo_segundos"] = round(time.time() - t0, 3)
+    stats["tiempo_segundos"] = round(time.time() - t0_wall, 3)
 
     return pallets_final, sin_colocar_final, stats
