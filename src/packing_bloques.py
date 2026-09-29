@@ -2113,6 +2113,14 @@ def _empacar_n_pallets(
 # pasos -la suite de tests igual queda protegida por el escalado de
 # `_tiempo_max_dfs`/`_tiempo_max_lns` por demanda (datasets sintéticos
 # chicos siguen convergiendo rápido), no por este número.
+#
+# [PATCH V6.12-R2-B] `_empacar_optimizado` ya NO usa esta constante
+# directamente -el binary search viejo se reemplazó por Policy A
+# (`src.busqueda_n_pallets.politica_a_descenso`), que reusa el MISMO
+# valor (5) bajo el nombre `POLICY_A_MAX_SOLVES` -mismo presupuesto,
+# gobierna una política distinta (descenso persistente, no bisección). Se
+# deja esta constante tal cual (no se borra, no se cambia su valor) por
+# la historia de por qué es 5, documentada arriba.
 COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA = 5
 
 
@@ -2139,27 +2147,38 @@ def _empacar_optimizado(
     para que todo siga entrando -eso es, en este motor, lo mismo que "tapizar
     la cama antes de subir de nivel".
 
-    Búsqueda binaria acotada de la N mínima de pallets que sigue colocando
-    el 100% de la demanda ORIGINAL (no la del greedy, para no arrastrar sus
-    decisiones subóptimas): `_empacar_n_pallets` ya expone exactamente esa
-    pregunta (¿entra el 100% en N pallets?) vía `sin_colocar` vacío/no
-    vacío. Los pasos de sondeo usan `con_lns=False` (solo DFS, barato -ver
-    ese flag) y una sola corrida FINAL, ya en la N ganadora, usa LNS
-    completo -si la búsqueda nunca logra bajar de `N_greedy`, esa corrida
-    final termina siendo exactamente en `N_greedy`, y el solver de lotes
-    (`_candidatos_lote`, combina SKUs por cuboide en vez de 1 caja a la
-    vez) igual suele cerrar huecos visibles aunque el conteo de pallets no
-    baje. `contador` no se resetea entre intentos (es un contador global de
-    IDs únicos, sin ninguna otra parte del código que asuma contigüidad -
-    ver grep de `contador[0]` en el resto del archivo); los intentos
-    descartados simplemente dejan huecos en la numeración, cosmético, nunca
-    una colisión de ID.
+    [PATCH V6.12-R2-B, reemplaza el binary search viejo] Búsqueda de la N
+    mínima de pallets que sigue colocando el 100% de la demanda ORIGINAL
+    (no la del greedy, para no arrastrar sus decisiones subóptimas), vía
+    `src.busqueda_n_pallets` -ver ese módulo para el diseño completo
+    (auditoría V6.12-R1/R2-B0/R2-B de esta sesión). El binary search
+    viejo trataba "`_empacar_n_pallets(con_lns=False)` no llegó al 100%"
+    como PRUEBA de infactibilidad (`lo = mid + 1`) -bug real: "no
+    encontrado dentro del presupuesto" nunca prueba nada, solo es
+    `UNKNOWN`. El reemplazo:
 
-    Nunca puede terminar peor que `_empacar` solo: si todos los intentos de
-    `_empacar_n_pallets` fallaran en colocar el 100% (no debería pasar -
-    `_empacar` ya probó que `N_greedy` alcanza, y `_empacar_n_pallets`
-    compara internamente contra su propio greedy interno, al menos igual de
-    capaz), el fallback final es `pallets_greedy` tal cual."""
+    1. Calcula un `hard_lower_bound` matemático (peso + volumen + Cajas
+       por PH, `busqueda_n_pallets.hard_lower_bound`) -ningún N por debajo
+       puede colocar el 100%, sin importar el algoritmo; se descarta
+       GRATIS, sin gastar un solo sondeo.
+    2. `Policy A` (`politica_a_descenso`): desciende de a 1 desde
+       `n_greedy - 1` hasta el hard bound (tope 5 solves) -un sondeo
+       `UNKNOWN` se registra pero NUNCA corta el descenso (a diferencia
+       del bug viejo). El resultado es siempre "la N mínima que se
+       demostró FEASIBLE", nunca "la N que sobrevivió a la búsqueda".
+    3. Materialización: SEPARADA de la búsqueda -una sola corrida FINAL,
+       con LNS completo, en la N que ganó (`best_feasible`) -acá sí se
+       busca la mejor densidad posible, no solo factibilidad. Si esa
+       corrida no llega al 100% (más raro, pero posible: el LNS
+       multi-reinicio puede no reproducir lo que el sondeo YA demostró
+       factible, por variación de semillas), se usa el `witness` real del
+       sondeo -NUNCA se retrocede a `pallets_greedy` habiendo demostrado
+       constructivamente una N menor.
+
+    `contador` sigue sin resetearse entre intentos (contador global de IDs
+    únicos, ver comentario histórico de esta función); los intentos
+    descartados dejan huecos cosméticos en la numeración, nunca una
+    colisión de ID."""
     pendientes_originales = dict(pendientes)
     pallets_greedy = _empacar(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
@@ -2169,38 +2188,66 @@ def _empacar_optimizado(
     if n_greedy <= 1:
         return pallets_greedy  # nada que comprimir
 
-    # [búsqueda barata -pedido explícito del usuario tras medir 43 min de
-    # suite] Sondea con `con_lns=False` (solo DFS, sin el multi-reinicio
-    # de LNS) -mucho más rápido, aunque puede subestimar qué N es
-    # factible. `hi` termina siendo la N más chica que el DFS solo ya
-    # prueba que alcanza para el 100% -nunca peor que `n_greedy` (arranca
-    # ahí) y la corrida final (abajo) SIEMPRE tiene éxito en esa N (si DFS
-    # solo ya la resolvía, DFS+LNS -que nunca hace menos que el DFS solo-
-    # también).
-    lo, hi = 1, n_greedy
-    intentos = 0
-    while lo < hi and intentos < COMBINACION_ABIERTO_MAX_INTENTOS_BUSQUEDA:
-        intentos += 1
-        mid = (lo + hi) // 2
-        _, sin_colocar_mid = _empacar_n_pallets(
-            dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
-            cd, contador, mid, paralelo_lns=paralelo_lns, con_lns=False,
-        )
-        if not sin_colocar_mid:
-            hi = mid
-        else:
-            lo = mid + 1
+    from src.busqueda_n_pallets import BusquedaState, hard_lower_bound, politica_a_descenso
 
-    # Una sola corrida final, con LNS completo, en la N que ganó la
-    # búsqueda -acá sí se busca la mejor densidad posible, no solo
-    # factibilidad.
+    hard_lb = hard_lower_bound(pendientes_originales, por_sku, tope_pallet_por_sku)
+    if hard_lb > n_greedy:
+        # [invariante -pedido explícito, sección B] `_empacar` (greedy) ya
+        # demostró CONSTRUCTIVAMENTE que n_greedy es FEASIBLE -un hard
+        # bound matemático que diga que hace falta MÁS que eso es una
+        # contradicción real (el bound estaría mal, no la solución
+        # greedy). Nunca debería pasar; si pasa, hay que auditar
+        # `busqueda_n_pallets.hard_lower_bound` antes de seguir, no
+        # silenciarlo.
+        raise AssertionError(
+            f"[V6.12-R2-B] hard_lower_bound={hard_lb} > n_greedy={n_greedy} para CD={cd} -- "
+            "el bound matemático contradice una solución greedy ya válida; auditar el bound "
+            "(src/busqueda_n_pallets.hard_lower_bound) antes de continuar."
+        )
+
+    state = BusquedaState(hard_lower_bound=hard_lb)
+    state.registrar_feasible_directo(n_greedy, pallets_greedy)
+    politica_a_descenso(
+        state, pendientes_originales, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+        cd, contador, paralelo_lns,
+    )
+
+    best_n = state.best_feasible
+    witness = state.best_feasible_pallets
+
+    # Materialización -SIEMPRE una corrida final con LNS completo en la N
+    # ganadora (idéntico en espíritu a lo que ya hacía el código viejo en
+    # `hi`) -la búsqueda de arriba NUNCA decide directamente qué layout se
+    # exporta (sección A de la autorización).
     pallets_final, sin_colocar_final = _empacar_n_pallets(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
-        cd, contador, hi, paralelo_lns=paralelo_lns,
+        cd, contador, best_n, paralelo_lns=paralelo_lns,
     )
+    metadata_optimality = {
+        "status": state.optimality_status(),
+        "hard_lower_bound": hard_lb,
+        "best_feasible_n": best_n,
+        "n_greedy": n_greedy,
+        "solves_realizados": state.solves_realizados,
+        "trace": state.trace,
+    }
     if not sin_colocar_final:
+        if pallets_final:
+            pallets_final[-1].metadata["optimality_status"] = metadata_optimality
         return pallets_final
-    return pallets_greedy
+
+    # [pedido explícito -sección A] la corrida final con LNS completo no
+    # llegó al 100% -si YA demostramos constructivamente que `best_n` es
+    # FEASIBLE (el witness real del sondeo, o `pallets_greedy` si
+    # `best_n == n_greedy`), usarlo: nunca retroceder a una solución peor
+    # habiendo demostrado una mejor.
+    if witness is not None:
+        if witness:
+            witness[-1].metadata["optimality_status"] = {
+                **metadata_optimality, "fuente": "witness_probe_no_reproducido_por_LNS_final",
+            }
+        return witness
+    return pallets_greedy  # no debería llegar nunca acá si `state` es consistente
 
 
 # [sección 8, redistribución de dispersos] Un pallet por debajo de este
