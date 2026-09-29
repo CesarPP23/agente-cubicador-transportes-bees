@@ -168,6 +168,39 @@ class _EstadoGlobal:
     cajas_colocadas: int = 0
 
 
+# [PATCH V6.12-2A2 -"Structural Cache Propagation"] Un `_EstadoGlobal` NUNCA
+# se muta después de construido: los únicos 2 sitios de todo este archivo que
+# asignan `.pendientes[...]`/`.colocados_por_pallet[...]`/`.cajas_colocadas`
+# son las 2 líneas de `_expandir_sku_en_estado` que colocan la torre de un
+# `hijo` recién clonado, ANTES de agregarlo a `hijos` y devolverlo (grep
+# exhaustivo confirmado) -así que, una vez que un `estado` sale de esa
+# función, su geometría queda congelada para siempre. Eso hace SEGURO atar
+# una `CacheEstructural` directamente al objeto Python vía un atributo
+# dinámico (`_EstadoGlobal` es un `@dataclass` sin `__slots__`): su lifetime
+# es EXACTAMENTE el del objeto -nunca se hereda al clonar (un `hijo` es una
+# instancia nueva, sin el atributo) y nunca se puede "filtrar" entre un
+# `id()` reciclado y un objeto distinto (a diferencia de un diccionario
+# externo keyed por `id()`, acá no hace falta ninguna protección de
+# reciclaje: el atributo vive y muere con el objeto en sí).
+_ATRIBUTO_CACHE_ESTRUCTURAL = "_cache_estructural_2a2"
+
+
+def _cache_estructural_de_estado(estado: "_EstadoGlobal") -> CacheEstructural | None:
+    """[PATCH V6.12-2A2] Lee la cache YA asociada a ESTE objeto `estado`
+    exacto, si la hay -nunca crea una. `None` si este estado todavía no
+    tuvo ninguna consulta Structural (o si es un estado recién clonado,
+    que nunca hereda la del padre)."""
+    return getattr(estado, _ATRIBUTO_CACHE_ESTRUCTURAL, None)
+
+
+def _asociar_cache_estructural(estado: "_EstadoGlobal", cache: CacheEstructural) -> None:
+    """[PATCH V6.12-2A2] Asocia esta cache a ESTE objeto `estado` exacto
+    -válido para toda su vida útil (nunca se muta después de construido,
+    ver comentario de arriba). Sobreescribir con la misma instancia (caso
+    común: ya estaba asociada) es un no-op observable."""
+    setattr(estado, _ATRIBUTO_CACHE_ESTRUCTURAL, cache)
+
+
 def _clonar_construccion(pc: _PalletEnConstruccion) -> _PalletEnConstruccion:
     """Copia independiente de una `_PalletEnConstruccion` -necesaria porque
     `.colocar()` muta `self.libres` y `self.pallet.torres` in-place, y el
@@ -383,7 +416,10 @@ def _generar_candidatos_multi_pallet_hibrido(
         return opciones  # [Caso A] MaxRects ya tiene salida -mismo camino que V6.05, Structural NUNCA se consulta
 
     # [Caso B] MaxRects == 0 -Zero Rescue.
-    cache_estructural = cache_estructural or CacheEstructural()
+    # [PATCH V6.12-2A2] Mismo criterio que en `_contar_candidatos_y_registrar`.
+    if cache_estructural is None:
+        cache_estructural = _cache_estructural_de_estado(estado) or CacheEstructural()
+    _asociar_cache_estructural(estado, cache_estructural)
     if stats is not None:
         stats["zero_rescue_generate_calls"] = stats.get("zero_rescue_generate_calls", 0) + 1
     candidatos_estructurales = generar_candidatos_estructurales(
@@ -513,7 +549,15 @@ def _contar_candidatos_y_registrar(
     )
     candidatos = candidatos_maxrects
     if presupuesto is not None and candidatos_maxrects <= STRUCTURAL_ZERO_RESCUE_MAXRECTS_MAXIMO:
-        cache_estructural = cache_estructural or CacheEstructural()
+        # [PATCH V6.12-2A2] Si el caller no pasó una cache explícita, busca
+        # primero si ESTE `estado` exacto ya tiene una asociada (de una
+        # consulta anterior sobre la MISMA geometría, ver `_cache_
+        # estructural_de_estado`) antes de crear una descartable -mismo
+        # comportamiento si nunca hubo una, cero riesgo si la hay: la
+        # asociación es por objeto Python, nunca por geometría "parecida".
+        if cache_estructural is None:
+            cache_estructural = _cache_estructural_de_estado(estado) or CacheEstructural()
+        _asociar_cache_estructural(estado, cache_estructural)
         # [PATCH V6.07, sección 2 -PATCH V6.08 sección 3/4] `max_count ==
         # 1` es exactamente el caso de uso de poda ("Existencia") -se
         # enruta a la API dedicada `existe_candidato_estructural`
@@ -699,7 +743,13 @@ def _expandir_estado(
     if not pendientes_criticos:
         return []
 
-    cache_estructural = CacheEstructural() if presupuesto is not None else None
+    # [PATCH V6.12-2A2] Este `estado` (el padre a expandir) puede YA tener
+    # una cache asociada -por ejemplo, si en la profundidad anterior ya se
+    # evaluó su viabilidad/score (`_beam_search`, más abajo) antes de
+    # entrar a la frontera- reusarla en vez de crear una nueva descartable.
+    cache_estructural = (_cache_estructural_de_estado(estado) or CacheEstructural()) if presupuesto is not None else None
+    if cache_estructural is not None:
+        _asociar_cache_estructural(estado, cache_estructural)
 
     orden = _ordenar_mrv(
         pendientes_criticos, estado, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
@@ -819,7 +869,16 @@ def _critical_precedence_lookahead(
     veredictos: list[tuple[_EstadoGlobal, CacheEstructural]] = []
     algun_viable = False
     for hijo in hijos_normales:
-        cache_hijo = CacheEstructural()
+        # [PATCH V6.12-2A2] Cada `hijo` es un objeto recién clonado por
+        # `_expandir_sku_en_estado` -en el caso normal esta es su PRIMERA
+        # consulta Structural, así que esto casi siempre crea una cache
+        # nueva (correcto: nunca hereda la del padre). Pero si este MISMO
+        # `hijo` ya fue evaluado antes en esta función (no debería, ver
+        # anti-loop del docstring) o va a ser reevaluado más abajo por
+        # `_beam_search`, la asociación permite que esa evaluación
+        # posterior reutilice el trabajo hecho acá en vez de descartarlo.
+        cache_hijo = _cache_estructural_de_estado(hijo) or CacheEstructural()
+        _asociar_cache_estructural(hijo, cache_hijo)
         muerto, _sku_causante = _evaluar_viabilidad(
             hijo, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, stats,
             None, cache_hijo,
@@ -891,7 +950,9 @@ def _critical_precedence_lookahead(
         )
         n_viables = 0
         for hv in hijos_v:
-            cache_hv = CacheEstructural()
+            # [PATCH V6.12-2A2] mismo criterio que `cache_hijo` arriba.
+            cache_hv = _cache_estructural_de_estado(hv) or CacheEstructural()
+            _asociar_cache_estructural(hv, cache_hv)
             muerto_hv, _ = _evaluar_viabilidad(
                 hv, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, stats,
                 None, cache_hv,
@@ -1309,7 +1370,17 @@ def _beam_search(
             # consultan sobre el MISMO objeto `hijo` en el mismo instante,
             # así que comparten cache -si la poda ya avanzó el iterador
             # estructural de un sku, el score reutiliza ese trabajo.
-            cache_hijo = CacheEstructural() if presupuesto is not None else None
+            # [PATCH V6.12-2A2] Además, este `hijo` puede YA traer una cache
+            # asociada -de `_critical_precedence_lookahead` (si acaba de
+            # salir de ahí, ver ese pre-chequeo de viabilidad) o de un
+            # `estado` estancado re-agregado tal cual (`candidatos_hijos.
+            # append(estado)` más arriba, mismo objeto que ya se expandió) -
+            # se reutiliza esa en vez de descartarla.
+            if presupuesto is not None:
+                cache_hijo = _cache_estructural_de_estado(hijo) or CacheEstructural()
+                _asociar_cache_estructural(hijo, cache_hijo)
+            else:
+                cache_hijo = None
             muerto, sku_causante = _evaluar_viabilidad(
                 hijo, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, stats,
                 oracle_sampler, cache_hijo,

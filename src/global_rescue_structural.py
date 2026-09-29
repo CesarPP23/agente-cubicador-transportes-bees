@@ -350,13 +350,22 @@ class _EntradaCache:
 
 
 class CacheEstructural:
-    """[sección 8] Cache EFÍMERO -una instancia nueva por cada llamada a
-    `_expandir_estado` (un solo `estado` padre), NUNCA global ni
-    persistente entre estados distintos del beam search. Memoiza, por
-    `(id(estado), sku)`, un generador YA AVANZADO -`existe`/`contar`/
-    `generar` para el MISMO (estado, sku) piden más elementos al MISMO
-    iterador en vez de reconstruirlo (sección 9: "si count(limit=4) ya
-    encontró 4, exists() debe responder desde cache")."""
+    """[sección 8] Cache EFÍMERA POR ESTADO -antes de V6.12-2A2 se creaba
+    una instancia nueva por cada llamada a `_expandir_estado` (un solo
+    `estado` padre) Y otra descartable por cada chequeo de viabilidad sin
+    cache explícita (`_es_estado_inviable`); desde V6.12-2A2 esas
+    instancias se buscan/asocian por estado exacto (ver `global_rescue.
+    _cache_estructural_de_estado`/`_asociar_cache_estructural`) -sigue
+    siendo efímera (nunca global entre estados DISTINTOS: cada `estado`
+    -objeto Python, nunca reusado tras clonarse- tiene a lo sumo UNA cache
+    asociada, y un hijo clonado nunca hereda la del padre, ver docstring
+    de esas 2 funciones). Memoiza, por `(id(estado), sku)`, un generador
+    YA AVANZADO -`existe`/`contar`/`generar` para el MISMO (estado, sku)
+    piden más elementos al MISMO iterador en vez de reconstruirlo
+    (sección 9: "si count(limit=4) ya encontró 4, exists() debe responder
+    desde cache"). Lógica de cache SIN CAMBIOS en V6.12-2A2 -solo se
+    agregaron 3 contadores puramente diagnósticos
+    (`structural_enumerations_started/resumed/avoided`, sección 2A1)."""
 
     def __init__(self) -> None:
         self._entradas: dict[tuple[int, str], _EntradaCache] = {}
@@ -384,11 +393,19 @@ class CacheEstructural:
         entrada = self._entrada(estado, sku, generador_factory)
         if entrada.encontrados:
             _stat_incr(stats, "structural_cache_hits")
+            _stat_incr(stats, "structural_enumerations_avoided")
             return True
         if entrada.agotado:
             _stat_incr(stats, "structural_cache_hits")
+            _stat_incr(stats, "structural_enumerations_avoided")
             return False
         _stat_incr(stats, "structural_cache_misses")
+        # [sección 2A1] `entrada.encontrados` está vacío acá siempre (si no,
+        # ya se habría retornado arriba) -para existe() esta rama es SIEMPRE
+        # "started", nunca "resumed" (1 es el mínimo, cualquier hallazgo
+        # previo ya cubre la pregunta). Se deja la expresión condicional por
+        # simetría con contar()/generar(), donde sí puede ser "resumed".
+        _stat_incr(stats, "structural_enumerations_resumed" if entrada.encontrados else "structural_enumerations_started")
         antes = len(entrada.encontrados)
         self._avanzar_hasta(entrada, 1)
         if len(entrada.encontrados) == antes and not entrada.agotado:
@@ -402,8 +419,10 @@ class CacheEstructural:
         entrada = self._entrada(estado, sku, generador_factory)
         if len(entrada.encontrados) >= limite or entrada.agotado:
             _stat_incr(stats, "structural_cache_hits")
+            _stat_incr(stats, "structural_enumerations_avoided")
             return min(len(entrada.encontrados), limite)
         _stat_incr(stats, "structural_cache_misses")
+        _stat_incr(stats, "structural_enumerations_resumed" if entrada.encontrados else "structural_enumerations_started")
         self._avanzar_hasta(entrada, limite)
         if entrada.agotado or len(entrada.encontrados) >= limite:
             _stat_incr(stats, "structural_early_exit_count")
@@ -413,9 +432,13 @@ class CacheEstructural:
         entrada = self._entrada(estado, sku, generador_factory)
         if len(entrada.encontrados) < buffer and not entrada.agotado:
             _stat_incr(stats, "structural_cache_misses")
+            _stat_incr(
+                stats, "structural_enumerations_resumed" if entrada.encontrados else "structural_enumerations_started",
+            )
             self._avanzar_hasta(entrada, buffer)
         else:
             _stat_incr(stats, "structural_cache_hits")
+            _stat_incr(stats, "structural_enumerations_avoided")
         return list(entrada.encontrados[:buffer])
 
 
