@@ -1395,20 +1395,36 @@ def _resolver_pallets_backtracking(
     pallets`). La primera rama que explora cada nodo es siempre la de
     mayor prioridad (misma clave que usa el greedy) -así la primera hoja
     completa que encuentra ya iguala el resultado de hoy; de ahí en más
-    solo puede empatar o mejorar. Acotado por `COMBINACION_PALLETS_MAX_
-    NODOS` (conteo de nodos, reproducible entre corridas) Y, si se pasa
-    `limite_tiempo` (deadline absoluto en la unidad que devuelva `reloj`),
-    también por reloj real -ver comentario junto a `COMBINACION_PALLETS_
-    TIEMPO_MAX_DFS_SEGUNDOS` sobre por qué el conteo de nodos solo no
-    alcanza cuando el estado está muy fragmentado.
+    solo puede empatar o mejorar. Acotado ÚNICAMENTE por
+    `COMBINACION_PALLETS_MAX_NODOS` (conteo de nodos, reproducible entre
+    corridas) -ver solución encontrada/espacio agotado más abajo.
 
-    [PATCH V6.11-R3] `reloj` default `time.process_time` -esta función
-    SIEMPRE corre en el mismo proceso que hace el trabajo real, tanto
-    llamada directa (DFS inicial de `_empacar_n_pallets`) como desde
-    adentro de `_lns_mejorar_pallets` en su variante secuencial; el único
-    caso que corre en un proceso hijo (`_lns_una_semilla_worker`, LNS
+    [PATCH V6.12-D5 -"Deterministic DFS/LNS Work Budgets"] `limite_tiempo`/
+    `reloj` YA NO deciden el corte -confirmado (V6.12-2A2-D2/D3/D4) que un
+    deadline de `process_time()` real puede cortar esta búsqueda en un
+    número de nodos DISTINTO entre corridas con la MISMA entrada, según
+    cuánto throughput efectivo tuvo el proceso en ese instante (contención
+    real de procesos hermanos -no reproducible con quemadores de CPU
+    sintéticos, ver D3- nunca "cuánto trabajo lógico hay que hacer").
+    Resultado ahora depende ÚNICAMENTE de: (1) solución encontrada (la
+    demanda completa, ver `colocado_actual >= demanda_inicial` abajo -una
+    vez encontrada, ninguna otra rama puede superarla, la poda por cota la
+    descarta sola), (2) `max_nodos` agotado, o (3) espacio agotado (la
+    cota de la rama ya no supera lo encontrado, o no quedan candidatos).
+    Se mantienen `limite_tiempo`/`reloj` en la firma SOLO por compatibilidad
+    con los callers existentes (`rescue_solver._aplicar_ruina_dirigida`,
+    `_lns_mejorar_pallets`) -no se tocan esos módulos en este parche- pero
+    ya no participan en ninguna decisión de corte acá adentro.
+
+    [PATCH V6.11-R3, sigue vigente] `reloj` default `time.process_time`
+    -esta función SIEMPRE corre en el mismo proceso que hace el trabajo
+    real, tanto llamada directa (DFS inicial de `_empacar_n_pallets`) como
+    desde adentro de `_lns_mejorar_pallets` en su variante secuencial; el
+    único caso que corre en un proceso hijo (`_lns_una_semilla_worker`, LNS
     paralelo) pasa `reloj=` explícito con `time.monotonic` -ver
-    `_search_budget_now`. Modifica `construcciones`/`colocados_
+    `_search_budget_now` (este comentario describe el dominio temporal del
+    parámetro, que sigue existiendo en la firma; no implica que se use acá
+    para cortar, ver arriba). Modifica `construcciones`/`colocados_
     por_pallet`/`pendientes` IN-PLACE, dejándolos en el MEJOR estado
     encontrado al terminar -no devuelve una copia."""
     demanda_inicial = sum(pendientes.values())
@@ -1432,9 +1448,6 @@ def _resolver_pallets_backtracking(
     # ese mismo x,y) -no hace falta un sweep completo en cada nodo.
     area_inicial = sum(_area_union_xy(pc.pallet.torres) for pc in construcciones)
     estado = {"mejor_total": -1, "mejor_area": -1.0, "mejor_snapshot": None, "nodos": 0}
-
-    def _tiempo_agotado() -> bool:
-        return limite_tiempo is not None and reloj() > limite_tiempo
 
     def _volumen_libre_total() -> float:
         return sum(c.w * c.h * c.d for pc in construcciones for c in pc.libres)
@@ -1461,7 +1474,7 @@ def _resolver_pallets_backtracking(
             estado["mejor_total"] = colocado_actual
             estado["mejor_area"] = area_actual
             estado["mejor_snapshot"] = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
-        if estado["nodos"] > max_nodos or _tiempo_agotado():
+        if estado["nodos"] > max_nodos:
             return
         if colocado_actual >= demanda_inicial:
             return  # se colocó TODO -óptimo absoluto, no hay nada más que buscar
@@ -1486,7 +1499,7 @@ def _resolver_pallets_backtracking(
             colocados_por_pallet[pidx][sku] = colocados_por_pallet[pidx].get(sku, 0) + cantidad
             _dfs(colocado_actual + cantidad, area_actual + delta_area)
             _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap)
-            if estado["nodos"] > max_nodos or _tiempo_agotado():
+            if estado["nodos"] > max_nodos:
                 break
 
     _dfs(demanda_inicial - sum(pendientes.values()), area_inicial)
@@ -1580,15 +1593,31 @@ def _lns_mejorar_pallets(
     pendiente. Si el total colocado mejora, se queda con el resultado
     nuevo; si no, se revierte al mejor incumbente conocido
     (`_snapshot_estado_pallets`/`_restaurar_estado_pallets`, el mismo
-    mecanismo de undo del DFS). Corta por iteraciones sin mejora
-    consecutivas (`COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX`) o por el total
-    de iteraciones (`COMBINACION_PALLETS_LNS_ITERACIONES`) -RNG con
-    semilla fija (derivada de `cd`+`n_pallets` por el caller) para que el
-    resultado sea reproducible entre corridas. Modifica `construcciones`/
+    mecanismo de undo del DFS). Corta ÚNICAMENTE por: (1) solución completa
+    (`mejor_total` ya alcanzó toda la demanda disponible al entrar -nada
+    más que optimizar), (2) iteraciones sin mejora consecutivas
+    (`COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX`), o (3) el total de
+    iteraciones (`COMBINACION_PALLETS_LNS_ITERACIONES`) -RNG con semilla
+    fija (derivada de `cd`+`n_pallets` por el caller) para que el resultado
+    sea reproducible entre corridas. Modifica `construcciones`/
     `colocados_por_pallet`/`pendientes` IN-PLACE, igual que el DFS.
     Devuelve el total de cajas colocadas en TODOS los pallets (no un delta
     relativo a esta llamada, a diferencia de `_resolver_pallets_
     backtracking`).
+
+    [PATCH V6.12-D5 -"Deterministic DFS/LNS Work Budgets"] `limite_tiempo`/
+    `reloj` YA NO deciden en qué iteración termina este loop -mismo
+    hallazgo que en `_resolver_pallets_backtracking` (V6.12-2A2-D2/D3/D4):
+    un deadline de `process_time()` real cortaba esto en una iteración
+    DISTINTA entre corridas con la MISMA entrada según el throughput
+    efectivo del proceso en ese instante, nunca según cuánto trabajo lógico
+    hacía falta. Se mantienen en la firma solo por compatibilidad con
+    `rescue_solver`/`repair_solver` (no se tocan en este parche) y porque
+    siguen reenviándose tal cual a las reconstrucciones DFS internas -esas
+    ya inertes para decidir cortes también (ver `_resolver_pallets_
+    backtracking`); la reconstrucción interna corta por su propio
+    `max_nodos` (`COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION`), nunca
+    por tiempo.
 
     `skus_protegidos` -[Refinamiento 'grandes primero', ver
     `_reservar_skus_grandes`] SKUs que nunca se ofrecen como candidatos a
@@ -1612,11 +1641,15 @@ def _lns_mejorar_pallets(
     mejor_total = _total_colocado()
     mejor_snapshot = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
     sin_mejora = 0
+    # [PATCH V6.12-D5] Techo real de "solución completa" -constante durante
+    # todo este LNS (nunca cambia la demanda TOTAL, solo qué parte está
+    # colocada vs pendiente en cada iteración).
+    demanda_total_lns = mejor_total + sum(pendientes.values())
 
     for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES):
+        if mejor_total >= demanda_total_lns:
+            break  # [PATCH V6.12-D5] ya se colocó el 100% -nada más que optimizar
         if sin_mejora >= COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX:
-            break
-        if limite_tiempo is not None and reloj() > limite_tiempo:
             break
         skus_colocados = sorted({
             sku for d in colocados_por_pallet for sku, cant in d.items()
@@ -1630,8 +1663,11 @@ def _lns_mejorar_pallets(
         _romper_skus_con_cascada(construcciones, colocados_por_pallet, pendientes, elegidos, n_pallets)
 
         # [reconstrucción] Mismo backtracking, presupuesto de nodos más
-        # chico -acá se corre muchas veces, no una sola- y el mismo
-        # deadline de reloj real de esta corrida de LNS.
+        # chico -acá se corre muchas veces, no una sola. [PATCH V6.12-D5]
+        # `limite_tiempo=`/`reloj=` se siguen reenviando tal cual (mismos
+        # nombres de parámetro que antes) pero ya son inertes para decidir
+        # ningún corte -ver docstring de ambas funciones; el único corte
+        # real de esta reconstrucción es su propio `max_nodos` de acá abajo.
         _resolver_pallets_backtracking(
             construcciones, colocados_por_pallet, pendientes, por_sku,
             capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,

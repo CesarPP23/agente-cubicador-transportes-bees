@@ -1,14 +1,24 @@
 """[PATCH V6.11-R3] Tests de la abstracción de reloj para DFS/LNS
-(`_search_budget_now`, ver CIERRE V6.11-R1/R2). Confirman: (1) DFS y LNS
-SECUENCIALES usan `time.process_time()` por default, (2) el `reloj`
-inyectado realmente gobierna el corte de búsqueda -no es un parámetro
-decorativo, (3) el worker de LNS PARALELO (`_lns_una_semilla_worker`,
-corre en un proceso hijo de `ProcessPoolExecutor`) pasa `time.monotonic`
-explícito, nunca CPU-time del padre, y (4) el presupuesto en modo CPU es
-invariante a una demora externa que no consume CPU de este proceso
-(contención de otros CDs hermanos), mientras el mismo presupuesto en modo
-reloj-de-pared SÍ se ve recortado por esa demora -sin dormir de verdad:
-todo con relojes falsos inyectados, determinista y rápido."""
+(`_search_budget_now`, ver CIERRE V6.11-R1/R2).
+
+[PATCH V6.12-D5 -"Deterministic DFS/LNS Work Budgets"] Confirmado
+(V6.12-2A2-D2/D3/D4) que un deadline de reloj real -en CUALQUIER dominio,
+CPU-time o wall-clock- podía cortar `_resolver_pallets_backtracking`/
+`_lns_mejorar_pallets` en un punto DISTINTO entre corridas con la MISMA
+entrada, según el throughput efectivo del proceso en ese instante -nunca
+según cuánto trabajo lógico hacía falta (ver `SJ87` en el batch histórico
+real: el mismo N=7 a veces completaba solo, a veces necesitaba rescue/
+repair, sin ningún cambio de datos). Estas 2 funciones YA NO usan
+`limite_tiempo`/`reloj` para decidir ningún corte -acotan ÚNICAMENTE por
+`max_nodos`/iteraciones/sin_mejora_max, deterministas. Los tests de acá
+abajo que antes probaban "el reloj SÍ gobierna el corte" (puntos 2 y 4 del
+docstring original) se invirtieron para probar exactamente lo contrario:
+el reloj YA NO gobierna nada acá, pase lo que pase con él. Sigue vigente:
+(1) DFS y LNS SECUENCIALES usan `time.process_time()` por default (la
+firma no cambió, solo dejó de usarse para cortar), y (3) el worker de LNS
+PARALELO (`_lns_una_semilla_worker`) sigue reenviando `time.monotonic`
+explícito -ese reenvío en sí no cambió, aunque ya no tenga efecto de corte
+dentro de estas 2 funciones."""
 import inspect
 import time
 from unittest.mock import patch
@@ -52,9 +62,15 @@ def test_lns_secuencial_default_es_process_time():
     assert sig.parameters["reloj"].default is time.process_time
 
 
-# --- (2) El reloj inyectado gobierna el corte, no es decorativo --------
+# --- (2) [PATCH V6.12-D5] El reloj inyectado YA NO gobierna el corte ----
 
-def test_dfs_reloj_ya_vencido_corta_en_el_nodo_raiz_sin_colocar_nada():
+def test_dfs_reloj_ya_vencido_ya_no_corta_nada_coloca_la_demanda_completa():
+    """[PATCH V6.12-D5, invierte la aserción original de V6.11-R3] Antes,
+    un deadline YA vencido al entrar (`limite_tiempo=0.0, reloj=lambda:
+    1000.0`) cortaba el DFS en el nodo raíz, sin colocar nada. Ahora ese
+    mismo reloj "vencido" se ignora por completo -el resultado depende
+    únicamente de `max_nodos`/solución encontrada, así que coloca la
+    demanda completa igual que si no se hubiera pasado ningún reloj."""
     por_sku = {"A": [_cand("A", 40, 30, 20, cantidad_disponible=10)]}
     pendientes = {"A": 10}
     construcciones, colocados = _estado_inicial(1)
@@ -63,7 +79,7 @@ def test_dfs_reloj_ya_vencido_corta_en_el_nodo_raiz_sin_colocar_nada():
         construcciones, colocados, pendientes, por_sku, {}, {}, {}, PRESUPUESTO, 1,
         limite_tiempo=0.0, reloj=lambda: 1000.0,
     )
-    assert sum(colocados[0].values()) == 0
+    assert sum(colocados[0].values()) == 10
 
 
 def test_dfs_reloj_no_vencido_coloca_la_demanda_completa():
@@ -97,7 +113,9 @@ def test_lns_una_semilla_worker_pasa_reloj_monotonic_explicito():
     assert mock_lns.call_args.kwargs["reloj"] is time.monotonic
 
 
-# --- (4) Invariancia del presupuesto CPU a una demora externa ----------
+# --- (4) [PATCH V6.12-D5] Invariancia a CUALQUIER demora, en CUALQUIER
+# dominio -ya no es "CPU inmune, wall-clock no"; ahora NINGÚN dominio
+# afecta nada, porque el reloj dejó de consultarse en absoluto. ---------
 
 class _RelojFalso:
     """Simula, por cada nodo no-terminal visitado (un llamado a
@@ -139,15 +157,15 @@ def _correr_con_demora_simulada(modo: str, presupuesto_reloj: float):
     return sum(colocados[0].values())
 
 
-def test_presupuesto_cpu_es_invariante_a_la_demora_externa_simulada():
-    """[sección 9] Mismo input, mismo presupuesto NUMÉRICO (0.5): en modo
-    CPU, la demora de reloj de pared inyectada por nodo (5.0 "segundos"
-    simulados) NUNCA se consulta -el presupuesto se agota solo por trabajo
-    de CPU real (0.01 por nodo), así que alcanza para colocar toda la
-    demanda. En modo reloj-de-pared, la MISMA demora corta la búsqueda
-    casi de inmediato (0.5 no alcanza ni para 1 nodo de 5.0)."""
+def test_presupuesto_ya_no_se_ve_afectado_por_ninguna_demora_en_ningun_dominio():
+    """[PATCH V6.12-D5, invierte la aserción original de V6.11-R3] Antes,
+    un presupuesto de 0.5 en modo reloj-de-pared cortaba la búsqueda casi
+    de inmediato (`cajas_wall < cajas_cpu`) -ahora NINGÚN dominio corta
+    nada: ambos modos ignoran `limite_tiempo`/`reloj` por completo y
+    colocan la demanda completa (12 = A + B), sin importar qué tan grande
+    sea la demora simulada por nodo en ninguno de los dos relojes."""
     cajas_cpu = _correr_con_demora_simulada("cpu", presupuesto_reloj=0.5)
     cajas_wall = _correr_con_demora_simulada("wall", presupuesto_reloj=0.5)
 
-    assert cajas_cpu == 12  # A + B completos, el presupuesto de CPU nunca se vio afectado
-    assert cajas_wall < cajas_cpu  # la misma demora SÍ recorta el presupuesto de pared
+    assert cajas_cpu == 12
+    assert cajas_wall == 12
