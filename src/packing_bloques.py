@@ -153,7 +153,7 @@ import os
 import random
 import time
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
 
@@ -1074,6 +1074,19 @@ COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION = 3_000
 # distintas desde el mismo punto de partida y se conserva el mejor.
 COMBINACION_PALLETS_LNS_REINICIOS = 5
 
+# [PATCH V6.12-D7B-0 -"Deterministic LNS restarts"] Cantidad de reinicios del
+# camino SECUENCIAL (`paralelo_lns=False`, el que usa el batch multi-CD de
+# `pipeline_sku_bloque._procesar_cd`). Antes, cuántos reinicios corrían lo
+# decidía un reloj (`reloj_lns() > deadline_lns`, CPU-time) -criterio
+# algorítmico basado en tiempo. Medido en V6.12-D7A/D7B (batch real de 9
+# CDs): los 7 CDs que usan LNS ejecutaban SIEMPRE exactamente 1 reinicio
+# (el primero completaba la demanda o excedía el tope de reloj por un
+# margen enorme), así que este valor reproduce el comportamiento real
+# actual, ahora explícito y sin reloj. El camino PARALELO sigue corriendo
+# `COMBINACION_PALLETS_LNS_REINICIOS` semillas (los reinicios extra SÍ
+# aportan valor medido: SJ95 semilla 1, SJ97 semilla 2).
+COMBINACION_PALLETS_LNS_REINICIOS_SECUENCIAL = 1
+
 # [tope de reloj real -pedido explícito del usuario tras el corrido con
 # `Pallets_Objetivo` real que quedó colgado >21 horas] `max_nodos` acota
 # la CANTIDAD de nodos, no lo que tarda cada uno -con `pallets_objetivo`
@@ -1688,6 +1701,32 @@ def _lns_mejorar_pallets(
     return mejor_total
 
 
+def _seleccionar_mejor_reinicio(
+    mejor_total_inicial: int,
+    mejor_snapshot_inicial,
+    resultados_por_semilla: list[tuple[int, list[_PalletEnConstruccion], list[dict[str, int]], dict[str, int]]],
+):
+    """[PATCH V6.12-D7B-0] Elige el mejor reinicio LNS de forma DETERMINISTA.
+    `resultados_por_semilla` viene en ORDEN DE ÍNDICE DE SEMILLA (no de
+    terminación). Criterio: el mismo de siempre -`total_intento` ESTRICTAMENTE
+    mayor que el mejor vigente (el incumbente de entrada, el DFS, gana
+    empates contra cualquier semilla)- recorrido por índice de semilla
+    ascendente, así que ante un empate entre semillas gana la de MENOR
+    índice, sin depender de qué proceso hijo terminó primero. No cambia el
+    score: solo elimina el orden de terminación como desempate."""
+    mejor_total = mejor_total_inicial
+    mejor_snapshot = mejor_snapshot_inicial
+    for total_intento, construcciones_i, colocados_i, pendientes_i in resultados_por_semilla:
+        if total_intento > mejor_total:
+            mejor_total = total_intento
+            mejor_snapshot = (
+                [(list(pc.pallet.torres), pc.libres) for pc in construcciones_i],
+                [dict(d) for d in colocados_i],
+                dict(pendientes_i),
+            )
+    return mejor_total, mejor_snapshot
+
+
 def _lns_una_semilla_worker(
     construcciones: list[_PalletEnConstruccion],
     colocados_por_pallet: list[dict[str, int]],
@@ -1875,8 +1914,9 @@ def _empacar_n_pallets(
         # [tope de reloj real, ver comentario junto a COMBINACION_PALLETS_
         # TIEMPO_MAX_LNS_SEGUNDOS] Un solo deadline absoluto para TODA la
         # fase de LNS -en paralelo, lo respeta cada semilla por igual (no
-        # se suma, corren a la vez); en secuencial, se reparte entre los
-        # reinicios que alcancen a arrancar antes de que se cumpla.
+        # se suma, corren a la vez). [PATCH V6.12-D7B-0] Ya NO decide cuántos
+        # reinicios corren (ver `COMBINACION_PALLETS_LNS_REINICIOS_SECUENCIAL`)
+        # ni corta nada: se mantiene solo para la firma de las funciones LNS.
         # [PATCH V6.11-R3] `paralelo_lns=True` reparte el trabajo real en
         # procesos hijos (`ProcessPoolExecutor` más abajo) -el CPU-time de
         # ESTE proceso (el padre) no avanza mientras los hijos trabajan,
@@ -1903,20 +1943,23 @@ def _empacar_n_pallets(
                     )
                     for intento in range(COMBINACION_PALLETS_LNS_REINICIOS)
                 ]
-                for futuro in as_completed(futuros):
-                    total_intento, construcciones_i, colocados_i, pendientes_i = futuro.result()
-                    if total_intento > mejor_total_lns:
-                        mejor_total_lns = total_intento
-                        mejor_snapshot_lns = (
-                            [(list(pc.pallet.torres), pc.libres) for pc in construcciones_i],
-                            [dict(d) for d in colocados_i],
-                            dict(pendientes_i),
-                        )
+                # [PATCH V6.12-D7B-0] Los resultados se leen EN ORDEN DE SEMILLA
+                # (`.result()` bloquea hasta que ESA semilla termina), nunca en
+                # orden de terminación (`as_completed`): ante un empate de
+                # cajas el ganador era "el primero en terminar" -dependiente
+                # del tiempo. Ver `_seleccionar_mejor_reinicio`.
+                resultados_por_semilla = [futuro.result() for futuro in futuros]
+            mejor_total_lns, mejor_snapshot_lns = _seleccionar_mejor_reinicio(
+                mejor_total_lns, mejor_snapshot_lns, resultados_por_semilla,
+            )
             _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, mejor_snapshot_lns)
         else:
-            for intento in range(COMBINACION_PALLETS_LNS_REINICIOS):
-                if reloj_lns() > deadline_lns:
-                    break
+            # [PATCH V6.12-D7B-0] La cantidad de reinicios es un LÍMITE
+            # EXPLÍCITO (`COMBINACION_PALLETS_LNS_REINICIOS_SECUENCIAL`), ya
+            # no `reloj_lns() > deadline_lns`. `limite_tiempo`/`reloj` se
+            # siguen reenviando solo por compatibilidad de firma: son
+            # inertes para decidir cortes desde V6.12-D5.
+            for intento in range(COMBINACION_PALLETS_LNS_REINICIOS_SECUENCIAL):
                 _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, snapshot_dfs)
                 total_intento = _lns_mejorar_pallets(
                     construcciones_bt, colocados_bt, pendientes_bt, por_sku,
