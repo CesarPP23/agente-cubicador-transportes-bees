@@ -43,6 +43,95 @@ from src.pipeline import (
 )
 
 
+# [PATCH V6.12-D6.1 -ID_ASSIGNMENT_NONDETERMINISM, ver V6.12-D6] El
+# contador que arma `ID_Pallet` (`PV5-{cd}-NNN`) es compartido y nunca se
+# resetea entre sondeos de `politica_a_descenso`/cascada Rescue/Repair/
+# Exact/Global -confirmado en D6 que estos sondeos DESCARTADOS, con un
+# `time.process_time()` real todavía sin calendarizar de forma
+# determinista (fuera de alcance de D5/D6.1), pueden consumir una
+# cantidad distinta de números según contención real entre corridas
+# "idénticas" -sin cambiar NUNCA el contenido final (demostrado
+# empíricamente: `content_diffs` vacío en las 4 corridas de D6, solo
+# `id_only_diffs`). Este prefijo excluye del renombrado a los pallets
+# dedicados BAT (`bat.renombrar_pallets_bat_puros`, esquema
+# `PV5-BAT-{cd}-NNN` que reconoce `benchmark.calcular_kpis` por prefijo)
+# -se dejan exactamente como están, nunca se tocan ni reordenan acá.
+_PREFIJO_BAT_DEDICADO = "PV5-BAT-"
+
+
+def _firma_torre_canonica(torre) -> tuple:
+    """[PATCH V6.12-D6.1] Firma de UNA torre, independiente de cuándo o en
+    qué orden interno se creó -solo lo que físicamente contiene. Misma
+    precisión contractual que ya usa `global_rescue._signature_torres`
+    (`round(..., 2)` para coordenadas/dimensiones), extendida con
+    `alto_caja` para capturar el resto de la geometría que puede
+    distinguir dos pallets."""
+    return (
+        torre.sku, torre.cantidad, round(torre.x, 2), round(torre.y, 2), round(torre.z, 2),
+        round(torre.largo, 2), round(torre.ancho, 2), round(torre.alto_caja, 2), torre.orientacion,
+    )
+
+
+def _firma_pallet_canonica(pallet: PalletV5) -> tuple:
+    """[PATCH V6.12-D6.1] Firma de UN pallet completo: multiset ordenado de
+    firmas de torres -nunca depende de ID, de orden de inserción, ni de
+    ninguna prioridad operacional (cajas/peso)."""
+    return tuple(sorted(_firma_torre_canonica(t) for t in pallet.torres))
+
+
+def _canonicalizar_ids_pallets_v5(pallets_v5: list) -> None:
+    """[PATCH V6.12-D6.1 -fix de V6.12-D6, ID_ASSIGNMENT_NONDETERMINISM]
+    Reasigna `ID_Pallet` de forma determinista, basada SOLO en contenido/
+    geometría final -nunca en el orden de inserción ni en cuántos intentos
+    internos (probes de `politica_a_descenso`, Rescue, Repair, Exact,
+    Global) precedieron a la materialización final de cada CD. Debe
+    llamarse en el PRIMER punto donde la solución final de TODOS los CDs
+    ya está elegida (después de ensamblar `pallets_v5`) y todavía no se
+    produjo ningún output público (antes de `_palletv5_a_pallet`/
+    `exportar.construir_*_df`) -nunca antes, para no interferir con el
+    contador interno que usan probes/DFS/LNS/Rescue/Repair/Exact/Global
+    (esos siguen exactamente igual, con sus huecos cosméticos de siempre).
+
+    Muta `pallets_v5` IN PLACE: reordena el bloque de cada CD (nunca mueve
+    un pallet de un CD a otro) según la firma canónica y reescribe `.id`
+    a `PV5-{cd}-001..NNN` sobre ESE orden -el mismo orden que
+    `exportar.construir_plan_picking_df` recorre para numerar
+    `N_Parihuela` (cuenta por posición de aparición), así que ambos
+    quedan consistentes entre sí sin tocar `exportar.py`.
+
+    [Empates] Dos pallets con firma canónica IDÉNTICA son, por
+    definición, físicamente intercambiables -cualquier asignación entre
+    ellos produce EXACTAMENTE las mismas filas exportadas (mismo SKU/
+    cantidad/geometría en cada una), solo cambia cuál copia física recibe
+    cuál número. El desempate (estable, por orden de aparición pre-sort)
+    nunca depende de identidad de objeto ni de ningún valor no
+    determinista.
+
+    [Referencial] También re-sella `pallet.metadata["estabilidad"].
+    pallet_id` si existe (`src/estabilidad.py`, calculado ANTES de este
+    punto con el id viejo) para que no quede una referencia interna
+    stale -aunque hoy ningún output lee ese campo (`exportar.
+    construir_estabilidad_df` ya usa `pallet.id` directamente, no
+    `est.pallet_id`)."""
+    posiciones_por_cd: dict[str, list[int]] = {}
+    for idx, pallet in enumerate(pallets_v5):
+        posiciones_por_cd.setdefault(pallet.cd, []).append(idx)
+
+    for cd, posiciones in posiciones_por_cd.items():
+        posiciones_normales = [i for i in posiciones if not pallets_v5[i].id.startswith(_PREFIJO_BAT_DEDICADO)]
+        if not posiciones_normales:
+            continue
+        pallets_ordenados = sorted(
+            (pallets_v5[i] for i in posiciones_normales), key=_firma_pallet_canonica,
+        )
+        for numero, (slot, pallet) in enumerate(zip(posiciones_normales, pallets_ordenados), start=1):
+            pallet.id = f"PV5-{cd}-{numero:03d}"
+            estab = pallet.metadata.get("estabilidad")
+            if estab is not None and hasattr(estab, "pallet_id"):
+                estab.pallet_id = pallet.id
+            pallets_v5[slot] = pallet
+
+
 def _palletv5_a_pallet(pv5, info_sku: dict) -> Pallet:
     """Adapta un PalletV5 (torres) a un Pallet (mismo modelo que usan
     soporte.py/exportar.py/benchmark.py) para no duplicar esa
@@ -247,6 +336,11 @@ def ejecutar_core_sku_bloque(
         # (paralelo_lns=True) si ese único CD lo necesita.]
         for cd, grupo in grupos_cd:
             pallets_v5.extend(_procesar_cd(cd, grupo, pallets_objetivo_por_cd.get(cd), True))
+
+    # [PATCH V6.12-D6.1] Primer punto donde la solución final de TODOS los
+    # CDs ya está elegida y todavía no se produjo ningún output público
+    # -ver `_canonicalizar_ids_pallets_v5`.
+    _canonicalizar_ids_pallets_v5(pallets_v5)
 
     pallets_apilado = [_palletv5_a_pallet(p, info_sku) for p in pallets_v5]
     for pallet in pallets_apilado:
