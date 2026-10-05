@@ -218,6 +218,20 @@ class BusquedaState:
         return "BEST_FEASIBLE_UNPROVEN"
 
 
+# [PATCH V6.12-D7B-P1 -"Probe DFS work budget"] Tope de nodos del DFS inicial
+# del SONDEO (`probe()`), SOLO en este contexto. Medido en V6.12-D7B-P (batch
+# real de 9 CDs, 9 sondeos): el nodo donde el DFS inicial de un sondeo
+# encuentra su mejor resultado nunca pasó de 5367 (SJ95 n=3, UNKNOWN sin
+# remedio) y en los 3 sondeos FEASIBLE fue 759/85/86 -con 30000 el DFS gastaba
+# ~80% de sus nodos DESPUÉS de haber encontrado su mejor resultado (el 83%
+# de los DFS iniciales terminaba por `max_nodos`). Con 8000 el resultado del
+# DFS es idéntico (el corte llega después del mejor nodo) y el sondeo cuesta
+# ~1/4. El DFS de la materialización final (30000), el de `Pallets_Objetivo`
+# fijo, el del LNS y el de Rescue/Repair NO se tocan. La unidad es CONTEO DE
+# NODOS -determinista, independiente de la velocidad del reloj.
+PROBE_DFS_MAX_NODES = 8000
+
+
 def probe(
     n: int,
     pendientes_originales: dict[str, int],
@@ -243,7 +257,7 @@ def probe(
     t0 = time.process_time()
     pallets, sin_colocar = _empacar_n_pallets(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
-        cd, contador, n, paralelo_lns=paralelo_lns, con_lns=False,
+        cd, contador, n, paralelo_lns=paralelo_lns, con_lns=False, max_nodos_dfs=PROBE_DFS_MAX_NODES,
     )
     cpu_s = time.process_time() - t0
     colocadas = demanda_total - sum(sin_colocar.values())

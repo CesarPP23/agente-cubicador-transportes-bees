@@ -1782,6 +1782,7 @@ def _empacar_n_pallets(
     paralelo_lns: bool = True,
     con_lns: bool = True,
     priorizar_grandes: bool = False,
+    max_nodos_dfs: int = COMBINACION_PALLETS_MAX_NODOS,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1837,7 +1838,17 @@ def _empacar_n_pallets(
     `_empacar_n_pallets_greedy` (el baseline de comparación de abajo sigue
     siendo el greedy de siempre) -si "grandes primero" empeorara algo, el
     guard de más abajo (`total_bt` vs `total_greedy`) ya descarta el
-    resultado y vuelve al greedy: cero riesgo de regresión por diseño."""
+    resultado y vuelve al greedy: cero riesgo de regresión por diseño.
+
+    [PATCH V6.12-D7B-P1 -"Probe DFS work budget"] `max_nodos_dfs` es el tope
+    de nodos del DFS INICIAL de esta función (el de abajo, con
+    `_resolver_pallets_backtracking`) -default `COMBINACION_PALLETS_MAX_
+    NODOS` (30000), así que TODO caller que no lo pase (la materialización
+    final de `_empacar_optimizado`, `Pallets_Objetivo` fijo vía
+    `armar_pallets_bloques`) queda exactamente igual. Solo el sondeo de
+    `busqueda_n_pallets.probe()` lo sobrescribe (`PROBE_DFS_MAX_NODES`).
+    No afecta al DFS de reconstrucción del LNS ni al de Rescue/Repair, que
+    tienen su propio `max_nodos`."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -1886,6 +1897,7 @@ def _empacar_n_pallets(
     _resolver_pallets_backtracking(
         construcciones_bt, colocados_bt, pendientes_bt, por_sku,
         capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+        max_nodos=max_nodos_dfs,
         limite_tiempo=_search_budget_now(incluye_trabajo_hijos=False) + _tiempo_max_dfs(demanda_total),
         reloj=lambda: _search_budget_now(incluye_trabajo_hijos=False),
     )
