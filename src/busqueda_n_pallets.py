@@ -231,6 +231,25 @@ class BusquedaState:
 # NODOS -determinista, independiente de la velocidad del reloj.
 PROBE_DFS_MAX_NODES = 8000
 
+# [PATCH V6.12-D7B-P2 -"Probe Rescue work budget"] Presupuesto de NODOS de
+# Rescue, SOLO en el contexto del sondeo (`probe()`); la materialización final
+# y `Pallets_Objetivo` fijo siguen con el presupuesto de CPU-time de siempre.
+# Calibrado en V6.12-D7B-P2 (batch real de 9 CDs, 8 cascadas de Rescue en
+# probes, cascada COMPLETA corriendo detrás: Rescue -> Repair -> Exact ->
+# Global) contra 12000 / 14000 / 15000:
+#   * 3 probes FEASIBLE (BK41 n=3, BK65 n=4, BK68 n=3) preservados con los 3
+#     topes, mismos hashes finales y mismo hash de witness;
+#   * último nodo que mejora el RESIDUAL en BK41 (único FEASIBLE cuyo Rescue
+#     queda cortado por el tope): 9032 -> margen 1,66x con 15000;
+#   * último nodo que mejora el SCORE COMPLETO en BK41: 12802 -> margen 1,17x
+#     (12000 queda debajo, 0,94x; el desempate fino, aunque en este caso
+#     igual se reproduce);
+#   * 15000 reproduce el residual de Rescue del baseline en BK31 y SJ95 n=4
+#     (12000 no: BK31 queda en 23 en vez de 18 faltantes) a +59 s de CPU de
+#     Rescue sobre 12000 (~3,5% del CPU de probes UNKNOWN).
+# Unidad y semántica de conteo: ver `src/medidor_trabajo.py`.
+PROBE_RESCUE_MAX_NODES = 15000
+
 
 def probe(
     n: int,
@@ -258,6 +277,7 @@ def probe(
     pallets, sin_colocar = _empacar_n_pallets(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n, paralelo_lns=paralelo_lns, con_lns=False, max_nodos_dfs=PROBE_DFS_MAX_NODES,
+        presupuesto_rescue_nodos=PROBE_RESCUE_MAX_NODES,
     )
     cpu_s = time.process_time() - t0
     colocadas = demanda_total - sum(sin_colocar.values())

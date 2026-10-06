@@ -1518,6 +1518,12 @@ def _resolver_pallets_backtracking(
     _dfs(demanda_inicial - sum(pendientes.values()), area_inicial)
     if estado["mejor_snapshot"] is not None:
         _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, estado["mejor_snapshot"])
+    # [PATCH V6.12-D7B-P2] Si el `reloj` recibido es un `MedidorTrabajo` (budget
+    # de trabajo determinista, ver src/medidor_trabajo.py) se le suman las
+    # visitas de este DFS. Con un `reloj` normal (función) no hace nada.
+    registrar_nodos = getattr(reloj, "registrar_nodos", None)
+    if registrar_nodos is not None:
+        registrar_nodos(estado["nodos"])
     return estado["mejor_total"]
 
 
@@ -1783,6 +1789,7 @@ def _empacar_n_pallets(
     con_lns: bool = True,
     priorizar_grandes: bool = False,
     max_nodos_dfs: int = COMBINACION_PALLETS_MAX_NODOS,
+    presupuesto_rescue_nodos: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1848,7 +1855,15 @@ def _empacar_n_pallets(
     `armar_pallets_bloques`) queda exactamente igual. Solo el sondeo de
     `busqueda_n_pallets.probe()` lo sobrescribe (`PROBE_DFS_MAX_NODES`).
     No afecta al DFS de reconstrucción del LNS ni al de Rescue/Repair, que
-    tienen su propio `max_nodos`."""
+    tienen su propio `max_nodos`.
+
+    [PATCH V6.12-D7B-P2 -"Probe Rescue work budget"] `presupuesto_rescue_nodos`
+    (default `None`): cuando se pasa, Rescue corta por un presupuesto de NODOS
+    (`rescue_solver(presupuesto_nodos=...)`, ver `src/medidor_trabajo.py`) en
+    vez del CPU-time de siempre. SOLO lo pasa `busqueda_n_pallets.probe()`
+    (`PROBE_RESCUE_MAX_NODES`); la materialización final y `Pallets_Objetivo`
+    fijo no lo pasan y Rescue queda exactamente igual (el kwarg ni siquiera se
+    envía). Repair/Exact/Global no cambian."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -2037,9 +2052,12 @@ def _empacar_n_pallets(
         score_actual = _score_solucion(total_final, pendientes_actual, por_sku, pallets_final, skus_protegidos_cd)
 
         deadline_rescue = time.process_time() + RESCUE_TIME_MAX_SECONDS
+        # [PATCH V6.12-D7B-P2] El kwarg SOLO se envía en contexto probe: fuera
+        # de él la llamada es idéntica a la de siempre.
+        kwargs_rescue = {} if presupuesto_rescue_nodos is None else {"presupuesto_nodos": presupuesto_rescue_nodos}
         pallets_rescue, sin_colocar_rescue, stats_rescue = rescue_solver(
             pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
-            tope_pallet_por_sku, n_pallets, presupuesto, deadline=deadline_rescue,
+            tope_pallet_por_sku, n_pallets, presupuesto, deadline=deadline_rescue, **kwargs_rescue,
         )
         total_rescue = demanda_total - sum(sin_colocar_rescue.values())
         pendientes_rescue = {**{sku: 0 for sku in por_sku}, **sin_colocar_rescue}

@@ -236,6 +236,10 @@ def _colocar_critico_backtracking(
 
     _dfs(0)
     _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor["snapshot"])
+    # [PATCH V6.12-D7B-P2] ver `src/medidor_trabajo.py` -no-op con un `reloj` normal.
+    registrar_nodos = getattr(reloj, "registrar_nodos", None)
+    if registrar_nodos is not None:
+        registrar_nodos(nodos[0])
     return inicial - pendientes.get(sku, 0)
 
 
@@ -504,6 +508,7 @@ def rescue_solver(
     n_pallets: int,
     presupuesto: float,
     deadline: float | None = None,
+    presupuesto_nodos: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int], dict]:
     """[sección 3] Punto de entrada. Recibe el MEJOR resultado ya obtenido
     por el camino normal (`pallets` + `sin_colocar`) y trata de mejorarlo
@@ -528,14 +533,29 @@ def rescue_solver(
     a `_resolver_pallets_backtracking`) -deadline y checker siempre en el
     mismo dominio temporal, nunca por default implícito. `deadline`
     (parámetro externo, ver `packing_bloques._empacar_n_pallets`) también
-    debe venir ya en este mismo dominio (CPU-time)."""
+    debe venir ya en este mismo dominio (CPU-time).
+
+    [PATCH V6.12-D7B-P2 -"Probe Rescue work budget"] `presupuesto_nodos`
+    (default `None` = comportamiento de siempre, CPU-time): cuando se pasa, el
+    `reloj` de TODO este rescue es un `MedidorTrabajo` (unidad: nodos de
+    backtracking, convención y semántica en `src/medidor_trabajo.py`) y
+    `limite_tiempo = reloj() + presupuesto_nodos`; `deadline` (que es un
+    instante de CPU-time) se IGNORA en ese modo. Los puntos de control son los
+    mismos de siempre; solo cambia la unidad del reloj. Lo pasa únicamente
+    `busqueda_n_pallets.probe()`."""
+    from src.medidor_trabajo import MedidorTrabajo
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 
-    reloj: Callable[[], float] = time.process_time
+    reloj: Callable[[], float]
     t0_wall = time.time()  # solo para stats["tiempo_segundos"] (diagnóstico humano, no budget)
-    limite_tiempo = reloj() + RESCUE_TIME_MAX_SECONDS
-    if deadline is not None:
-        limite_tiempo = min(limite_tiempo, deadline)
+    if presupuesto_nodos is not None:
+        reloj = MedidorTrabajo()
+        limite_tiempo = reloj() + presupuesto_nodos
+    else:
+        reloj = time.process_time
+        limite_tiempo = reloj() + RESCUE_TIME_MAX_SECONDS
+        if deadline is not None:
+            limite_tiempo = min(limite_tiempo, deadline)
 
     stats = {
         "activado": True,
@@ -662,6 +682,10 @@ def rescue_solver(
     stats["mejor_mejora"] = mejor_total - total_inicial
     stats["colocadas"] = mejor_total
     stats["tiempo_segundos"] = round(time.time() - t0_wall, 3)
+    stats["presupuesto"] = (
+        {"modo": "tiempo"} if presupuesto_nodos is None
+        else {"modo": "nodos", "tope": presupuesto_nodos, "nodos_trabajo": reloj.nodos}
+    )
     for sku, d in stats["por_sku_critico"].items():
         pendiente_final = sin_colocar_final.get(sku, 0)
         d["pendiente_final"] = pendiente_final

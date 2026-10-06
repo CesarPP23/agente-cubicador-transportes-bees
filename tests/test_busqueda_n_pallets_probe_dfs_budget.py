@@ -2,7 +2,19 @@
 (`busqueda_n_pallets.probe()`) acota por `PROBE_DFS_MAX_NODES` (8000);
 TODO lo demás conserva su tope: materialización final de `_empacar_optimizado`,
 `Pallets_Objetivo` fijo, DFS del LNS, Rescue/Repair. La unidad es conteo de
-nodos -nunca el reloj."""
+nodos -nunca el reloj.
+
+[CONVENCIÓN DE CONTEO -fijada en V6.12-D7B-P2, idéntica para todos los
+budgets de trabajo de ahí en adelante] `_resolver_pallets_backtracking`
+incrementa `estado["nodos"]` AL ENTRAR a cada nodo (la raíz es el nodo 1) y
+corta con `if estado["nodos"] > max_nodos: return` (guard estricto). Por lo
+tanto, un tope de N significa:
+  * EXPANSIONES (nodos que calculan candidatos, = llamadas a
+    `_candidatos_lote`) <= N  -exactamente N si el espacio no se agota antes;
+  * VISITAS (la métrica real `estado["nodos"]`, la que registran los
+    contadores y las trazas) = N + 1 al cortar: la visita que excede el tope
+    se cuenta, evalúa si mejora el incumbente, y retorna sin expandir.
+Los tests sintéticos de abajo miden las dos cosas con el contador real."""
 import inspect
 from unittest.mock import patch
 
@@ -64,6 +76,26 @@ def _contar_nodos_dfs(monkeypatch):
 
     monkeypatch.setattr(pb, "_candidatos_lote", _contado)
     return n
+
+
+def _contar_visitas_dfs(monkeypatch):
+    """Instrumenta (solo en el test) `_resolver_pallets_backtracking` para
+    registrar `estado["nodos"]` -la MISMA métrica real que reportan las trazas
+    y los contadores- al terminar cada corrida. No cambia el comportamiento."""
+    visitas: list[int] = []
+    fuente = inspect.getsource(pb._resolver_pallets_backtracking)
+    marca = '    return estado["mejor_total"]\n'
+    assert fuente.count(marca) == 1
+    fuente = fuente.replace(marca, '    _registro_visitas_test.append(estado["nodos"])\n' + marca)
+    original = pb._resolver_pallets_backtracking
+    pb.__dict__["_registro_visitas_test"] = visitas
+    exec(compile(fuente, "<visitas_test>", "exec"), pb.__dict__)
+    instrumentada = pb.__dict__["_resolver_pallets_backtracking"]
+    pb.__dict__["_resolver_pallets_backtracking"] = original  # monkeypatch registra `original` como valor a restaurar
+    monkeypatch.setattr(pb, "_resolver_pallets_backtracking", instrumentada)
+    monkeypatch.delitem(pb.__dict__, "_registro_visitas_test", raising=False)
+    pb.__dict__["_registro_visitas_test"] = visitas
+    return visitas
 
 
 def _correr_probe(por_sku, pendientes, n_pallets=1):
@@ -166,6 +198,24 @@ def test_el_corte_ocurre_exactamente_por_el_presupuesto_de_nodos(monkeypatch):
     assert [resultados[t][0] for t in (5, 25, 60)] == [5, 25, 60]
     # más trabajo permitido => nunca menos cajas
     assert resultados[5][1] <= resultados[25][1] <= resultados[60][1]
+
+
+def test_convencion_expansiones_igual_al_tope_y_visitas_igual_al_tope_mas_uno(monkeypatch):
+    """Explica por qué la métrica real de un DFS cortado por `PROBE_DFS_MAX_NODES
+    = 8000` es 8001 y no 8000: la visita que excede el tope se contabiliza
+    (guard `>` estricto, contador incrementado al entrar) pero no expande."""
+    _stubear_cascada(monkeypatch)
+    expansiones = _contar_nodos_dfs(monkeypatch)
+    visitas = _contar_visitas_dfs(monkeypatch)
+    por_sku, pendientes = _escenario_inalcanzable()
+
+    for tope in (7, 30):
+        expansiones[0] = 0
+        visitas.clear()
+        monkeypatch.setattr(bnp, "PROBE_DFS_MAX_NODES", tope)
+        _correr_probe(por_sku, pendientes)
+        assert expansiones[0] == tope
+        assert visitas == [tope + 1]  # una sola corrida de DFS en el probe; métrica real = tope + 1
 
 
 def test_un_probe_que_necesita_menos_de_8000_nodos_sigue_siendo_feasible(monkeypatch):
