@@ -1791,6 +1791,8 @@ def _empacar_n_pallets(
     max_nodos_dfs: int = COMBINACION_PALLETS_MAX_NODOS,
     presupuesto_rescue_nodos: int | None = None,
     presupuesto_repair_nodos: int | None = None,
+    presupuesto_exact_intentos: int | None = None,
+    exact_max_deterministic_time: float | None = None,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1871,7 +1873,17 @@ def _empacar_n_pallets(
     para `repair_solver(presupuesto_nodos=...)`, con SU PROPIO medidor de
     trabajo (independiente del de Rescue). Solo lo pasa `probe()`
     (`PROBE_REPAIR_MAX_NODES`); la materialización final y `Pallets_Objetivo`
-    fijo no lo pasan (el kwarg ni siquiera se envía)."""
+    fijo no lo pasan (el kwarg ni siquiera se envía).
+
+    [PATCH V6.12-D7B-P4 -"Probe Exact deterministic hardening"]
+    `presupuesto_exact_intentos` / `exact_max_deterministic_time` (default
+    `None`): SOLO los pasa `probe()`. Con ellos, el orquestador de Exact
+    (nivel Python) corta por un TOPE DURO de intentos, COMPARTIDO por todos
+    los pallets del CD en esta etapa, en vez del deadline de CPU-time, y el
+    CP-SAT nativo corta por `max_deterministic_time` (con
+    `max_time_in_seconds` solo como watchdog operacional). Fuera del probe
+    (materialización final, `Pallets_Objetivo` fijo) los kwargs no se envían y
+    Exact queda exactamente igual (deadline de CPU-time + 30 s de pared)."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -2115,10 +2127,30 @@ def _empacar_n_pallets(
             from src.exact_repair import EXACT_REPAIR_TIME_MAX_SECONDS, exact_repair_orquestado
 
             deadline_exact = time.process_time() + EXACT_REPAIR_TIME_MAX_SECONDS * 3
-            stats_exact_total = {"activado": True, "intentos": 0, "exitos": 0, "cajas_recuperadas": 0}
+            stats_exact_total = {
+                "activado": True, "intentos": 0, "exitos": 0, "cajas_recuperadas": 0,
+                "stop_reason": None, "cp_solves": 0, "cp_det_time_max": 0.0, "operational_timeouts": 0,
+            }
+            # [PATCH V6.12-D7B-P4] Contexto probe: tope duro de intentos (compartido
+            # entre pallets) + CP-SAT determinista; sin deadline de CPU-time. Fuera
+            # del probe el kwarg ni se envía (comportamiento clásico).
+            modo_exact_determinista = presupuesto_exact_intentos is not None
             for idx in range(len(pallets_final)):
-                if not sin_colocar_final or time.process_time() > deadline_exact:
+                if not sin_colocar_final:
                     break
+                if modo_exact_determinista:
+                    kwargs_exact = {
+                        "max_intentos": presupuesto_exact_intentos - stats_exact_total["intentos"],
+                        "max_deterministic_time": exact_max_deterministic_time,
+                    }
+                    if kwargs_exact["max_intentos"] <= 0:
+                        stats_exact_total["stop_reason"] = "max_attempts"
+                        break
+                else:
+                    if time.process_time() > deadline_exact:
+                        stats_exact_total["stop_reason"] = "deadline"
+                        break
+                    kwargs_exact = {"deadline": deadline_exact}
                 total_pre_exact = demanda_total - sum(sin_colocar_final.values())
                 pendientes_pre_exact = {**{sku: 0 for sku in por_sku}, **sin_colocar_final}
                 score_pre_exact = _score_solucion(
@@ -2126,7 +2158,7 @@ def _empacar_n_pallets(
                 )
                 pallet_exact, sin_colocar_exact, stats_exact = exact_repair_orquestado(
                     pallets_final[idx], por_sku, sin_colocar_final, tope_pallet_por_sku, presupuesto,
-                    deadline=deadline_exact,
+                    **kwargs_exact,
                 )
                 total_exact = total_pre_exact + stats_exact.get("cajas_recuperadas", 0)
                 pallets_intento = list(pallets_final)
@@ -2138,9 +2170,19 @@ def _empacar_n_pallets(
                 stats_exact_total["intentos"] += stats_exact.get("intentos", 0)
                 stats_exact_total["exitos"] += stats_exact.get("exitos", 0)
                 stats_exact_total["cajas_recuperadas"] += stats_exact.get("cajas_recuperadas", 0)
+                stats_exact_total["cp_solves"] += stats_exact.get("cp_solves", 0)
+                stats_exact_total["cp_det_time_max"] = max(
+                    stats_exact_total["cp_det_time_max"], stats_exact.get("cp_det_time_max", 0.0),
+                )
+                stats_exact_total["operational_timeouts"] += stats_exact.get("operational_timeouts", 0)
                 if score_exact > score_pre_exact:
                     pallets_final = pallets_intento
                     sin_colocar_final = sin_colocar_exact
+                if stats_exact.get("stop_reason") in ("max_attempts", "deadline"):
+                    stats_exact_total["stop_reason"] = stats_exact["stop_reason"]
+                    break
+            if stats_exact_total["stop_reason"] is None:
+                stats_exact_total["stop_reason"] = "solucion" if not sin_colocar_final else "espacio_agotado"
             if pallets_final:
                 pallets_final[-1].metadata["exact_repair_stats"] = stats_exact_total
 

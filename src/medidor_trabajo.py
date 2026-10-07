@@ -20,7 +20,11 @@ CONVENCIÓN DE CONTEO (la misma para todos los budgets de trabajo):
     puntos de control son estrictos (`reloj() > limite_tiempo`) y se evalúan
     ENTRE unidades de trabajo (y entre variantes de lote dentro de
     `_aplicar_ruina_dirigida`): la unidad en curso termina, así que el total
-    consumido puede superar el tope por, como máximo, esa unidad.
+    consumido puede superar el tope por, como máximo, esa unidad. Contrato
+    explícito: SOFT CAP AT WORK-UNIT BOUNDARY (en P3 un DFS de Repair llegó a
+    26365 visitas con tope 24000); el comportamiento es deliberado y no se
+    modifica. (El tope de INTENTOS de Exact, P4, en cambio es duro: se chequea
+    antes de iniciar cada intento.)
   * Con el mismo input el recorrido es idéntico: ni el reloj de pared ni la
     velocidad de la máquina participan."""
 

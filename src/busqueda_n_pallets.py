@@ -270,6 +270,38 @@ PROBE_RESCUE_MAX_NODES = 15000
 #     nominal es conservador: la unidad en curso termina al cruzar el tope.
 # Unidad y semántica de conteo: ver `src/medidor_trabajo.py`.
 PROBE_REPAIR_MAX_NODES = 24000
+# Contrato (ver `src/medidor_trabajo.py`): `PROBE_RESCUE_MAX_NODES` y
+# `PROBE_REPAIR_MAX_NODES` son "soft cap at work-unit boundary" -el tope se
+# chequea ENTRE unidades de trabajo, así que una unidad ya iniciada puede
+# terminar por encima del tope (en P3 un DFS llegó a 26365 con tope 24000).
+# El comportamiento NO se modifica; el margen de calibración ya lo absorbe.
+
+# [PATCH V6.12-D7B-P4 -"Probe Exact deterministic hardening"] NO es una fase de
+# performance: elimina el reloj como fuente de decisión lógica en Exact dentro
+# del probe, con riesgo mínimo. Dos niveles independientes:
+#   A. Orquestador Python (`exact_repair_orquestado`): tope DURO de intentos,
+#      compartido por todos los pallets del CD en la etapa, EN VEZ del deadline
+#      de CPU-time. A diferencia de los topes de nodos (soft cap), se chequea
+#      ANTES de cada intento: nunca se ejecuta el intento `max + 1`. Máximo
+#      observado en probes reales: 144 (BK65 n=3: 48 intentos x 3 pallets) -el
+#      tope es 3,5x ese máximo, no un ajuste fino. La etapa termina por
+#      `solucion` / `espacio_agotado` / `max_attempts`, nunca por reloj.
+#   B. CP-SAT nativo: `max_deterministic_time` (1 worker => reproducible) en
+#      vez de depender de `max_time_in_seconds`, que queda como WATCHDOG
+#      operacional (`OPERATIONAL_TIMEOUT` si alguna vez dispara, ver
+#      `exact_repair._clasificar_parada_cp_sat`; deuda: el parcial no se
+#      descarta, solo se registra). Calibración y por qué ese valor: ver el
+#      comentario de `PROBE_EXACT_MAX_DET_TIME`.
+PROBE_EXACT_MAX_ATTEMPTS = 500
+# Calibración (V6.12-D7B-P4, shadow sobre 35 modelos CP-SAT REALES: 18 del
+# batch histórico + 17 de golden BK52/BK53, todos OPTIMAL con 1 worker):
+# `deterministic_time` máximo observado 0,0023 (mediana 0,0007) y resultado
+# (status/objetivo/hash de solución) idéntico con 0,05 / 0,1 / 1,0 y sin
+# inestabilidad entre repeticiones. 1,0 es el más conservador (428x el máximo
+# observado; 0,05 serían 21x) y sigue siendo útil como safety budget: acota
+# cada resolución a ~10 s de pared en estos modelos (antes 30 s). NO está
+# ajustado al máximo observado: nunca debe atar en el trabajo real.
+PROBE_EXACT_MAX_DET_TIME = 1.0
 
 
 def probe(
@@ -299,6 +331,7 @@ def probe(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n, paralelo_lns=paralelo_lns, con_lns=False, max_nodos_dfs=PROBE_DFS_MAX_NODES,
         presupuesto_rescue_nodos=PROBE_RESCUE_MAX_NODES, presupuesto_repair_nodos=PROBE_REPAIR_MAX_NODES,
+        presupuesto_exact_intentos=PROBE_EXACT_MAX_ATTEMPTS, exact_max_deterministic_time=PROBE_EXACT_MAX_DET_TIME,
     )
     cpu_s = time.process_time() - t0
     colocadas = demanda_total - sum(sin_colocar.values())

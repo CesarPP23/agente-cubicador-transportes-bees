@@ -94,7 +94,8 @@ def test_witness_fallback_usado_cuando_materializacion_final_falla(monkeypatch):
     def _fake_empacar_n_pallets(
         pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets, paralelo_lns=True, con_lns=True, priorizar_grandes=False, max_nodos_dfs=30_000,
-        presupuesto_rescue_nodos=None, presupuesto_repair_nodos=None,
+        presupuesto_rescue_nodos=None, presupuesto_repair_nodos=None, presupuesto_exact_intentos=None,
+        exact_max_deterministic_time=None,
     ):
         if n_pallets == 2 and con_lns is False:
             return pallets_witness, {}          # el sondeo SÍ demuestra FEASIBLE en N=2

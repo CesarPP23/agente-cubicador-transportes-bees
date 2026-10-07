@@ -13,6 +13,7 @@ desplazadas por las dimensiones de las cajas del propio vecindario
 para vecindarios de hasta `EXACT_REPAIR_MAX_BOXES` cajas."""
 from __future__ import annotations
 
+import logging
 import time
 
 import config
@@ -21,8 +22,20 @@ from src.rescue_solver import TOL, _blockers_para_posicion, _quedaria_flotando
 from src.torres import TorreCandidate, crear_torre
 from src.validacion_v5 import _tiene_soporte_admisible
 
+_LOG = logging.getLogger(__name__)
+
 EXACT_REPAIR_MAX_BOXES = 24
 EXACT_REPAIR_TIME_MAX_SECONDS = 30.0
+
+# [PATCH V6.12-D7B-P4 -"Probe Exact deterministic hardening"] Clasificación de
+# por qué terminó una resolución CP-SAT (ver `_clasificar_parada_cp_sat`). Solo
+# `OPERATIONAL_TIMEOUT` es un evento anómalo: el watchdog de pared
+# (`max_time_in_seconds`) disparó ANTES que el límite determinista, o sea el
+# resultado depende del reloj y NO es equivalente a una corrida normal.
+CP_SAT_COMPLETADO = "COMPLETED"
+CP_SAT_LIMITE_DETERMINISTA = "DETERMINISTIC_LIMIT"
+CP_SAT_LIMITE_TIEMPO = "TIME_LIMIT"  # modo clásico (sin tope determinista)
+CP_SAT_TIMEOUT_OPERATIVO = "OPERATIONAL_TIMEOUT"
 # [performance -bug real encontrado probando esto contra BK52] El no-overlap
 # se arma por PARES de opciones en Python puro (sección 13) -con un SKU de
 # muchas unidades, cada unidad repite la MISMA lista de candidatas, así que
@@ -215,11 +228,34 @@ def _se_solapan_candidatos(a: tuple[float, float, float, TorreCandidate], b: tup
     )
 
 
+def _clasificar_parada_cp_sat(
+    estado_optimo_o_infactible: bool, det_time: float, wall_s: float,
+    max_deterministic_time: float | None, watchdog_s: float,
+) -> str:
+    """[PATCH V6.12-D7B-P4] Por qué terminó una resolución CP-SAT.
+
+    * `COMPLETED`: el solver cerró (OPTIMAL / INFEASIBLE).
+    * Con tope determinista y sin cierre: `DETERMINISTIC_LIMIT` si consumió
+      el tope; `OPERATIONAL_TIMEOUT` si el watchdog de pared cortó antes
+      (el resultado depende del reloj -NO equivalente a uno normal).
+    * Sin tope determinista (modo clásico): `TIME_LIMIT`."""
+    if estado_optimo_o_infactible:
+        return CP_SAT_COMPLETADO
+    if max_deterministic_time is None:
+        return CP_SAT_LIMITE_TIEMPO
+    if det_time >= max_deterministic_time:
+        return CP_SAT_LIMITE_DETERMINISTA
+    if wall_s >= watchdog_s:
+        return CP_SAT_TIMEOUT_OPERATIVO
+    return CP_SAT_LIMITE_DETERMINISTA
+
+
 def resolver_cp_sat(
     pallet_congelado: PalletV5, por_sku: dict[str, list[TorreCandidate]], items_libres: dict[str, int],
     tope_pallet_por_sku: dict[str, int], presupuesto: float,
     time_limit_s: float = EXACT_REPAIR_TIME_MAX_SECONDS,
     region: tuple[float, float, float, float] | None = None,
+    max_deterministic_time: float | None = None,
 ) -> dict:
     """[sección 13] Variables `placement_choice` (una por caja individual
     x posición candidata x orientación), restricciones de no-overlap,
@@ -310,7 +346,21 @@ def resolver_cp_sat(
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_s
     solver.parameters.num_search_workers = 1
+    # [PATCH V6.12-D7B-P4] Con tope determinista (SOLO contexto probe) el
+    # límite lógico es `max_deterministic_time` (unidad interna de CP-SAT,
+    # independiente de la velocidad del reloj; 1 worker => reproducible) y
+    # `max_time_in_seconds` (arriba, sin cambios) queda como WATCHDOG
+    # operacional: si alguna vez corta primero, se registra
+    # `OPERATIONAL_TIMEOUT` (ver `_clasificar_parada_cp_sat`). Sin tope,
+    # comportamiento clásico idéntico.
+    if max_deterministic_time is not None:
+        solver.parameters.max_deterministic_time = max_deterministic_time
     status = solver.Solve(model)
+    det_time = float(solver.ResponseProto().deterministic_time)
+    wall_solver_s = float(solver.WallTime())
+    parada = _clasificar_parada_cp_sat(
+        status in (cp_model.OPTIMAL, cp_model.INFEASIBLE), det_time, wall_solver_s, max_deterministic_time, time_limit_s,
+    )
 
     colocado = []
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -325,6 +375,9 @@ def resolver_cp_sat(
         "tiempo_s": round(time.time() - t0, 3),
         "cajas_en_vecindario": len(cajas),
         "posiciones_candidatas": len(todas_opciones),
+        "objetivo": float(solver.ObjectiveValue()) if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None,
+        "det_time": det_time, "wall_solver_s": wall_solver_s, "parada": parada,
+        "branches": int(solver.NumBranches()), "conflicts": int(solver.NumConflicts()),
     }
 
 
@@ -332,6 +385,7 @@ def exact_local_repair(
     pallet: PalletV5, por_sku: dict[str, list[TorreCandidate]], sin_colocar: dict[str, int],
     skus_blockers: set[str], tope_pallet_por_sku: dict[str, int], presupuesto: float,
     max_boxes: int = EXACT_REPAIR_MAX_BOXES, time_limit_s: float = EXACT_REPAIR_TIME_MAX_SECONDS,
+    max_deterministic_time: float | None = None,
 ) -> tuple[PalletV5, dict[str, int], dict]:
     """[sección 10, 11] Punto de entrada. Arma el vecindario (sección 10),
     si supera `max_boxes` NO lo amplía (devuelve el pallet sin tocar -el
@@ -372,10 +426,13 @@ def exact_local_repair(
 
     resultado = resolver_cp_sat(
         pallet_congelado, por_sku, items_libres, tope_pallet_por_sku, presupuesto, time_limit_s, region,
+        max_deterministic_time=max_deterministic_time,
     )
     stats.update({
         "status": resultado["status"], "tiempo_s": resultado["tiempo_s"],
         "colocadas_exact": len(resultado["colocado"]), "posiciones_candidatas": resultado["posiciones_candidatas"],
+        "objetivo": resultado["objetivo"], "det_time": resultado["det_time"], "parada": resultado["parada"],
+        "branches": resultado["branches"], "conflicts": resultado["conflicts"],
     })
 
     torres_nuevas = list(pallet_congelado.torres)
@@ -412,7 +469,8 @@ def exact_repair_orquestado(
     pallet: PalletV5, por_sku: dict[str, list[TorreCandidate]], sin_colocar: dict[str, int],
     tope_pallet_por_sku: dict[str, int], presupuesto: float,
     max_boxes: int = EXACT_REPAIR_MAX_BOXES, time_limit_s: float = EXACT_REPAIR_TIME_MAX_SECONDS,
-    deadline: float | None = None,
+    deadline: float | None = None, max_intentos: int | None = None,
+    max_deterministic_time: float | None = None,
 ) -> tuple[PalletV5, dict[str, int], dict]:
     """[sección 10, 11] Orquesta `exact_local_repair` sobre VARIOS conflict
     sets candidatos (mismo mecanismo de `rescue_solver._rankear_
@@ -436,7 +494,23 @@ def exact_repair_orquestado(
     wall-clock por diseño de la librería (confirmado: la versión
     instalada de OR-Tools SÍ expone `max_deterministic_time` como
     alternativa, ver auditoría R2-A1 -no se activa todavía, cambio fuera
-    de alcance de este parche)."""
+    de alcance de este parche).
+
+    [PATCH V6.12-D7B-P4 -"Probe Exact deterministic hardening"] Dos topes
+    OPCIONALES, SOLO para el contexto probe (el caller los manda únicamente
+    ahí; sin ellos el comportamiento es exactamente el de siempre):
+      * `max_intentos`: tope DURO de intentos de `exact_local_repair`
+        (`stats["intentos"]`, cuenta también los que se descartan por
+        `excedio_max_boxes`). Se chequea ANTES de iniciar cada intento, o
+        sea nunca se ejecuta el intento `max_intentos + 1` (a diferencia de
+        los topes de nodos de Rescue/Repair, que son "soft cap" a frontera de
+        unidad de trabajo). Reemplaza al `deadline` de CPU-time: en el
+        contexto probe el caller NO manda `deadline`, así que ninguna
+        decisión lógica de este orquestador depende de `process_time()`.
+      * `max_deterministic_time`: tope determinista del CP-SAT nativo (ver
+        `resolver_cp_sat`), independiente de `max_intentos`.
+    `stats["stop_reason"]` queda en `solucion` / `espacio_agotado` /
+    `max_attempts` (o `deadline` en modo clásico)."""
     from src.packing_columnar import _reconstruir_en_construccion
     from src.rescue_solver import _rankear_conflictos
 
@@ -445,6 +519,8 @@ def exact_repair_orquestado(
     stats = {
         "activado": True, "intentos": 0, "exitos": 0, "excedio_max_boxes": 0,
         "cajas_recuperadas": 0, "skus_resueltos": [],
+        "stop_reason": None, "cp_solves": 0, "cp_det_time_total": 0.0, "cp_det_time_max": 0.0,
+        "cp_deterministic_limit_hits": 0, "operational_timeouts": 0,
     }
 
     pendientes = {sku: cant for sku, cant in sin_colocar.items() if cant > 0}
@@ -462,6 +538,10 @@ def exact_repair_orquestado(
         if not candidatos_pendientes:
             break
         if deadline is not None and reloj() > deadline:
+            stats["stop_reason"] = "deadline"
+            break
+        if max_intentos is not None and stats["intentos"] >= max_intentos:
+            stats["stop_reason"] = "max_attempts"
             break
         sku_objetivo = min(candidatos_pendientes, key=lambda s: candidatos_pendientes[s])
         candidatas_sku = por_sku.get(sku_objetivo, [])
@@ -476,13 +556,29 @@ def exact_repair_orquestado(
         resuelto = False
         for _, _pidx, _x, _y, _z, _cand, blocker_skus in conflictos:
             if deadline is not None and reloj() > deadline:
+                stats["stop_reason"] = "deadline"
+                break
+            if max_intentos is not None and stats["intentos"] >= max_intentos:
+                stats["stop_reason"] = "max_attempts"
                 break
             stats["intentos"] += 1
             total_antes = sum(t.cantidad for t in pallet_actual.torres)
             pallet_intento, sin_colocar_intento, r_stats = exact_local_repair(
                 pallet_actual, por_sku, pendientes, blocker_skus, tope_pallet_por_sku, presupuesto,
-                max_boxes=max_boxes, time_limit_s=time_limit_s,
+                max_boxes=max_boxes, time_limit_s=time_limit_s, max_deterministic_time=max_deterministic_time,
             )
+            if r_stats.get("det_time") is not None:
+                stats["cp_solves"] += 1
+                stats["cp_det_time_total"] += r_stats["det_time"]
+                stats["cp_det_time_max"] = max(stats["cp_det_time_max"], r_stats["det_time"])
+                if r_stats["parada"] == CP_SAT_LIMITE_DETERMINISTA:
+                    stats["cp_deterministic_limit_hits"] += 1
+                elif r_stats["parada"] == CP_SAT_TIMEOUT_OPERATIVO:
+                    # [deuda P4] NO se rediseña el manejo del error: el parcial se
+                    # conserva como siempre, pero queda registrado y logueado para
+                    # no confundirlo con un resultado normal del solver.
+                    stats["operational_timeouts"] += 1
+                    _LOG.warning("Exact CP-SAT OPERATIONAL_TIMEOUT (watchdog de pared %.1fs): resultado dependiente del reloj", time_limit_s)
             if r_stats.get("excedio_max_boxes"):
                 stats["excedio_max_boxes"] += 1
                 continue
@@ -498,6 +594,9 @@ def exact_repair_orquestado(
                 resuelto = True
                 break
 
+        if stats["stop_reason"] is not None:
+            break  # el tope (deadline / max_attempts) cortó el for interno: cortar también el while
+
         if not resuelto:
             # Este SKU no mejoró con ningún conflict set en el estado
             # actual -no insistir más CON ÉL, pero seguir con los demás.
@@ -505,4 +604,6 @@ def exact_repair_orquestado(
 
     stats["tiempo_s"] = round(time.time() - t0, 3)
     sin_colocar_final = {sku: cant for sku, cant in pendientes.items() if cant > 0}
+    if stats["stop_reason"] is None:
+        stats["stop_reason"] = "espacio_agotado" if sin_colocar_final else "solucion"
     return pallet_actual, sin_colocar_final, stats
