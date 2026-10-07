@@ -303,6 +303,34 @@ PROBE_EXACT_MAX_ATTEMPTS = 500
 # ajustado al máximo observado: nunca debe atar en el trabajo real.
 PROBE_EXACT_MAX_DET_TIME = 1.0
 
+# [PATCH V6.12-D8A.1 -"Final materialization work budget"] Presupuestos de
+# TRABAJO de la materialización FINAL (`_empacar_optimizado`, la corrida con LNS
+# en la N ganadora). Contexto propio: NO son los del sondeo (arriba) ni los de
+# `Pallets_Objetivo` fijo, que siguen con 30000 / 3000 / 40. Propagados
+# explícitos `_empacar_optimizado` -> `_empacar_n_pallets(max_nodos_dfs,
+# lns_recon_max_nodos, lns_sin_mejora_max)` -> `_lns_mejorar_pallets`.
+# Calibrados en V6.12-D8A / D8A.1 desde BREAKPOINTS MEDIDOS de los 8 CDs cuya
+# final tiene éxito (BK31, BK41, BK43, BK65, BK68, SJ86, SJ87, SJ95). Regla:
+# un DFS con tope C reproduce el resultado de uno mayor si su último nodo que
+# mejora el incumbente es <= C+1; en el LNS solo importan las iteraciones
+# ACEPTADAS (las rechazadas se revierten). Breakpoints:
+#   * DFS inicial: último nodo que mejora = 4275 (SJ86)  -> tope >= 4274;
+#   * reconstrucción LNS: nodo máximo en iteraciones aceptadas = 2465 (BK43,
+#     iteración 19)                                      -> tope >= 2464;
+#   * iteraciones sin mejora: 38 antes de la primera mejora de SJ95 -> >= 39.
+# Elegidos (shadow de batch completo, 9/9 hashes canónicos idénticos, 8/8
+# éxitos, SJ97 sigue cayendo al witness, mismo recorrido de iteraciones LNS
+# aceptadas en los 7 CDs con LNS): DFS 6500 (margen 1,5x, cuesta ~+7 s de CPU
+# por CD), recon 2650 (margen 185 nodos = 7,5%; comparado con 2500, que sólo
+# deja 35 nodos, cuesta +42 s de CPU en SJ97 (~+4%)), sin mejora 40 (sin
+# cambio). Por DEBAJO de los breakpoints el layout cambia aunque se siga
+# colocando el 100% (control de precipicio: FINAL_LAYOUT_CHANGED en BK43 y
+# SJ86). Efecto medido: SJ97 final ~1109 -> ~964 s de CPU y batch ~1187 ->
+# ~1004 s de pared.
+FINAL_DFS_MAX_NODES = 6500
+FINAL_LNS_RECON_MAX_NODES = 2650
+FINAL_LNS_SIN_MEJORA = 40
+
 
 def probe(
     n: int,

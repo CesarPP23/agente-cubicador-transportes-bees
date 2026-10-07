@@ -131,10 +131,11 @@ def test_probe_pasa_PROBE_DFS_MAX_NODES_a_empacar_n_pallets(monkeypatch):
 
 
 def test_materializacion_final_y_pallets_objetivo_no_pasan_el_override(monkeypatch):
-    """La materialización final (`_empacar_optimizado`) y `Pallets_Objetivo`
-    fijo (`armar_pallets_bloques`) llaman a `_empacar_n_pallets` SIN
-    `max_nodos_dfs` -siguen con el default de 30000. Solo los sondeos (con_lns=False,
-    via probe()) lo sobrescriben."""
+    """`Pallets_Objetivo` fijo (`armar_pallets_bloques`) llama a
+    `_empacar_n_pallets` SIN `max_nodos_dfs` -sigue con el default de 30000. Los
+    sondeos (con_lns=False, via probe()) lo sobrescriben con 8000 y desde
+    V6.12-D8A.1 la materialización final usa SU PROPIO tope (FINAL_DFS_MAX_NODES,
+    ver tests/test_final_materialization_work_budget.py), nunca el del sondeo."""
     llamadas = []
 
     def _espia(pendientes, por_sku, cap, niv, tope, cd, contador, n, **kw):
@@ -151,7 +152,7 @@ def test_materializacion_final_y_pallets_objetivo_no_pasan_el_override(monkeypat
     sondeos = [(n, kw) for n, kw in llamadas if kw.get("con_lns") is False]
     finales = [(n, kw) for n, kw in llamadas if kw.get("con_lns", True) is True]
     assert sondeos and all(kw["max_nodos_dfs"] == 8000 for _, kw in sondeos)
-    assert finales and all("max_nodos_dfs" not in kw for _, kw in finales)
+    assert finales and all(kw["max_nodos_dfs"] == bnp.FINAL_DFS_MAX_NODES != bnp.PROBE_DFS_MAX_NODES for _, kw in finales)
 
     # 2) Pallets_Objetivo fijo, directo desde armar_pallets_bloques
     llamadas.clear()

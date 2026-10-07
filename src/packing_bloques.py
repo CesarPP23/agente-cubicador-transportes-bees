@@ -1599,6 +1599,8 @@ def _lns_mejorar_pallets(
     limite_tiempo: float | None = None,
     skus_protegidos: frozenset[str] = frozenset(),
     reloj: Callable[[], float] = time.process_time,
+    max_nodos_reconstruccion: int | None = None,
+    sin_mejora_max: int | None = None,
 ) -> int:
     """[LNS -ruina y reconstrucción, ver comentario junto a las
     constantes `COMBINACION_PALLETS_LNS_*`] Complementa el DFS de
@@ -1651,8 +1653,19 @@ def _lns_mejorar_pallets(
     [PATCH V6.11-R3] `reloj` default `time.process_time` -ver comentario
     de `_resolver_pallets_backtracking` y `_search_budget_now`. El caller
     paralelo (`_lns_una_semilla_worker`) pasa `reloj=time.monotonic`
-    explícito."""
+    explícito.
+
+    [PATCH V6.12-D8A.1] `max_nodos_reconstruccion` / `sin_mejora_max`
+    (default `None` => las constantes de módulo de siempre,
+    `COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION` y
+    `COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX`): permiten que SOLO la
+    materialización final (`_empacar_optimizado`) use sus propios topes
+    (`busqueda_n_pallets.FINAL_LNS_*`) sin tocar los de `Pallets_Objetivo`."""
     rng = random.Random(semilla)
+    if max_nodos_reconstruccion is None:
+        max_nodos_reconstruccion = COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION
+    if sin_mejora_max is None:
+        sin_mejora_max = COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX
 
     def _total_colocado() -> int:
         return sum(sum(d.values()) for d in colocados_por_pallet)
@@ -1668,7 +1681,7 @@ def _lns_mejorar_pallets(
     for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES):
         if mejor_total >= demanda_total_lns:
             break  # [PATCH V6.12-D5] ya se colocó el 100% -nada más que optimizar
-        if sin_mejora >= COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX:
+        if sin_mejora >= sin_mejora_max:
             break
         skus_colocados = sorted({
             sku for d in colocados_por_pallet for sku, cant in d.items()
@@ -1690,7 +1703,7 @@ def _lns_mejorar_pallets(
         _resolver_pallets_backtracking(
             construcciones, colocados_por_pallet, pendientes, por_sku,
             capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
-            max_nodos=COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION,
+            max_nodos=max_nodos_reconstruccion,
             limite_tiempo=limite_tiempo, reloj=reloj,
         )
 
@@ -1746,6 +1759,8 @@ def _lns_una_semilla_worker(
     semilla: str,
     limite_tiempo: float | None = None,
     skus_protegidos: frozenset[str] = frozenset(),
+    max_nodos_reconstruccion: int | None = None,
+    sin_mejora_max: int | None = None,
 ) -> tuple[int, list[_PalletEnConstruccion], list[dict[str, int]], dict[str, int]]:
     """[paralelización -pedido explícito del usuario: "como podemos hacer
     para que no demore tanto"] Función de nivel de módulo (necesaria para
@@ -1772,6 +1787,7 @@ def _lns_una_semilla_worker(
         construcciones, colocados_por_pallet, pendientes, por_sku,
         capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets, semilla,
         limite_tiempo=limite_tiempo, skus_protegidos=skus_protegidos, reloj=time.monotonic,
+        max_nodos_reconstruccion=max_nodos_reconstruccion, sin_mejora_max=sin_mejora_max,
     )
     return total, construcciones, colocados_por_pallet, pendientes
 
@@ -1793,6 +1809,8 @@ def _empacar_n_pallets(
     presupuesto_repair_nodos: int | None = None,
     presupuesto_exact_intentos: int | None = None,
     exact_max_deterministic_time: float | None = None,
+    lns_recon_max_nodos: int | None = None,
+    lns_sin_mejora_max: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1883,7 +1901,13 @@ def _empacar_n_pallets(
     CP-SAT nativo corta por `max_deterministic_time` (con
     `max_time_in_seconds` solo como watchdog operacional). Fuera del probe
     (materialización final, `Pallets_Objetivo` fijo) los kwargs no se envían y
-    Exact queda exactamente igual (deadline de CPU-time + 30 s de pared)."""
+    Exact queda exactamente igual (deadline de CPU-time + 30 s de pared).
+
+    [PATCH V6.12-D8A.1 -"Final materialization work budget"] `max_nodos_dfs`
+    (arriba), `lns_recon_max_nodos` y `lns_sin_mejora_max` (default `None` =>
+    constantes de módulo de siempre) los pasa SOLO `_empacar_optimizado` en la
+    materialización FINAL (`busqueda_n_pallets.FINAL_*`). `Pallets_Objetivo`
+    fijo y los sondeos no los heredan."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -1987,6 +2011,7 @@ def _empacar_n_pallets(
                         _lns_una_semilla_worker, construcciones_bt, colocados_bt, pendientes_bt, por_sku,
                         capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
                         f"{cd}-{n_pallets}-{intento}", deadline_lns, skus_protegidos,
+                        lns_recon_max_nodos, lns_sin_mejora_max,
                     )
                     for intento in range(COMBINACION_PALLETS_LNS_REINICIOS)
                 ]
@@ -2013,6 +2038,7 @@ def _empacar_n_pallets(
                     capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
                     semilla=f"{cd}-{n_pallets}-{intento}", limite_tiempo=deadline_lns,
                     skus_protegidos=skus_protegidos, reloj=reloj_lns,
+                    max_nodos_reconstruccion=lns_recon_max_nodos, sin_mejora_max=lns_sin_mejora_max,
                 )
                 if total_intento > mejor_total_lns:
                     mejor_total_lns = total_intento
@@ -2381,9 +2407,16 @@ def _empacar_optimizado(
     # ganadora (idéntico en espíritu a lo que ya hacía el código viejo en
     # `hi`) -la búsqueda de arriba NUNCA decide directamente qué layout se
     # exporta (sección A de la autorización).
+    # [PATCH V6.12-D8A.1] Presupuestos de TRABAJO propios de la materialización
+    # final (no los del sondeo ni los de `Pallets_Objetivo`): ver el comentario
+    # de calibración de `busqueda_n_pallets.FINAL_DFS_MAX_NODES`.
+    from src.busqueda_n_pallets import FINAL_DFS_MAX_NODES, FINAL_LNS_RECON_MAX_NODES, FINAL_LNS_SIN_MEJORA
+
     pallets_final, sin_colocar_final = _empacar_n_pallets(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, best_n, paralelo_lns=paralelo_lns,
+        max_nodos_dfs=FINAL_DFS_MAX_NODES, lns_recon_max_nodos=FINAL_LNS_RECON_MAX_NODES,
+        lns_sin_mejora_max=FINAL_LNS_SIN_MEJORA,
     )
     metadata_optimality = {
         "status": state.optimality_status(),
