@@ -250,6 +250,27 @@ PROBE_DFS_MAX_NODES = 8000
 # Unidad y semántica de conteo: ver `src/medidor_trabajo.py`.
 PROBE_RESCUE_MAX_NODES = 15000
 
+# [PATCH V6.12-D7B-P3 -"Probe Repair work budget"] Presupuesto de NODOS de
+# Repair, SOLO en el contexto del sondeo; propagado explícito `probe()` ->
+# `_empacar_n_pallets(presupuesto_repair_nodos)` -> `repair_solver(
+# presupuesto_nodos)`, con su PROPIO medidor (independiente del de Rescue).
+# Calibrado en V6.12-D7B-P3 (batch real, 9 cascadas de Repair en probes,
+# sobre P1 + P2, con Exact y Global sin tocar y la cascada completa detrás)
+# contra 24000 / 26000 / 28000:
+#   * los 3 topes preservan los 3 probes FEASIBLE, los 6 UNKNOWN, los hashes
+#     finales y el hash de witness;
+#   * el ÚNICO éxito de Repair en probes es BK65 n=4 (residual 3 -> 0, mejoras
+#     en los nodos 13754 y 13799): margen 1,74x / 1,88x / 2,03x. BK41 n=3 no
+#     recibe ninguna mejora de Repair (3 -> 3) y Global lo resuelve igual;
+#   * Repair NO ahorra CPU con ningún tope (las instancias que hoy cortan por
+#     tiempo antes de llegar al tope trabajan más): CPU Repair UNKNOWN 539 s
+#     por tiempo contra 557 / 597 / 643 s -cada +2000 nodos de tope cuestan
+#     ~+40-46 s y compran ~+0,14x de margen, sin punto de inflexión. 24000 es
+#     el único que no encarece el CPU de forma material (+3%) y el margen
+#     nominal es conservador: la unidad en curso termina al cruzar el tope.
+# Unidad y semántica de conteo: ver `src/medidor_trabajo.py`.
+PROBE_REPAIR_MAX_NODES = 24000
+
 
 def probe(
     n: int,
@@ -277,7 +298,7 @@ def probe(
     pallets, sin_colocar = _empacar_n_pallets(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n, paralelo_lns=paralelo_lns, con_lns=False, max_nodos_dfs=PROBE_DFS_MAX_NODES,
-        presupuesto_rescue_nodos=PROBE_RESCUE_MAX_NODES,
+        presupuesto_rescue_nodos=PROBE_RESCUE_MAX_NODES, presupuesto_repair_nodos=PROBE_REPAIR_MAX_NODES,
     )
     cpu_s = time.process_time() - t0
     colocadas = demanda_total - sum(sin_colocar.values())

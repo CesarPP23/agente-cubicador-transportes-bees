@@ -321,6 +321,7 @@ def repair_solver(
     presupuesto: float,
     skus_protegidos: frozenset[str] = frozenset(),
     deadline: float | None = None,
+    presupuesto_nodos: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int], dict]:
     """[sección 14] Punto de entrada del Repair Solver v2. Recibe lo que
     dejó el Rescue V6.02 (`pallets` + `sin_colocar`, que puede ya venir
@@ -332,14 +333,31 @@ def repair_solver(
     [PATCH V6.12-R2-A1] Mismo patrón que `rescue_solver`: `reloj =
     time.process_time` explícito, calculado UNA vez acá y pasado a todo lo
     que recibe `limite_tiempo` -deadline y checker en el mismo dominio
-    temporal siempre, nunca por default implícito."""
+    temporal siempre, nunca por default implícito.
+
+    [PATCH V6.12-D7B-P3 -"Probe Repair work budget"] `presupuesto_nodos`
+    (default `None` = comportamiento de siempre, CPU-time): cuando se pasa, el
+    `reloj` de TODO este repair es un `MedidorTrabajo` PROPIO de esta etapa
+    (nunca el de Rescue: cada etapa tiene su contador) y `limite_tiempo =
+    reloj() + presupuesto_nodos`; `deadline` (un instante de CPU-time) se
+    IGNORA en ese modo. Unidad y semántica de corte: `src/medidor_trabajo.py`.
+    No cambia ningún tope local de Repair (DFS de reconstrucción,
+    neighborhoods, profundidad de ejection chain, multi-crítica): solo agrega
+    el presupuesto TOTAL de la etapa. Lo pasa únicamente
+    `busqueda_n_pallets.probe()`."""
+    from src.medidor_trabajo import MedidorTrabajo
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 
-    reloj: Callable[[], float] = time.process_time
+    reloj: Callable[[], float]
     t0_wall = time.time()  # solo para stats["tiempo_segundos"] (diagnóstico humano, no budget)
-    limite_tiempo = reloj() + REPAIR_TIME_MAX_SECONDS
-    if deadline is not None:
-        limite_tiempo = min(limite_tiempo, deadline)
+    if presupuesto_nodos is not None:
+        reloj = MedidorTrabajo()
+        limite_tiempo = reloj() + presupuesto_nodos
+    else:
+        reloj = time.process_time
+        limite_tiempo = reloj() + REPAIR_TIME_MAX_SECONDS
+        if deadline is not None:
+            limite_tiempo = min(limite_tiempo, deadline)
 
     stats = {
         "activado": True,
@@ -493,5 +511,9 @@ def repair_solver(
     stats["colocadas"] = mejor_total
     stats["pareto_alternativas_en_archivo"] = len(archivo.items)
     stats["tiempo_segundos"] = round(time.time() - t0_wall, 3)
+    stats["presupuesto"] = (
+        {"modo": "tiempo"} if presupuesto_nodos is None
+        else {"modo": "nodos", "tope": presupuesto_nodos, "nodos_trabajo": reloj.nodos}
+    )
 
     return pallets_final, sin_colocar_final, stats

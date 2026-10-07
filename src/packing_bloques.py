@@ -1790,6 +1790,7 @@ def _empacar_n_pallets(
     priorizar_grandes: bool = False,
     max_nodos_dfs: int = COMBINACION_PALLETS_MAX_NODOS,
     presupuesto_rescue_nodos: int | None = None,
+    presupuesto_repair_nodos: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1863,7 +1864,14 @@ def _empacar_n_pallets(
     vez del CPU-time de siempre. SOLO lo pasa `busqueda_n_pallets.probe()`
     (`PROBE_RESCUE_MAX_NODES`); la materialización final y `Pallets_Objetivo`
     fijo no lo pasan y Rescue queda exactamente igual (el kwarg ni siquiera se
-    envía). Repair/Exact/Global no cambian."""
+    envía). Exact/Global no cambian.
+
+    [PATCH V6.12-D7B-P3 -"Probe Repair work budget"] `presupuesto_repair_nodos`
+    (default `None`): idéntico en espíritu a `presupuesto_rescue_nodos` pero
+    para `repair_solver(presupuesto_nodos=...)`, con SU PROPIO medidor de
+    trabajo (independiente del de Rescue). Solo lo pasa `probe()`
+    (`PROBE_REPAIR_MAX_NODES`); la materialización final y `Pallets_Objetivo`
+    fijo no lo pasan (el kwarg ni siquiera se envía)."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -2081,9 +2089,12 @@ def _empacar_n_pallets(
                 total_pre_repair, pendientes_pre_repair, por_sku, pallets_final, skus_protegidos_cd,
             )
             deadline_repair = time.process_time() + REPAIR_TIME_MAX_SECONDS
+            # [PATCH V6.12-D7B-P3] El kwarg SOLO se envía en contexto probe.
+            kwargs_repair = {} if presupuesto_repair_nodos is None else {"presupuesto_nodos": presupuesto_repair_nodos}
             pallets_repair, sin_colocar_repair, stats_repair = repair_solver(
                 pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
                 tope_pallet_por_sku, n_pallets, presupuesto, skus_protegidos_cd, deadline=deadline_repair,
+                **kwargs_repair,
             )
             total_repair = demanda_total - sum(sin_colocar_repair.values())
             pendientes_repair = {**{sku: 0 for sku in por_sku}, **sin_colocar_repair}
