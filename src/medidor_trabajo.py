@@ -25,6 +25,10 @@ CONVENCIÓN DE CONTEO (la misma para todos los budgets de trabajo):
     26365 visitas con tope 24000); el comportamiento es deliberado y no se
     modifica. (El tope de INTENTOS de Exact, P4, en cambio es duro: se chequea
     antes de iniciar cada intento.)
+  * [D8B-7.2] Global Rescue usa el mismo medidor con otra unidad: EXPANSIONES
+    de estado (cada `_expandir_estado` del beam search suma 1); sus puntos de
+    control son el inicio de cada profundidad / reinicio (soft cap at depth
+    boundary).
   * Con el mismo input el recorrido es idéntico: ni el reloj de pared ni la
     velocidad de la máquina participan."""
 

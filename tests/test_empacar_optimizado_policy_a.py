@@ -96,6 +96,7 @@ def test_witness_fallback_usado_cuando_materializacion_final_falla(monkeypatch):
         cd, contador, n_pallets, paralelo_lns=True, con_lns=True, priorizar_grandes=False, max_nodos_dfs=30_000,
         presupuesto_rescue_nodos=None, presupuesto_repair_nodos=None, presupuesto_exact_intentos=None,
         exact_max_deterministic_time=None, lns_recon_max_nodos=None, lns_sin_mejora_max=None,
+        omitir_repair=False, presupuesto_global_expansiones=None,
     ):
         if n_pallets == 2 and con_lns is False:
             return pallets_witness, {}          # el sondeo SÍ demuestra FEASIBLE en N=2

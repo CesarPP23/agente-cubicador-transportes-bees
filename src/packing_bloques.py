@@ -1811,6 +1811,8 @@ def _empacar_n_pallets(
     exact_max_deterministic_time: float | None = None,
     lns_recon_max_nodos: int | None = None,
     lns_sin_mejora_max: int | None = None,
+    omitir_repair: bool = False,
+    presupuesto_global_expansiones: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1907,7 +1909,16 @@ def _empacar_n_pallets(
     (arriba), `lns_recon_max_nodos` y `lns_sin_mejora_max` (default `None` =>
     constantes de módulo de siempre) los pasa SOLO `_empacar_optimizado` en la
     materialización FINAL (`busqueda_n_pallets.FINAL_*`). `Pallets_Objetivo`
-    fijo y los sondeos no los heredan."""
+    fijo y los sondeos no los heredan.
+
+    [PATCH V6.12-D8B-7.2 -"Final minimal cascade"] `omitir_repair` (default
+    `False`: Repair corre como siempre) y `presupuesto_global_expansiones`
+    (default `None`: Global por CPU-time como siempre) los pasa SOLO
+    `_empacar_optimizado` en la materialización FINAL: cascada
+    Rescue(presupuesto_rescue_nodos) -> [sin Repair] -> Exact
+    (presupuesto_exact_intentos) -> Global(presupuesto_global_expansiones) ->
+    fallback al witness. El sondeo conserva Repair y Global por tiempo;
+    `Pallets_Objetivo` fijo conserva la cascada completa."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -2117,7 +2128,9 @@ def _empacar_n_pallets(
         # iterativos + ejection chains) sobre lo que haya quedado -nunca
         # reemplaza al rescue, solo lo mejora con el mismo criterio de
         # score de arriba.
-        if sin_colocar_final:
+        # [PATCH V6.12-D8B-7.2] `omitir_repair=True` SOLO en la materialización
+        # FINAL (ver `busqueda_n_pallets.FINAL_REPAIR_ENABLED`).
+        if sin_colocar_final and not omitir_repair:
             from src.repair_solver import RESCUE_TIME_MAX_SECONDS as REPAIR_TIME_MAX_SECONDS
             from src.repair_solver import repair_solver
 
@@ -2230,9 +2243,15 @@ def _empacar_n_pallets(
                 total_pre_global, pendientes_pre_global, por_sku, pallets_final, skus_protegidos_cd,
             )
             deadline_global = time.process_time() + GLOBAL_RESCUE_TIME_SECONDS
+            # [PATCH V6.12-D8B-7.2] El kwarg SOLO se envía en la materialización FINAL.
+            kwargs_global = (
+                {} if presupuesto_global_expansiones is None
+                else {"presupuesto_expansiones": presupuesto_global_expansiones}
+            )
             pallets_global, sin_colocar_global, stats_global = global_rescue(
                 pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
                 tope_pallet_por_sku, n_pallets, cd, presupuesto, deadline=deadline_global, contador=contador,
+                **kwargs_global,
             )
             total_global = demanda_total - sum(sin_colocar_global.values())
             pendientes_global = {**{sku: 0 for sku in por_sku}, **sin_colocar_global}
@@ -2410,13 +2429,28 @@ def _empacar_optimizado(
     # [PATCH V6.12-D8A.1] Presupuestos de TRABAJO propios de la materialización
     # final (no los del sondeo ni los de `Pallets_Objetivo`): ver el comentario
     # de calibración de `busqueda_n_pallets.FINAL_DFS_MAX_NODES`.
-    from src.busqueda_n_pallets import FINAL_DFS_MAX_NODES, FINAL_LNS_RECON_MAX_NODES, FINAL_LNS_SIN_MEJORA
+    # [PATCH V6.12-D8B-7.2] Cascada FINAL mínima y acotada por trabajo: Rescue
+    # 3250 nodos -> sin Repair -> Exact 14 intentos (CP-SAT determinista) ->
+    # Global 9500 expansiones -> witness. Ver `busqueda_n_pallets.FINAL_*`.
+    from src.busqueda_n_pallets import (
+        FINAL_DFS_MAX_NODES,
+        FINAL_EXACT_MAX_ATTEMPTS,
+        FINAL_EXACT_MAX_DET_TIME,
+        FINAL_GLOBAL_MAX_EXPANSIONS,
+        FINAL_LNS_RECON_MAX_NODES,
+        FINAL_LNS_SIN_MEJORA,
+        FINAL_REPAIR_ENABLED,
+        FINAL_RESCUE_MAX_NODES,
+    )
 
     pallets_final, sin_colocar_final = _empacar_n_pallets(
         dict(pendientes_originales), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, best_n, paralelo_lns=paralelo_lns,
         max_nodos_dfs=FINAL_DFS_MAX_NODES, lns_recon_max_nodos=FINAL_LNS_RECON_MAX_NODES,
         lns_sin_mejora_max=FINAL_LNS_SIN_MEJORA,
+        presupuesto_rescue_nodos=FINAL_RESCUE_MAX_NODES, omitir_repair=not FINAL_REPAIR_ENABLED,
+        presupuesto_exact_intentos=FINAL_EXACT_MAX_ATTEMPTS, exact_max_deterministic_time=FINAL_EXACT_MAX_DET_TIME,
+        presupuesto_global_expansiones=FINAL_GLOBAL_MAX_EXPANSIONS,
     )
     metadata_optimality = {
         "status": state.optimality_status(),

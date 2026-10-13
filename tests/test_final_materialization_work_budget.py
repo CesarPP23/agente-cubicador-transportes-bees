@@ -140,11 +140,15 @@ def test_final_usa_6500_2650_40_y_el_probe_conserva_8000_sin_kwargs_de_lns(monke
         assert kw["presupuesto_rescue_nodos"] == 15000 and kw["presupuesto_repair_nodos"] == 24000
         assert kw["presupuesto_exact_intentos"] == 500 and kw["exact_max_deterministic_time"] == 1.0
         assert "lns_recon_max_nodos" not in kw and "lns_sin_mejora_max" not in kw
+        assert "omitir_repair" not in kw and "presupuesto_global_expansiones" not in kw
     for kw in finales:
         assert kw["max_nodos_dfs"] == 6500
         assert kw["lns_recon_max_nodos"] == 2650 and kw["lns_sin_mejora_max"] == 40
-        # el final no hereda NINGÚN presupuesto del sondeo
-        assert not any(k.startswith("presupuesto_") or k == "exact_max_deterministic_time" for k in kw)
+        # el final no hereda NINGÚN presupuesto del sondeo: tiene los suyos (D8B-7.2)
+        assert kw["presupuesto_rescue_nodos"] == 3250 and "presupuesto_repair_nodos" not in kw
+        assert kw["omitir_repair"] is True
+        assert kw["presupuesto_exact_intentos"] == 14 and kw["exact_max_deterministic_time"] == 1.0
+        assert kw["presupuesto_global_expansiones"] == 9500
 
 
 def test_pallets_objetivo_no_hereda_el_budget_final(monkeypatch):
@@ -161,6 +165,8 @@ def test_pallets_objetivo_no_hereda_el_budget_final(monkeypatch):
     assert llamadas
     for kw in llamadas:
         assert "max_nodos_dfs" not in kw and "lns_recon_max_nodos" not in kw and "lns_sin_mejora_max" not in kw
+        assert not any(k.startswith("presupuesto_") for k in kw)
+        assert "omitir_repair" not in kw and "exact_max_deterministic_time" not in kw
 
 
 def test_lns_secuencial_recibe_los_topes_y_sin_kwargs_usa_las_constantes(monkeypatch):

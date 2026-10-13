@@ -331,6 +331,38 @@ FINAL_DFS_MAX_NODES = 6500
 FINAL_LNS_RECON_MAX_NODES = 2650
 FINAL_LNS_SIN_MEJORA = 40
 
+# [PATCH V6.12-D8B-7.2 -"Final minimal cascade"] Cascada FINAL mínima y acotada
+# por trabajo, solo en la materialización FINAL (`_empacar_optimizado`):
+#     DFS/LNS -> Rescue -> [Repair OFF] -> Exact -> Global -> witness.
+# PROBE (Rescue 15000 / Repair 24000 / Exact 500 / Global por tiempo) y
+# `Pallets_Objetivo` (cascada completa por tiempo) NO cambian. Contratos
+# distintos: en PROBE perder un éxito puede aumentar N (BK65 N=4 solo se
+# resuelve en el sondeo con Repair o con Exact); en FINAL N ya está elegido y
+# existe un witness factible, así que perder una mejora profunda solo implica
+# fallback de calidad al witness. Calibración (D8B / D8B-7 / D8B-7.1 / D8B-7.2,
+# todo medido, 9/9 hashes canónicos y 8/8 éxitos en OPEN y en maestro C):
+#   * Rescue 3250: SJ95 (único éxito de Rescue en FINAL abierto) necesita 649
+#     nodos; las unidades de trabajo son reconstrucciones <= 3000 nodos, así
+#     que 3250 permite ~6003 nodos. NO conserva la clase de éxito largo de
+#     BK31 de N FIJO (55747 nodos), que sigue intacta en `Pallets_Objetivo`
+#     (GENERALIZATION_WARNING: LONG_RESCUE_SUCCESS_CLASS_EXISTS).
+#   * Repair OFF: 0 éxitos propios de Repair observados en FINAL ni en N fijo;
+#     costaba ~46 s de CPU en SJ97 (salida descartada por el fallback al
+#     witness). Es ACCEPTED_GENERALIZATION_RISK, no una pérdida del sondeo.
+#   * Exact 14 intentos, det_time 1,0, 1 worker: cuesta ~0 s en los CDs abiertos
+#     (con 53 cajas pendientes cada intento supera el límite de caja y se
+#     descarta) y conserva el éxito Exact barato observado en PROBE.
+#   * Global 9500 expansiones: éxitos de BK52 (4388 exp, última profundidad en
+#     4260) y BK53 (6434 exp, última profundidad en 6306), independientes de lo
+#     que dejen Rescue/Exact (Global reconstruye desde cero). 9500 = 1,48x el
+#     peor caso. Cuesta ~43 s de CPU en SJ97 (9523 expansiones, soft cap a
+#     profundidad).
+FINAL_RESCUE_MAX_NODES = 3250
+FINAL_REPAIR_ENABLED = False
+FINAL_EXACT_MAX_ATTEMPTS = 14
+FINAL_EXACT_MAX_DET_TIME = 1.0
+FINAL_GLOBAL_MAX_EXPANSIONS = 9500
+
 
 def probe(
     n: int,

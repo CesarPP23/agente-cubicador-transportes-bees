@@ -261,8 +261,12 @@ def test_final_y_pallets_objetivo_no_reciben_override_de_exact(monkeypatch):
     sondeos = [kw for kw in llamadas if kw.get("con_lns") is False]
     finales = [kw for kw in llamadas if kw.get("con_lns", True) is True]
     assert sondeos and all(kw["presupuesto_exact_intentos"] == 500 for kw in sondeos)
-    assert finales and all("presupuesto_exact_intentos" not in kw and "exact_max_deterministic_time" not in kw
-                           for kw in finales)
+    # [D8B-7.2] la FINAL tiene su PROPIO tope de Exact (14 intentos), no el del sondeo (500)
+    assert finales and all(
+        kw["presupuesto_exact_intentos"] == bnp.FINAL_EXACT_MAX_ATTEMPTS == 14
+        and kw["exact_max_deterministic_time"] == bnp.FINAL_EXACT_MAX_DET_TIME
+        for kw in finales
+    )
 
     llamadas.clear()
     import pandas as pd

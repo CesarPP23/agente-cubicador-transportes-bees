@@ -108,7 +108,8 @@ def test_final_y_pallets_objetivo_no_reciben_el_presupuesto_de_rescue(monkeypatc
     sondeos = [kw for kw in llamadas if kw.get("con_lns") is False]
     finales = [kw for kw in llamadas if kw.get("con_lns", True) is True]
     assert sondeos and all(kw["presupuesto_rescue_nodos"] == 15000 for kw in sondeos)
-    assert finales and all("presupuesto_rescue_nodos" not in kw for kw in finales)
+    # [D8B-7.2] la FINAL tiene su PROPIO tope de Rescue (3250), nunca el del sondeo (15000)
+    assert finales and all(kw["presupuesto_rescue_nodos"] == bnp.FINAL_RESCUE_MAX_NODES == 3250 for kw in finales)
 
     # Pallets_Objetivo fijo
     llamadas.clear()

@@ -1294,6 +1294,9 @@ def _beam_search(
     temporal que `limite_tiempo` (calculado por `global_rescue` con este
     mismo `reloj`); antes de este patch, `limite_tiempo` venía de
     `time.time()` (reloj de pared)."""
+    # [PATCH V6.12-D8B-7.2] Con un `MedidorTrabajo` como `reloj` cada
+    # `_expandir_estado` suma 1 expansión; con un reloj normal es no-op.
+    registrar_expansion = getattr(reloj, "registrar_nodos", None)
     visited: dict[tuple, tuple] = {}
     frontera = [estado_inicial]
     mejor_estado = estado_inicial
@@ -1336,6 +1339,8 @@ def _beam_search(
                 estado, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, estrategia, stats,
                 presupuesto,
             )
+            if registrar_expansion is not None:
+                registrar_expansion(1)
             stats["estados_generados"] += len(hijos)
             if not hijos:
                 candidatos_hijos.append(estado)  # estancado -se conserva, puede seguir siendo el mejor
@@ -1475,6 +1480,7 @@ def global_rescue(
     deadline: float | None = None,
     contador: list[int] | None = None,
     oracle_sampler=None,
+    presupuesto_expansiones: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int], dict]:
     """[sección 4] Punto de entrada. A diferencia de Rescue V6.02/Repair
     V6.04/Exact Local Repair (que reciben el MEJOR resultado ya obtenido y
@@ -1511,12 +1517,32 @@ def global_rescue(
     se calculaba con `time.time()` (reloj de pared, sensible a contención
     de otros CDs corriendo en paralelo). `deadline` (parámetro externo,
     ver `packing_bloques._empacar_n_pallets`) también debe venir ya en
-    este dominio (CPU-time)."""
-    reloj: Callable[[], float] = time.process_time
+    este dominio (CPU-time).
+
+    [PATCH V6.12-D8B-7.2 -"Final Global work budget"] `presupuesto_expansiones`
+    (default `None` = comportamiento de siempre, CPU-time): cuando se pasa, el
+    `reloj` de TODO este Global es un `MedidorTrabajo` cuya unidad son
+    EXPANSIONES DE ESTADO (cada llamada a `_expandir_estado` en el beam
+    search) y `limite_tiempo = reloj() + presupuesto_expansiones`; `deadline`
+    (un instante de CPU-time) se IGNORA en ese modo. Los puntos de control son
+    los mismos de siempre (inicio de cada profundidad y de cada reinicio), así
+    que es un SOFT CAP AT DEPTH BOUNDARY: la profundidad en curso termina y el
+    total consumido puede superar el tope por, como máximo, esa profundidad.
+    Lo pasa únicamente la materialización FINAL
+    (`busqueda_n_pallets.FINAL_GLOBAL_MAX_EXPANSIONS`)."""
+    reloj: Callable[[], float]
     t0_wall = time.time()  # solo para stats["tiempo_s"] (diagnóstico humano, no budget)
-    limite_tiempo = reloj() + GLOBAL_RESCUE_TIME_SECONDS
-    if deadline is not None:
-        limite_tiempo = min(limite_tiempo, deadline)
+    if presupuesto_expansiones is not None:
+        # [PATCH V6.12-D8B-7.2] ver el docstring (presupuesto de TRABAJO).
+        from src.medidor_trabajo import MedidorTrabajo
+
+        reloj = MedidorTrabajo()
+        limite_tiempo = reloj() + presupuesto_expansiones
+    else:
+        reloj = time.process_time
+        limite_tiempo = reloj() + GLOBAL_RESCUE_TIME_SECONDS
+        if deadline is not None:
+            limite_tiempo = min(limite_tiempo, deadline)
 
     stats: dict = {
         "activado": True, "cd": cd, "beam_width_por_estrategia": dict(GLOBAL_BEAM_WIDTH_BY_STRATEGY),
