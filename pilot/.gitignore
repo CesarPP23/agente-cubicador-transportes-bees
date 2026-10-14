@@ -1,0 +1,6 @@
+# Datos reales del piloto: no se versionan por defecto.
+runs/
+exceptions/
+cases/
+report/
+__pycache__/

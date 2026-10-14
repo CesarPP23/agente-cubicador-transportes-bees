@@ -1,0 +1,2 @@
+case_id,cd,n_pallets_operacion,resultado_fisico,observaciones
+EJEMPLO_CASO,BK00,5,OK,"plan manual de operaciones; llenar solo las filas que existan"
