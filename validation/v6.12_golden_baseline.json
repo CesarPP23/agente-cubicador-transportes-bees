@@ -1,0 +1,39 @@
+{
+  "version": "V6.12",
+  "release_candidate_source_commit": "ea3bc8a",
+  "date": "2026-10-14",
+  "purpose": "Metadata only. Not read by any code or test; it does not change any executable contract.",
+  "canonical_hash": {
+    "namespace": "COMP",
+    "implementation": "scripts/golden6_gate.py::hash_canonico",
+    "role": "COMP = contractual golden (RELEASE_CANONICAL_HASH). LAYOUT = supplemental geometry regression guard; it does not replace COMP.",
+    "comp_definition": "sha256(json.dumps(sorted(sorted((sku, cantidad) for each tower) for each pallet), sort_keys=True, default=str))[:16]",
+    "layout_implementation": "src/pipeline_sku_bloque.py::_firma_pallet_canonica (coordinates and dimensions rounded to 2 decimals, no pallet ID)",
+    "layout_note": "LAYOUT values are the HEAD ea3bc8a values; no comparable pre-V6.12 history exists for the six CDs."
+  },
+  "golden": {
+    "BK31": {"N": 1,  "cajas": 98,   "COMP": "7e86d30f441c6e41", "LAYOUT": "8f03a02c5cda2046"},
+    "BK43": {"N": 3,  "cajas": 407,  "COMP": "7764da5e6842a9b9", "LAYOUT": "74e6b172cb4a917e"},
+    "BK49": {"N": 9,  "cajas": 910,  "COMP": "2358a0b9e7886e39", "LAYOUT": "44020de6bf000abc"},
+    "BK50": {"N": 14, "cajas": 1489, "COMP": "eb3c498e6d392895", "LAYOUT": "f7fea27b6b5be60b"},
+    "BK52": {"N": 1,  "cajas": 114,  "COMP": "e028452d4bf44586", "LAYOUT": "0c931402980db937"},
+    "BK53": {"N": 2,  "cajas": 208,  "COMP": "f172759840c3a5e7", "LAYOUT": "eba170225b45cfc4"}
+  },
+  "golden_paths": {
+    "BK31/BK49/BK50/BK52/BK53": "tests/fixtures/multicd_validation.xlsx, armar_pallets_bloques(df_cd, cd, pallets_objetivo=pobj[cd], paralelo_lns=True)",
+    "BK43": "Cubicaje18.07.2026.xlsx, armar_pallets_bloques(grupo, 'BK43', contador=[0], pallets_objetivo=None, paralelo_lns=False)"
+  },
+  "bk43_rebaseline": {
+    "classification": "INTENTIONAL_GOLDEN_REBASELINE",
+    "causal_commit": "acae72e",
+    "reason": "deterministic DFS/LNS work budgets removed execution-mode dependency",
+    "pre_d5": {
+      "status": "PRE_D5_REFERENCE_ONLY",
+      "paralelo_lns_false": "885d929bff4dbc66",
+      "paralelo_lns_true": "9a6a4652d41ab5e8"
+    },
+    "v6_12": {
+      "both_modes": "7764da5e6842a9b9"
+    }
+  }
+}
