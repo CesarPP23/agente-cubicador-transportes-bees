@@ -27,7 +27,21 @@ Harness de **medición y reporte**. No es una versión del solver y **no recalib
 
    Genera `pilot/report/pilot_report.md` y `pilot/report/pilot_table.csv`.
 
-## Clasificación (por CD, solo por cantidad de pallets; menos es mejor)
+## Modo FIXED_N (`--mode FIXED_N`)
+
+`Pallets_Objetivo` = posiciones reales y obligatorias de operación. El runner carga la hoja con el cargador oficial (`src/validacion.py::cargar_pallets_objetivo`), se la pasa al pipeline (`pallets_objetivo_por_cd`) y evalúa **tres gates independientes** por CD:
+
+| gate | valores | criterio |
+|---|---|---|
+| A cubicaje | `PASS_FIXED_N_GEOMETRY` / `FAIL_FIXED_N` | exactamente N objetivo, 100 % de la demanda elegible colocada, 0 faltantes, 0 errores geométricos |
+| B peso | `WEIGHT_VALIDATED` / `WEIGHT_VALIDATION_INCOMPLETE` | incompleto si hay cajas con peso 0/no validable en el solver (RC1 las computa como 0 kg) |
+| C determinismo | `REPEAT_MATCH` / `DETERMINISM_DIVERGENCE` / `NOT_CHECKED` | requiere `--repeat >= 2`: N, cajas, COMP, LAYOUT, IDs y salida pública idénticos |
+
+`RESULT` = `FAIL_FIXED_N` | `PASS_FIXED_N_GEOMETRY` | `PASS_FULL_PHYSICAL_VALIDATION` (solo con A, B y C en verde). Cigarros/BAT excluidos por diseño **no** cuentan como faltantes, y los pesos 0 **no** son fallo de cubicaje: solo impiden afirmar más de lo que los datos permiten. Por cada CD se registra la reconciliación de demanda (originales, efectiva del solver, excluida y motivo, BAT, pesos no validables) y `N_OBJETIVO`/`N_PRODUCIDO`. El reporte separa *cajas cubicadas* de *consolidaciones BAT* (`--bat-handling A|B|C` solo se registra; por defecto `UNCONFIRMED`).
+
+Un `FAIL_FIXED_N` es `PILOT_EXCEPTION`: se guarda el input y no se aumenta N ni se recalibra nada.
+
+## Clasificación (modo OPEN; por CD, solo por cantidad de pallets; menos es mejor)
 
 | clase | criterio |
 |---|---|
