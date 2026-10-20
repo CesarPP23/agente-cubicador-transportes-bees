@@ -229,21 +229,27 @@ def reconciliar_demanda(envios, maestro, uma, pobj: dict | None) -> dict:
     out: dict = {}
     for cd in sorted(agr["CD"].unique()):
         t = agr[agr["CD"] == cd]
-        s, ex = t[t["destino"] == "SOLVER"], t[t["destino"] != "SOLVER"]
+        es_bat = t["destino"].str.startswith("BAT_")
+        s, ex, bt = t[t["destino"] == "SOLVER"], t[(t["destino"] != "SOLVER") & ~es_bat], t[es_bat]
         c = df_cls[df_cls["CD"] == cd]
         b = df_bat[df_bat["CD"] == cd]
         si = solver_in.get(cd, {})
         pend = int(sum(si.get("pend", {}).values())) if "pend" in si else None
         efectiva_ceil = int(s["techo"].sum())
         motivos = {}
-        for m in sorted(ex["destino"].unique()):
+        for m in sorted(ex["destino"].unique()):  # solo exclusiones reales; Cigarros/Vapes NO es demanda excluida
             q = ex[ex["destino"] == m]
             motivos[m] = {"skus": int(len(q)), "cajas_teoricas": round(float(q["Cajas Teóricas"].sum()), 3)}
         out[cd] = {
             "n_objetivo": pobj.get(cd), "cajas_originales": round(float(orig.loc[cd, "cajas"]), 3), "skus_originales": int(orig.loc[cd, "skus"]),
             "filas_originales": int(orig.loc[cd, "filas"]), "demanda_efectiva_solver": pend, "skus_solver": int(len(s)),
             "cajas_teoricas_solver": round(float(s["Cajas Teóricas"].sum()), 3), "redondeo_ascendente": round(efectiva_ceil - float(s["Cajas Teóricas"].sum()), 3),
-            "cajas_excluidas": round(float(ex["Cajas Teóricas"].sum()), 3), "skus_excluidos": int(len(ex)), "excluidos_por_motivo": motivos,
+            # demanda_original = demanda_cubicable (no BAT) + demanda Cigarros/Vapes separada; la cubicable se reparte entre lo que
+            # entra al solver y las OTRAS exclusiones reales (validacion, categoria no reconocida, geometria, sin torre, no cabe).
+            "demanda_cubicable": round(float(s["Cajas Teóricas"].sum()) + float(ex["Cajas Teóricas"].sum()), 3),
+            "demanda_cigarros_vapes_cajas_teoricas": round(float(bt["Cajas Teóricas"].sum()), 3),
+            "identidad_original_cubicable_bat": abs(float(orig.loc[cd, "cajas"]) - (float(s["Cajas Teóricas"].sum()) + float(ex["Cajas Teóricas"].sum()) + float(bt["Cajas Teóricas"].sum()))) < 1e-6,
+            "otras_exclusiones_cajas": round(float(ex["Cajas Teóricas"].sum()), 3), "otras_exclusiones_skus": int(len(ex)), "otras_exclusiones_por_motivo": motivos,
             "bat_skus": int(b["SKU"].nunique()), "bat_cajas_teoricas": round(float(b["Cajas Teóricas"].sum()), 3), "bat_unidades": int(b["Unidades"].sum()),
             "bat_cajas_consolidacion": len(cajas_bat.get(cd, [])),
             "peso_no_validable_skus_en_solver": int(c["Peso_No_Validable"].sum()),
@@ -284,3 +290,108 @@ def gates_fixed_n(m: dict | None, rec: dict | None, n_objetivo: int | None, repe
     else:
         res = "PASS_FIXED_N_GEOMETRY"
     return {"gate_a": a, "gate_b": b, "gate_c": c, "resultado": res, "motivos_fail": motivos}
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Cigarros / Vapes (BAT): contrato operacional
+#   demanda total -> demanda no BAT -> cubicador (consume N)   |   cigarros/vapes -> hoja `Cigarros_Vapes` (HUB)
+# BAT no consume N, no modifica Pallets_Objetivo, no participa en geometria/ocupacion y no cuenta como faltante.
+# Es demanda ATENDIDA por otro flujo (no "excluida"). Pilot-side: el exportador productivo NO se toca.
+# ----------------------------------------------------------------------------------------------------------------
+HOJA_BAT = "Cigarros_Vapes"
+COLUMNAS_HOJA_BAT = ["CD", "SKU", "Descripción", "Categoría", "Subcategoría", "Unidades", "Cajas_Teoricas", "Cajas_Consolidacion_CD"]
+
+
+def _es_bat_negocio(categoria, subcategoria) -> bool:
+    """Definicion de NEGOCIO (independiente del pipeline): Categoria Cigarros, o Subcategoria vape/vapes (sin importar
+    mayusculas ni espacios). Se usa para comprobar que el pipeline no deje vapes dentro del cubicaje."""
+    import config
+
+    cat = config.normalizar_categoria(categoria)
+    sub = "" if subcategoria is None or subcategoria != subcategoria else str(subcategoria).strip().casefold()
+    return cat in config.CATEGORIAS_BAT or sub in {"vape", "vapes"}
+
+
+def bat_esperado(envios, maestro):
+    """Cigarros/Vapes segun la definicion de negocio, calculado DIRECTO desde el input (sin pasar por el pipeline)."""
+    env = envios.copy()
+    env["SKU"] = env["SKU"].astype(str).str.strip()
+    agr = env.groupby(["CD", "SKU"], as_index=False).agg({"Descripción": "first", "Cajas Teóricas": "sum", "Unidades": "sum"})
+    m = maestro.copy()
+    m["SKU"] = m["SKU"].astype(str).str.strip()
+    m = m.drop_duplicates(subset="SKU")
+    cols = ["SKU", "Categoría", "Unidades por caja"] + (["Subcategoría"] if "Subcategoría" in m.columns else [])
+    df = agr.merge(m[cols], on="SKU", how="left")
+    if "Subcategoría" not in df.columns:
+        df["Subcategoría"] = None
+    df = df[[_es_bat_negocio(c, sc) for c, sc in zip(df["Categoría"], df["Subcategoría"])]]
+    return df.reset_index(drop=True)
+
+
+def consolidaciones_contractuales(esperado) -> dict:
+    """Cajas fisicas de consolidacion por CD con la logica BAT vigente (`bat.consolidar_bat_por_cd`)."""
+    from src import bat
+
+    if esperado.empty:
+        return {}
+    df = esperado.rename(columns={"Unidades": "Unidades"}).copy()
+    return {cd: len(cajas) for cd, cajas in bat.consolidar_bat_por_cd(df).items()}
+
+
+def hoja_cigarros_vapes(filas_pipeline: list[dict], maestro):
+    """Arma la hoja `Cigarros_Vapes` (detalle por SKU + resumen por CD) a partir de lo que el pipeline REALMENTE emite
+    (`ResultadoPipeline.demanda_cigarros_df`), agregando Categoria/Subcategoria del Maestro. Si el pipeline omitiera un SKU,
+    la hoja lo omite tambien (la conciliacion lo detecta)."""
+    import pandas as pd
+
+    df = pd.DataFrame(filas_pipeline)
+    if df.empty:
+        return pd.DataFrame(columns=COLUMNAS_HOJA_BAT), pd.DataFrame(columns=["CD", "SKUs", "Unidades_Total_CD", "Cajas_Teoricas_Total_CD", "Cajas_Consolidacion_CD"])
+    m = maestro.copy()
+    m["SKU"] = m["SKU"].astype(str).str.strip()
+    m = m.drop_duplicates(subset="SKU")
+    cols = ["SKU", "Categoría"] + (["Subcategoría"] if "Subcategoría" in m.columns else [])
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df = df.merge(m[cols], on="SKU", how="left")
+    if "Subcategoría" not in df.columns:
+        df["Subcategoría"] = None
+    det = pd.DataFrame({"CD": df["CD"], "SKU": df["SKU"], "Descripción": df["Descripcion"], "Categoría": df["Categoría"], "Subcategoría": df["Subcategoría"],
+                        "Unidades": df["Unidades_Demanda"], "Cajas_Teoricas": df["Cajas_Teoricas"],
+                        "Cajas_Consolidacion_CD": df["Cajas_Consolidacion_Necesarias_CD"]}).sort_values(["CD", "SKU"]).reset_index(drop=True)
+    res = det.groupby("CD", as_index=False).agg(SKUs=("SKU", "nunique"), Unidades_Total_CD=("Unidades", "sum"), Cajas_Teoricas_Total_CD=("Cajas_Teoricas", "sum"),
+                                                Cajas_Consolidacion_CD=("Cajas_Consolidacion_CD", "max"))
+    return det[COLUMNAS_HOJA_BAT], res
+
+
+def conciliar_bat(cd: str, esperado, hoja_det, skus_en_pallets: set, consol_esperada: dict) -> dict:
+    """Conciliacion de BAT por CD (perdida cero): SKUs, unidades, cajas teoricas y consolidaciones entre el input (definicion de
+    negocio) y la hoja `Cigarros_Vapes` que emite el pipeline; ademas, ningun SKU BAT puede estar en un pallet cubicado."""
+    e = esperado[esperado["CD"] == cd]
+    h = hoja_det[hoja_det["CD"] == cd] if len(hoja_det) else hoja_det
+    sk_e, sk_h = set(e["SKU"]), set(h["SKU"]) if len(h) else set()
+    u_e, u_h = float(e["Unidades"].sum()), float(h["Unidades"].sum()) if len(h) else 0.0
+    c_e, c_h = float(e["Cajas Teóricas"].sum()), float(h["Cajas_Teoricas"].sum()) if len(h) else 0.0
+    k_e = consol_esperada.get(cd, 0)
+    k_h = int(h["Cajas_Consolidacion_CD"].max()) if len(h) else 0
+    en_pallets = sorted(sk_e & set(skus_en_pallets))
+    motivos = []
+    if sk_e - sk_h:
+        motivos.append(f"SKUs_BAT_FALTAN_EN_HOJA({len(sk_e - sk_h)}): {sorted(sk_e - sk_h)[:8]}")
+    if sk_h - sk_e:
+        motivos.append(f"SKUs_EN_HOJA_NO_BAT({len(sk_h - sk_e)})")
+    if abs(u_e - u_h) > 1e-6:
+        motivos.append(f"UNIDADES_BAT_entrada({u_e:g})!=hoja({u_h:g})")
+    if abs(c_e - c_h) > 1e-6:
+        motivos.append(f"CAJAS_TEORICAS_BAT_entrada({c_e:g})!=hoja({c_h:g})")
+    if k_e != k_h:
+        motivos.append(f"CONSOLIDACION_esperada({k_e})!=hoja({k_h})")
+    if en_pallets:
+        motivos.append(f"SKUs_BAT_DENTRO_DEL_CUBICAJE({len(en_pallets)}): {en_pallets[:8]}")
+    return {"skus_entrada": len(sk_e), "skus_hoja": len(sk_h), "unidades_entrada": u_e, "unidades_hoja": u_h, "cajas_teoricas_entrada": round(c_e, 6),
+            "cajas_teoricas_hoja": round(c_h, 6), "consolidaciones_esperadas": k_e, "consolidaciones_hoja": k_h, "skus_bat_en_pallets": en_pallets,
+            "gate_bat": "FAIL_BAT_ROUTING" if motivos else "PASS_BAT_ROUTING", "motivos_bat": motivos}
+
+
+def cobertura_operacional(gate_a: str, gate_bat: str) -> str:
+    """PASS_OPERATIONAL_COVERAGE solo si pasan el cubicaje (N fijo) Y el ruteo BAT. El peso (gate B) sigue separado."""
+    return "PASS_OPERATIONAL_COVERAGE" if gate_a == "PASS_FIXED_N_GEOMETRY" and gate_bat == "PASS_BAT_ROUTING" else "FAIL_OPERATIONAL_COVERAGE"

@@ -16,7 +16,7 @@ import pilot_common as pc  # noqa: E402
 COLS = ["run_id", "fecha", "case_id", "input_hash", "cd", "demanda_cajas", "skus", "n_pallets", "cajas_colocadas", "faltantes", "errores",
         "peso_max", "altura_max", "pallets_parciales", "altura_media", "ocupacion_media", "origen", "optimality_status", "wall_s", "cpu_s",
         "comp", "layout", "version", "n_pallets_operacion", "diferencia_vs_operacion", "resultado_fisico", "observaciones",
-        "clasificacion", "pilot_exception", "motivos", "n_objetivo", "n_producido", "gate_a", "gate_b", "gate_c", "motivos_fail", "bat_handling"]
+        "clasificacion", "pilot_exception", "motivos", "n_objetivo", "n_producido", "gate_a", "gate_b", "gate_c", "motivos_fail", "bat_handling", "gate_bat", "cobertura_operacional"]
 
 
 def cargar(runs_dir: Path, todas: bool) -> tuple[list[dict], list[dict]]:
@@ -30,7 +30,7 @@ def cargar(runs_dir: Path, todas: bool) -> tuple[list[dict], list[dict]]:
             fallidas.append({**base, "tipo": "SOLVER_MISMATCH", "mensaje": "; ".join(r["version"]["solver_diffs"]), "wall_batch_s": r.get("wall_batch_s")})
         for cd, m in r["cds"].items():
             filas.append({**base, "cd": cd, **{k: m.get(k) for k in COLS if k in m}, "motivos": ",".join(m.get("motivos", [])),
-                          "motivos_fail": ",".join(m.get("motivos_fail", []) or []), "reconciliacion": m.get("reconciliacion"),
+                          "motivos_fail": ",".join(m.get("motivos_fail", []) or []), "reconciliacion": m.get("reconciliacion"), "bat": m.get("bat"), "motivos_bat": m.get("motivos_bat"),
                           "wall_batch_s": (r.get("wall_batch_s") or [None])[0], "cpu_batch_s": (r.get("cpu_batch_s") or [None])[0]})
     if not todas:
         ult: dict = {}
@@ -38,6 +38,10 @@ def cargar(runs_dir: Path, todas: bool) -> tuple[list[dict], list[dict]]:
             ult[(x["case_id"], x["input_hash"], x["cd"])] = x  # sorted por run_id (fecha): gana la ultima
         filas = list(ult.values())
     return filas, fallidas
+
+
+def gnum(x):
+    return "-" if x is None else f"{x:g}"
 
 
 def fmt(x, nd=1):
@@ -89,34 +93,44 @@ def reporte(filas: list[dict], fallidas: list[dict]) -> str:
 
 
 def reporte_fixed_n(fixed: list[dict]) -> list[str]:
-    """Seccion FIXED_N: Pallets_Objetivo = posiciones reales y obligatorias. Tres gates independientes (A cubicaje, B peso,
-    C determinismo). Cigarros/BAT excluidos por diseno NO son faltantes del solver; los pesos 0 NO son fallo de cubicaje
-    pero impiden declarar PASS_FULL_PHYSICAL_VALIDATION."""
+    """Seccion FIXED_N: Pallets_Objetivo = posiciones reales y obligatorias del cubicador. Cigarros/Vapes (BAT) NO consumen N, no
+    participan en geometria ni ocupacion y no son faltantes: es demanda ATENDIDA por otro flujo (hoja `Cigarros_Vapes`).
+    Gates: A cubicaje, B peso, C determinismo, BAT ruteo; cobertura operacional = A y BAT."""
     cnt = lambda k, v: sum(1 for x in fixed if x.get(k) == v)  # noqa: E731
     L = ["", "## FIXED_N: resultados por CD", "",
-         f"- RESULT: PASS_FULL_PHYSICAL_VALIDATION {cnt('clasificacion', 'PASS_FULL_PHYSICAL_VALIDATION')} | PASS_FIXED_N_GEOMETRY {cnt('clasificacion', 'PASS_FIXED_N_GEOMETRY')} | FAIL_FIXED_N {cnt('clasificacion', 'FAIL_FIXED_N')}",
+         f"- RESULT (A/B/C): PASS_FULL_PHYSICAL_VALIDATION {cnt('clasificacion', 'PASS_FULL_PHYSICAL_VALIDATION')} | PASS_FIXED_N_GEOMETRY {cnt('clasificacion', 'PASS_FIXED_N_GEOMETRY')} | FAIL_FIXED_N {cnt('clasificacion', 'FAIL_FIXED_N')}",
          f"- Gate A (cubicaje): PASS {cnt('gate_a', 'PASS_FIXED_N_GEOMETRY')}/{len(fixed)} | Gate B (peso): WEIGHT_VALIDATED {cnt('gate_b', 'WEIGHT_VALIDATED')}, "
          f"WEIGHT_VALIDATION_INCOMPLETE {cnt('gate_b', 'WEIGHT_VALIDATION_INCOMPLETE')} | Gate C (determinismo): REPEAT_MATCH {cnt('gate_c', 'REPEAT_MATCH')}, "
-         f"DETERMINISM_DIVERGENCE {cnt('gate_c', 'DETERMINISM_DIVERGENCE')}, NOT_CHECKED {cnt('gate_c', 'NOT_CHECKED')}", "",
-         "| CD | N obj. | N prod. | demanda original | demanda efectiva solver | colocada | excluidos (motivo) | faltantes | errores | peso max* | altura max | altura media | parciales | ocupacion | COMP | LAYOUT | repeat | wall s | CPU s | A | B | C | RESULT |",
-         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+         f"DETERMINISM_DIVERGENCE {cnt('gate_c', 'DETERMINISM_DIVERGENCE')}, NOT_CHECKED {cnt('gate_c', 'NOT_CHECKED')}",
+         f"- Gate BAT (ruteo): PASS_BAT_ROUTING {cnt('gate_bat', 'PASS_BAT_ROUTING')}/{len(fixed)} | Cobertura operacional (A y BAT): PASS_OPERATIONAL_COVERAGE {cnt('cobertura_operacional', 'PASS_OPERATIONAL_COVERAGE')}/{len(fixed)}", "",
+         "| CD | N obj. | N prod. | demanda original (cajas teor.) | demanda cubicable | efectiva solver | colocada | otras exclusiones (motivo) | faltantes | errores | peso max* | altura max | altura media | parciales | ocupacion | COMP | LAYOUT | wall s | CPU s | A | B | C | BAT | RESULT | cobertura operacional |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for x in sorted(fixed, key=lambda x: x["cd"]):
         r = x.get("reconciliacion") or {}
-        mot = "; ".join(f"{k}: {v['skus']} SKU/{v['cajas_teoricas']} cj" for k, v in (r.get("excluidos_por_motivo") or {}).items()) or "-"
-        L.append(f"| {x['cd']} | {x.get('n_objetivo')} | {x.get('n_producido')} | {fmt(r.get('cajas_originales'), 3)} ({r.get('skus_originales', '-')} SKU) | {r.get('demanda_efectiva_solver', '-')} ({r.get('skus_solver', '-')} SKU) | "
+        mot = "; ".join(f"{k}: {v['skus']} SKU/{v['cajas_teoricas']} cj" for k, v in (r.get("otras_exclusiones_por_motivo") or {}).items()) or "ninguna"
+        L.append(f"| {x['cd']} | {x.get('n_objetivo')} | {x.get('n_producido')} | {fmt(r.get('cajas_originales'), 3)} ({r.get('skus_originales', '-')} SKU) | {fmt(r.get('demanda_cubicable'), 3)} | {r.get('demanda_efectiva_solver', '-')} ({r.get('skus_solver', '-')} SKU) | "
                  f"{x['cajas_colocadas']} | {mot} | {x['faltantes']} | {x['errores']} | {fmt(x.get('peso_max'))} | {fmt(x.get('altura_max'))} | {fmt(x.get('altura_media'))} | {x.get('pallets_parciales')} | "
-                 f"{fmt(x.get('ocupacion_media'), 3)} | `{x['comp']}` | `{x['layout']}` | {x.get('gate_c')} | {fmt(x.get('wall_s'))} | {fmt(x.get('cpu_s'))} | {x.get('gate_a')} | {x.get('gate_b')} | {x.get('gate_c')} | **{x['clasificacion']}** |")
+                 f"{fmt(x.get('ocupacion_media'), 3)} | `{x['comp']}` | `{x['layout']}` | {fmt(x.get('wall_s'))} | {fmt(x.get('cpu_s'))} | {x.get('gate_a')} | {x.get('gate_b')} | {x.get('gate_c')} | {x.get('gate_bat')} | **{x['clasificacion']}** | **{x.get('cobertura_operacional')}** |")
     L += ["", "\\* El peso maximo computa como 0 kg las cajas con peso no validable (WEIGHT_VALIDATION_INCOMPLETE): es un limite inferior, no un peso validado.", "",
-          "## BAT / Cigarros (fuera del cubicaje) y carga operacional", "",
-          "Manejo operacional de BAT (A dentro de los N pallets / B fuera de ellos / C posicion adicional): **" + ", ".join(sorted({str(x.get('bat_handling')) for x in fixed})) + "**", "",
-          "| CD | N obj. | cajas cubicadas | cajas BAT excluidas (teoricas) | unidades BAT | consolidaciones BAT (cajas fisicas) | carga operacional total |", "|---|---|---|---|---|---|---|"]
+          "## Cigarros / Vapes: demanda separada hacia la hoja `Cigarros_Vapes` (no es demanda excluida)", "",
+          "Flujo: demanda total -> (demanda no BAT -> cubicador, consume N) + (Cigarros/Vapes -> hoja `Cigarros_Vapes` para el HUB). BAT no consume N, no modifica `Pallets_Objetivo`, "
+          "no participa en geometria ni ocupacion y no cuenta como faltante. Artefacto por corrida: `pilot/runs/<run_id>/Cigarros_Vapes.xlsx` (hojas `Cigarros_Vapes` con detalle SKU y `Resumen_CD`).", "",
+          "| CD | N obj. | cajas cubicadas | demanda Cigarros/Vapes separada (cajas teor.) | original = cubicable + BAT | SKUs BAT entrada / hoja | unidades BAT entrada / hoja | consolidaciones esperadas / hoja | BAT dentro del cubicaje | gate BAT |", "|---|---|---|---|---|---|---|---|---|---|"]
     for x in sorted(fixed, key=lambda x: x["cd"]):
-        r = x.get("reconciliacion") or {}
-        L.append(f"| {x['cd']} | {x.get('n_objetivo')} | {x['cajas_colocadas']} en {x.get('n_producido')} pallets | {r.get('bat_cajas_teoricas', '-')} | {r.get('bat_unidades', '-')} | "
-                 f"{r.get('bat_cajas_consolidacion', '-')} | {x['cajas_colocadas']} cajas cubicadas + {r.get('bat_cajas_consolidacion', '-')} consolidaciones BAT |")
+        r, b = x.get("reconciliacion") or {}, x.get("bat") or {}
+        L.append(f"| {x['cd']} | {x.get('n_objetivo')} | {x['cajas_colocadas']} en {x.get('n_producido')} pallets | {r.get('demanda_cigarros_vapes_cajas_teoricas', '-')} | "
+                 f"{'OK' if r.get('identidad_original_cubicable_bat') else 'NO CIERRA'} | {b.get('skus_entrada', '-')} / {b.get('skus_hoja', '-')} | {gnum(b.get('unidades_entrada'))} / {gnum(b.get('unidades_hoja'))} | "
+                 f"{b.get('consolidaciones_esperadas', '-')} / {b.get('consolidaciones_hoja', '-')} | {len(b.get('skus_bat_en_pallets', []))} | **{x.get('gate_bat')}** |")
+    malos = [x for x in fixed if x.get("gate_bat") != "PASS_BAT_ROUTING"]
+    if malos:
+        L += ["", "### FAIL_BAT_ROUTING", ""] + [f"- {x['cd']}: {'; '.join(x.get('motivos_bat') or [])}" for x in malos]
     pw = [x for x in fixed if (x.get("reconciliacion") or {}).get("peso_no_validable_cajas_en_solver")]
     if pw:
         L += ["", "## WEIGHT_VALIDATION_INCOMPLETE", ""] + [f"- {x['cd']}: {x['reconciliacion']['peso_no_validable_skus_en_solver']} SKU / {x['reconciliacion']['peso_no_validable_cajas_en_solver']} cajas con peso no validable (computadas como 0 kg)" for x in sorted(pw, key=lambda x: x['cd'])]
+    L += ["", "## Requerimientos de producto detectados (NO se modifican durante el piloto)", "",
+          "El exportador productivo hoy emite la hoja `Cigarros` (`exportar.construir_demanda_cigarros_df`) con columnas `CD, Nombre_CD, SKU, Descripcion, Unidades_Demanda, Unidades_Por_Caja, Cajas_Teoricas, Total_Unidades_CD, Cajas_Consolidacion_Necesarias_CD`. Frente al contrato operacional:",
+          "- la hoja se llama `Cigarros`, no `Cigarros_Vapes`;", "- faltan `Categoría` y `Subcategoría` en el detalle, y la columna se llama `Cajas_Consolidacion_Necesarias_CD` (contrato: `Cajas_Consolidacion_CD`);",
+          "- `config.SUBCATEGORIAS_BAT = {\"vapes\"}` no coincide con la Subcategoría `Vape` (singular) del Maestro: hoy los vapes salen a BAT solo si su Categoría es `Cigarros`. Un vape con otra Categoría quedaría DENTRO del cubicaje (el gate BAT lo detecta con la definición de negocio).", ""]
     return L
 
 

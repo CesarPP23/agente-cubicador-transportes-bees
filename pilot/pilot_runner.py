@@ -83,9 +83,13 @@ def _una_corrida(envios, maestro, uma, timing_log: Path, pobj: dict | None = Non
         m["wall_s"], m["cpu_s"] = t.get("wall_s"), t.get("cpu_s")
         m["ids"] = sorted(p.id for p in pals)
         cds[cd] = m
+    cig = resultado.demanda_cigarros_df if resultado.demanda_cigarros_df is not None else pd.DataFrame()
     publico = {"plan_picking_sha": pc.sha16(resultado.plan_picking_df.to_csv(index=True)),
-               "resumen_cd_sha": pc.sha16(resultado.resumen_cd_df.to_csv(index=True))}
-    return {"wall_batch_s": round(wall, 1), "cpu_batch_s": round(cpu, 1), "cds": cds, "publico": publico}
+               "resumen_cd_sha": pc.sha16(resultado.resumen_cd_df.to_csv(index=True)),
+               "cigarros_vapes_sha": pc.sha16(cig.to_csv(index=True))}
+    skus_pallets = {cd: sorted({t.sku for p in pals for t in p.torres}) for cd, pals in por_cd.items()}
+    return {"wall_batch_s": round(wall, 1), "cpu_batch_s": round(cpu, 1), "cds": cds, "publico": publico,
+            "cigarros_filas": cig.to_dict("records"), "skus_en_pallets": skus_pallets}
 
 
 def main() -> int:
@@ -117,6 +121,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     reconciliacion: dict = {}
+    bat_esp, consol_esp, maestro = None, {}, None
     registro = {"run_id": run_id, "fecha": datetime.now().isoformat(timespec="seconds"), "case_id": case_id,
                 "input": {"archivo": str(inp), "sha256": h_full, "hash": h_full[:16], "filas_envios": None},
                 "version": ver, "nota": a.nota, "repeat": a.repeat, "mode": a.mode, "excepcion": None, "corridas": [], "cds": {}}
@@ -145,6 +150,8 @@ def main() -> int:
         registro["bat_handling"] = a.bat_handling
         reconciliacion = pc.reconciliar_demanda(envios, maestro, uma, pobj)
         registro["reconciliacion_demanda"] = reconciliacion
+        bat_esp = pc.bat_esperado(envios, maestro)
+        consol_esp = pc.consolidaciones_contractuales(bat_esp)
         for i in range(max(1, a.repeat)):
             try:
                 corridas.append(_una_corrida(envios, maestro, uma, timing_log, pobj))
@@ -170,6 +177,16 @@ def main() -> int:
             if (c["publico"] != base["publico"]):
                 divergencia.setdefault("_PUBLICO", []).append(k)
 
+    bat_conc: dict = {}
+    if corridas and bat_esp is not None:
+        hoja_det, hoja_res = pc.hoja_cigarros_vapes(corridas[0]["cigarros_filas"], maestro)
+        with pd.ExcelWriter(out / f"{pc.HOJA_BAT}.xlsx") as w:  # artefacto del piloto (datos reales: no se versiona)
+            hoja_det.to_excel(w, sheet_name=pc.HOJA_BAT, index=False)
+            hoja_res.to_excel(w, sheet_name="Resumen_CD", index=False)
+        for cd in sorted(set(bat_esp["CD"]) | set(hoja_det["CD"]) | set(corridas[0]["cds"])):
+            bat_conc[cd] = pc.conciliar_bat(cd, bat_esp, hoja_det, set(corridas[0]["skus_en_pallets"].get(cd, [])), consol_esp)
+    registro["bat"] = bat_conc
+
     exc_motivos: dict = {}
     ultimo = corridas[-1] if corridas else None
     if registro["excepcion"]:
@@ -179,6 +196,7 @@ def main() -> int:
     for cd, m in (corridas[0]["cds"].items() if corridas else []):
         op = operacion.get(cd, {})
         rec = reconciliacion.get(cd)
+        bconc = bat_conc.get(cd)
         motivos = []
         extra: dict = {}
         if a.mode == "FIXED_N":
@@ -186,8 +204,12 @@ def main() -> int:
             rep_ok = None if len(corridas) < 2 else (cd not in divergencia and "_PUBLICO" not in divergencia)
             g = pc.gates_fixed_n(m, rec, n_obj, rep_ok)
             clase, dif = g["resultado"], (None if n_obj is None else m["n_pallets"] - n_obj)
+            gb = (bconc or {}).get("gate_bat", "FAIL_BAT_ROUTING")
             extra = {"n_objetivo": n_obj, "n_producido": m["n_pallets"], **{k: g[k] for k in ("gate_a", "gate_b", "gate_c", "motivos_fail")},
-                     "reconciliacion": rec, "bat_handling": a.bat_handling}
+                     "gate_bat": gb, "motivos_bat": (bconc or {}).get("motivos_bat", ["SIN_CONCILIACION_BAT"]),
+                     "cobertura_operacional": pc.cobertura_operacional(g["gate_a"], gb), "reconciliacion": rec, "bat": bconc, "bat_handling": a.bat_handling}
+            if gb != "PASS_BAT_ROUTING":
+                motivos.append("FAIL_BAT_ROUTING")
             if g["gate_a"] == "FAIL_FIXED_N":
                 motivos.append("FAIL_FIXED_N")
             if g["gate_c"] == "DETERMINISM_DIVERGENCE":
@@ -203,6 +225,9 @@ def main() -> int:
                                "wall_s_repeticiones": [c["cds"][cd]["wall_s"] for c in corridas if cd in c["cds"]], "pilot_exception": bool(motivos), "motivos": motivos}
         if motivos:
             exc_motivos[cd] = motivos
+    for cd, bc in bat_conc.items():  # CDs con solo Cigarros/Vapes (sin cubicaje) tambien se concilian
+        if cd not in registro["cds"] and bc["gate_bat"] != "PASS_BAT_ROUTING":
+            exc_motivos[cd] = ["FAIL_BAT_ROUTING"]
     registro["divergencia"] = divergencia
     registro["wall_batch_s"] = [c["wall_batch_s"] for c in corridas]
     registro["cpu_batch_s"] = [c["cpu_batch_s"] for c in corridas]
@@ -224,7 +249,7 @@ def main() -> int:
     (out / "run.json").write_text(json.dumps(registro, indent=2, default=str))
     print(f"[{run_id}] {ver['version']}  wall_batch={registro['wall_batch_s']}  PILOT_EXCEPTION={registro['pilot_exception']}")
     for cd, r in registro["cds"].items():
-        gates = f" [A={r['gate_a']} B={r['gate_b']} C={r['gate_c']}] N_obj={r['n_objetivo']}" if "gate_a" in r else ""
+        gates = f" [A={r['gate_a']} B={r['gate_b']} C={r['gate_c']} BAT={r['gate_bat']} -> {r['cobertura_operacional']}] N_obj={r['n_objetivo']}" if "gate_a" in r else ""
         print(f"  {cd}: N={r['n_pallets']} cajas={r['cajas_colocadas']}/{r['demanda_cajas']} falt={r['faltantes']} err={r['errores']} "
               f"{r['origen']} COMP={r['comp']} LAYOUT={r['layout']} wall={r['wall_s']}s -> {r['clasificacion']}{gates}{' PILOT_EXCEPTION' if r['pilot_exception'] else ''}")
     if registro["excepcion"]:
