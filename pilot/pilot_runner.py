@@ -30,24 +30,41 @@ import pandas as pd  # noqa: E402
 import pilot_common as pc  # noqa: E402
 
 
-def _cronometrar_cds(timing_log: Path):
+def _cronometrar_cds(timing_log: Path, ckpt_log: Path | None = None):
     """Envuelve `pipeline_sku_bloque.armar_pallets_bloques` (lo llama cada worker de CD) para registrar wall/CPU por CD."""
     import src.pipeline_sku_bloque as psb
 
     original = psb.armar_pallets_bloques
+    original_firma = psb._firma_pallet_canonica
 
     def _wrap(grupo, cd, *a, **k):
         c0, w0 = time.process_time(), time.time()
         r = original(grupo, cd, *a, **k)
+        cpu, wall = round(time.process_time() - c0, 2), round(time.time() - w0, 2)
         with open(timing_log, "a") as f:
-            f.write(json.dumps({"cd": cd, "cpu_s": round(time.process_time() - c0, 2), "wall_s": round(time.time() - w0, 2), "pid": os.getpid()}) + "\n")
+            f.write(json.dumps({"cd": cd, "cpu_s": cpu, "wall_s": wall, "pid": os.getpid()}) + "\n")
+        if ckpt_log is not None:  # checkpoint por CD: se conserva aunque otro CD tarde horas o la corrida se corte
+            try:
+                import config
+                from src.packing_bloques import _area_union_xy
+                from src.validacion_v5 import validar_pallet_v5
+
+                m = pc.metricas_cd(r, original_firma, validar_pallet_v5, config, _area_union_xy)
+                m.pop("pallets_sobre_peso_hard", None)
+                m.update(cd=cd, rep=os.environ.get("PILOT_REP"), cpu_s=cpu, wall_s=wall, cierre=pc.etapa_cierre(r, m["faltantes"]), fecha=datetime.now().isoformat(timespec="seconds"),
+                         nota="parcial: IDs no canonicos; el registro final es run.json")
+                with open(ckpt_log, "a") as f:
+                    f.write(json.dumps(m, default=str) + "\n")
+            except Exception as e:  # noqa: BLE001 -un checkpoint nunca debe romper la corrida
+                with open(ckpt_log, "a") as f:
+                    f.write(json.dumps({"cd": cd, "rep": os.environ.get("PILOT_REP"), "error_checkpoint": repr(e)}) + "\n")
         return r
 
     psb.armar_pallets_bloques = _wrap
     return original, psb
 
 
-def _una_corrida(envios, maestro, uma, timing_log: Path, pobj: dict | None = None) -> dict:
+def _una_corrida(envios, maestro, uma, timing_log: Path, pobj: dict | None = None, ckpt_log: Path | None = None, rep: int = 1) -> dict:
     import config
     import src.pipeline_sku_bloque as psb
     from src.packing_bloques import _area_union_xy
@@ -56,7 +73,8 @@ def _una_corrida(envios, maestro, uma, timing_log: Path, pobj: dict | None = Non
 
     if timing_log.exists():
         timing_log.unlink()
-    original, mod = _cronometrar_cds(timing_log)
+    os.environ["PILOT_REP"] = str(rep)
+    original, mod = _cronometrar_cds(timing_log, ckpt_log)
     r0 = resource.getrusage(resource.RUSAGE_SELF); c0 = resource.getrusage(resource.RUSAGE_CHILDREN); w0 = time.time()
     try:
         resultado = ejecutar_pipeline(envios.copy(), maestro.copy(), uma.copy(), pallets_objetivo_por_cd=pobj)
@@ -81,6 +99,7 @@ def _una_corrida(envios, maestro, uma, timing_log: Path, pobj: dict | None = Non
         if pobj and cd in pobj and m["origen"] == "GREEDY_O_PALLETS_OBJETIVO":
             m["origen"] = "PALLETS_OBJETIVO"  # CD resuelto por el camino de N fijo (sin witness ni materializacion abierta)
         m["wall_s"], m["cpu_s"] = t.get("wall_s"), t.get("cpu_s")
+        m["cierre"] = pc.etapa_cierre(pals, m["faltantes"])
         m["ids"] = sorted(p.id for p in pals)
         cds[cd] = m
     cig = resultado.demanda_cigarros_df if resultado.demanda_cigarros_df is not None else pd.DataFrame()
@@ -154,7 +173,7 @@ def main() -> int:
         consol_esp = pc.consolidaciones_contractuales(bat_esp)
         for i in range(max(1, a.repeat)):
             try:
-                corridas.append(_una_corrida(envios, maestro, uma, timing_log, pobj))
+                corridas.append(_una_corrida(envios, maestro, uma, timing_log, pobj, out / "checkpoint_cd.jsonl", i + 1))
             except Exception as e:  # noqa: BLE001 -toda excepcion del pipeline se registra como PILOT_EXCEPTION
                 registro["excepcion"] = {"tipo": type(e).__name__, "mensaje": str(e), "traceback": traceback.format_exc(), "repeticion": i + 1}
                 break
@@ -210,6 +229,8 @@ def main() -> int:
                      "cobertura_operacional": pc.cobertura_operacional(g["gate_a"], gb), "reconciliacion": rec, "bat": bconc, "bat_handling": a.bat_handling}
             if gb != "PASS_BAT_ROUTING":
                 motivos.append("FAIL_BAT_ROUTING")
+            extra["operational_result"] = g["gate_a"]
+            extra["technical_diagnosis"] = "NOT_YET_DIAGNOSED" if g["gate_a"] == "FAIL_FIXED_N" else "NOT_APPLICABLE"
             if g["gate_a"] == "FAIL_FIXED_N":
                 motivos.append("FAIL_FIXED_N")
             if g["gate_c"] == "DETERMINISM_DIVERGENCE":
@@ -222,7 +243,9 @@ def main() -> int:
             motivos.append("DIVERGENCIA_ENTRE_REPETICIONES")
         registro["cds"][cd] = {**m, **extra, "clasificacion": clase, "n_pallets_operacion": op.get("n_pallets_operacion"), "diferencia_vs_operacion": dif,
                                "resultado_fisico": op.get("resultado_fisico"), "observaciones": op.get("observaciones"),
-                               "wall_s_repeticiones": [c["cds"][cd]["wall_s"] for c in corridas if cd in c["cds"]], "pilot_exception": bool(motivos), "motivos": motivos}
+                               "wall_s_repeticiones": [c["cds"][cd]["wall_s"] for c in corridas if cd in c["cds"]],
+                               "cpu_s_repeticiones": [c["cds"][cd]["cpu_s"] for c in corridas if cd in c["cds"]],
+                               "closure_stage_repeticiones": [c["cds"][cd]["cierre"]["closure_stage"] for c in corridas if cd in c["cds"]], "pilot_exception": bool(motivos), "motivos": motivos}
         if motivos:
             exc_motivos[cd] = motivos
     for cd, bc in bat_conc.items():  # CDs con solo Cigarros/Vapes (sin cubicaje) tambien se concilian
@@ -249,7 +272,7 @@ def main() -> int:
     (out / "run.json").write_text(json.dumps(registro, indent=2, default=str))
     print(f"[{run_id}] {ver['version']}  wall_batch={registro['wall_batch_s']}  PILOT_EXCEPTION={registro['pilot_exception']}")
     for cd, r in registro["cds"].items():
-        gates = f" [A={r['gate_a']} B={r['gate_b']} C={r['gate_c']} BAT={r['gate_bat']} -> {r['cobertura_operacional']}] N_obj={r['n_objetivo']}" if "gate_a" in r else ""
+        gates = f" [closure={r['cierre']['closure_stage']} OVERWEIGHT_LB={r['overweight_lower_bound']} A={r['gate_a']} B={r['gate_b']} C={r['gate_c']} BAT={r['gate_bat']} -> {r['cobertura_operacional']}] N_obj={r['n_objetivo']}" if "gate_a" in r else ""
         print(f"  {cd}: N={r['n_pallets']} cajas={r['cajas_colocadas']}/{r['demanda_cajas']} falt={r['faltantes']} err={r['errores']} "
               f"{r['origen']} COMP={r['comp']} LAYOUT={r['layout']} wall={r['wall_s']}s -> {r['clasificacion']}{gates}{' PILOT_EXCEPTION' if r['pilot_exception'] else ''}")
     if registro["excepcion"]:

@@ -70,6 +70,7 @@ def metricas_cd(pallets, firma, validar, config, area_union_xy) -> dict:
     pesos = [p.peso_estimado for p in pallets] or [0.0]
     area_pallet = config.PALLET_LARGO * config.PALLET_ANCHO
     ocup = [area_union_xy(p.torres) / area_pallet for p in pallets] or [0.0]
+    sobrepeso = [{"id": p.id, "peso": round(p.peso_estimado, 2)} for p in pallets if p.peso_estimado > config.PESO_HARD_KG]
     opt = next((p.metadata["optimality_status"] for p in pallets if "optimality_status" in p.metadata), None)
     if opt is None:
         origen = "GREEDY_O_PALLETS_OBJETIVO"  # un solo pallet greedy, o CD con Pallets_Objetivo fijo
@@ -83,6 +84,8 @@ def metricas_cd(pallets, firma, validar, config, area_union_xy) -> dict:
         "peso_max": max(pesos), "altura_max": max(alturas), "altura_media": sum(alturas) / len(alturas),
         "pallets_parciales": sum(1 for a in alturas if a < config.ALTURA_TOLERADO_MIN),
         "ocupacion_media": sum(ocup) / len(ocup),
+        # Pallets que YA superan PESO_HARD_KG con las cajas de peso 0/no validable contadas como 0 kg: el peso real solo puede ser >=.
+        "pallets_sobre_peso_hard": sobrepeso, "overweight_lower_bound": bool(sobrepeso),
         "origen": origen, "optimality_status": (opt or {}).get("status"), "hard_lower_bound": (opt or {}).get("hard_lower_bound"),
         "n_greedy": (opt or {}).get("n_greedy"),
         "comp": hash_comp(pallets), "layout": hash_layout(pallets, firma),
@@ -395,3 +398,33 @@ def conciliar_bat(cd: str, esperado, hoja_det, skus_en_pallets: set, consol_espe
 def cobertura_operacional(gate_a: str, gate_bat: str) -> str:
     """PASS_OPERATIONAL_COVERAGE solo si pasan el cubicaje (N fijo) Y el ruteo BAT. El peso (gate B) sigue separado."""
     return "PASS_OPERATIONAL_COVERAGE" if gate_a == "PASS_FIXED_N_GEOMETRY" and gate_bat == "PASS_BAT_ROUTING" else "FAIL_OPERATIONAL_COVERAGE"
+
+
+def etapa_cierre(pallets, faltantes: int) -> dict:
+    """Etapa que cerro la demanda, SOLO desde la metadata que RC1 ya deja en los pallets finales (`rescue_stats`, `repair_stats`,
+    `exact_repair_stats`, `global_rescue_stats`); sin monkeypatch, sin mirar tiempos. `rescue_stats` se escribe siempre al final de
+    una cascada activada; `global_rescue_stats` solo si Global corrio. Repair/Exact no dejan una marca confiable en los pallets finales
+    (pueden perderse si una etapa posterior reemplaza el pallet), asi que esos cierres quedan como NOT_EXPOSED_BY_RC1."""
+    md: dict = {}
+    for p in pallets:
+        for k in ("rescue_stats", "repair_stats", "exact_repair_stats", "global_rescue_stats"):
+            if k in p.metadata and k not in md:
+                md[k] = p.metadata[k]
+    rescue, glob = md.get("rescue_stats"), md.get("global_rescue_stats")
+    colocadas = sum(t.cantidad for p in pallets for t in p.torres)
+    det = {"cascada_activada": rescue is not None, "global_ejecutado": glob is not None,
+           "global_motivo_stop": (glob or {}).get("motivo_stop"), "rescue_cajas_antes": (rescue or {}).get("rescue_cajas_antes"),
+           "rescue_cajas_despues": (rescue or {}).get("rescue_cajas_despues")}
+    if faltantes == 0:
+        if rescue is None:
+            etapa = "DFS_LNS"
+        elif glob is not None:
+            etapa = "GLOBAL"
+        elif det["rescue_cajas_despues"] == colocadas:
+            etapa = "RESCUE"
+        else:
+            etapa = "NOT_EXPOSED_BY_RC1"
+            det["nota"] = "cerro tras Rescue (Repair o Exact); RC1 no expone cual"
+    else:
+        etapa = "SIN_CIERRE_CASCADA_AGOTADA" if glob is not None else "NOT_EXPOSED_BY_RC1"
+    return {"closure_stage": etapa, **det}

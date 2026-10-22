@@ -19,6 +19,13 @@ COLS = ["run_id", "fecha", "case_id", "input_hash", "cd", "demanda_cajas", "skus
         "clasificacion", "pilot_exception", "motivos", "n_objetivo", "n_producido", "gate_a", "gate_b", "gate_c", "motivos_fail", "bat_handling", "gate_bat", "cobertura_operacional"]
 
 
+def cargar_diagnosticos(runs_dir: Path) -> dict:
+    """Diagnostico tecnico posterior por CD (p. ej. de una corrida OPEN diagnostica): `pilot/runs/diagnosticos.json`
+    {"BK46": {"technical_diagnosis": "FIXED_N_PATH_GAP", "ref": "<run_id>"}}. Sin entrada => NOT_YET_DIAGNOSED en los FAIL."""
+    f = runs_dir / "diagnosticos.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
 def cargar(runs_dir: Path, todas: bool) -> tuple[list[dict], list[dict]]:
     filas, fallidas = [], []
     for f in sorted(runs_dir.glob("*/run.json")):
@@ -30,7 +37,9 @@ def cargar(runs_dir: Path, todas: bool) -> tuple[list[dict], list[dict]]:
             fallidas.append({**base, "tipo": "SOLVER_MISMATCH", "mensaje": "; ".join(r["version"]["solver_diffs"]), "wall_batch_s": r.get("wall_batch_s")})
         for cd, m in r["cds"].items():
             filas.append({**base, "cd": cd, **{k: m.get(k) for k in COLS if k in m}, "motivos": ",".join(m.get("motivos", [])),
-                          "motivos_fail": ",".join(m.get("motivos_fail", []) or []), "reconciliacion": m.get("reconciliacion"), "bat": m.get("bat"), "motivos_bat": m.get("motivos_bat"),
+                          "motivos_fail": ",".join(m.get("motivos_fail", []) or []), "reconciliacion": m.get("reconciliacion"), "bat": m.get("bat"), "motivos_bat": m.get("motivos_bat"), "cierre": m.get("cierre"),
+                          "wall_rep": m.get("wall_s_repeticiones"), "cpu_rep": m.get("cpu_s_repeticiones") or ([m.get("cpu_s")] if m.get("cpu_s") is not None else None),
+                          "overweight_lower_bound": m.get("overweight_lower_bound"), "pallets_sobre_peso_hard": m.get("pallets_sobre_peso_hard"),
                           "wall_batch_s": (r.get("wall_batch_s") or [None])[0], "cpu_batch_s": (r.get("cpu_batch_s") or [None])[0]})
     if not todas:
         ult: dict = {}
@@ -48,7 +57,7 @@ def fmt(x, nd=1):
     return "-" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
 
 
-def reporte(filas: list[dict], fallidas: list[dict]) -> str:
+def reporte(filas: list[dict], fallidas: list[dict], diag: dict | None = None) -> str:
     total = len(filas) + len([f for f in fallidas if f["tipo"] != "SOLVER_MISMATCH"])
     fixed = [x for x in filas if x.get("gate_a")]
     cuenta = {c: sum(1 for x in filas if x["clasificacion"] == c) for c in (*pc.CLASES, pc.SIN_OPERACION)}
@@ -84,7 +93,7 @@ def reporte(filas: list[dict], fallidas: list[dict]) -> str:
                  f"{x['cajas_colocadas']}/{x['demanda_cajas']} | {x['faltantes']} | {x['errores']} | {x['origen']} | {fmt(x.get('wall_s'))} | `{x['comp']}` | `{x['layout']}` | "
                  f"{('SI: ' + x['motivos']) if x['pilot_exception'] else ''} |")
     if fixed:
-        L += reporte_fixed_n(fixed)
+        L += reporte_fixed_n(fixed, diag or {})
     if fallidas:
         L += ["", "## Corridas con excepcion o solver distinto de RC1", ""] + [f"- `{f['run_id']}` {f['tipo']}: {f['mensaje']}" for f in fallidas]
     if excep:
@@ -92,12 +101,42 @@ def reporte(filas: list[dict], fallidas: list[dict]) -> str:
     return "\n".join(l for l in L if l is not None) + "\n"
 
 
-def reporte_fixed_n(fixed: list[dict]) -> list[str]:
+def _ow(x: dict) -> bool:
+    """OVERWEIGHT_LOWER_BOUND: algun pallet YA supera PESO_HARD_KG (1430) con cajas de peso 0 contadas como 0 kg => peso real >= calculado."""
+    v = x.get("overweight_lower_bound")
+    return bool(v) if v is not None else (x.get("peso_max") or 0) > 1430  # corridas previas al campo: se deriva del peso maximo
+
+
+def _rep(lst, i):
+    return fmt(lst[i]) if lst and len(lst) > i and lst[i] is not None else "n/d"
+
+
+def reporte_fixed_n(fixed: list[dict], diag: dict) -> list[str]:
     """Seccion FIXED_N: Pallets_Objetivo = posiciones reales y obligatorias del cubicador. Cigarros/Vapes (BAT) NO consumen N, no
     participan en geometria ni ocupacion y no son faltantes: es demanda ATENDIDA por otro flujo (hoja `Cigarros_Vapes`).
     Gates: A cubicaje, B peso, C determinismo, BAT ruteo; cobertura operacional = A y BAT."""
     cnt = lambda k, v: sum(1 for x in fixed if x.get(k) == v)  # noqa: E731
-    L = ["", "## FIXED_N: resultados por CD", "",
+    for x in fixed:
+        d = diag.get(x["cd"], {})
+        x["_diag"] = d.get("technical_diagnosis") or ("NOT_YET_DIAGNOSED" if x.get("gate_a") == "FAIL_FIXED_N" else "-")
+    L = ["", "## CONSOLIDADO DEL PILOTO (FIXED_N)", "",
+         f"- Total CDs piloto = **{len(fixed)}** ({', '.join(sorted(x['cd'] for x in fixed))})",
+         f"- PASS_FIXED_N **{cnt('gate_a', 'PASS_FIXED_N_GEOMETRY')}** | FAIL_FIXED_N **{cnt('gate_a', 'FAIL_FIXED_N')}**",
+         f"- REPEAT_MATCH **{cnt('gate_c', 'REPEAT_MATCH')}** | DETERMINISM_DIVERGENCE **{cnt('gate_c', 'DETERMINISM_DIVERGENCE')}**",
+         f"- PASS_BAT_ROUTING **{cnt('gate_bat', 'PASS_BAT_ROUTING')}** | FAIL_BAT_ROUTING **{cnt('gate_bat', 'FAIL_BAT_ROUTING')}**",
+         f"- WEIGHT_VALIDATION_INCOMPLETE **{cnt('gate_b', 'WEIGHT_VALIDATION_INCOMPLETE')}** | OVERWEIGHT_LOWER_BOUND **{sum(1 for x in fixed if _ow(x))}**",
+         f"- PASS_OPERATIONAL_COVERAGE **{cnt('cobertura_operacional', 'PASS_OPERATIONAL_COVERAGE')}** | FAIL_OPERATIONAL_COVERAGE **{cnt('cobertura_operacional', 'FAIL_OPERATIONAL_COVERAGE')}**", "",
+         "| CD | N obj. | demanda cubicable | colocadas | faltantes | Gate A | Gate BAT | Gate C | Gate peso | Overweight LB | Cobertura | COMP | LAYOUT | wall R1 | wall R2 | CPU R1 | CPU R2 | cierre | OPERATIONAL_RESULT | TECHNICAL_DIAGNOSIS |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for x in sorted(fixed, key=lambda x: x["cd"]):
+        r = x.get("reconciliacion") or {}
+        cl = (x.get("cierre") or {}).get("closure_stage", "n/d")
+        L.append(f"| {x['cd']} | {x.get('n_objetivo')} | {fmt(r.get('demanda_cubicable'), 0)} | {x['cajas_colocadas']} | {x['faltantes']} | {x.get('gate_a')} | {x.get('gate_bat')} | {x.get('gate_c')} | "
+                 f"{x.get('gate_b')} | {'OVERWEIGHT_LOWER_BOUND' if _ow(x) else 'no'} | {x.get('cobertura_operacional')} | `{x['comp']}` | `{x['layout']}` | {_rep(x.get('wall_rep'), 0)} | {_rep(x.get('wall_rep'), 1)} | "
+                 f"{_rep(x.get('cpu_rep'), 0)} | {_rep(x.get('cpu_rep'), 1)} | {cl} | **{x.get('gate_a')}** | {x['_diag']} |")
+    L += ["", "CPU = `process_time` del proceso que ejecuta el CD (en modo multi-CD no incluye hijos). `n/d` = no registrado (corridas anteriores a este campo). "
+          "`cierre` sale solo de la metadata que RC1 deja en los pallets finales; `NOT_EXPOSED_BY_RC1` cuando RC1 no permite distinguirla.", "",
+          "## FIXED_N: resultados por CD (detalle)", "",
          f"- RESULT (A/B/C): PASS_FULL_PHYSICAL_VALIDATION {cnt('clasificacion', 'PASS_FULL_PHYSICAL_VALIDATION')} | PASS_FIXED_N_GEOMETRY {cnt('clasificacion', 'PASS_FIXED_N_GEOMETRY')} | FAIL_FIXED_N {cnt('clasificacion', 'FAIL_FIXED_N')}",
          f"- Gate A (cubicaje): PASS {cnt('gate_a', 'PASS_FIXED_N_GEOMETRY')}/{len(fixed)} | Gate B (peso): WEIGHT_VALIDATED {cnt('gate_b', 'WEIGHT_VALIDATED')}, "
          f"WEIGHT_VALIDATION_INCOMPLETE {cnt('gate_b', 'WEIGHT_VALIDATION_INCOMPLETE')} | Gate C (determinismo): REPEAT_MATCH {cnt('gate_c', 'REPEAT_MATCH')}, "
@@ -124,6 +163,10 @@ def reporte_fixed_n(fixed: list[dict]) -> list[str]:
     malos = [x for x in fixed if x.get("gate_bat") != "PASS_BAT_ROUTING"]
     if malos:
         L += ["", "### FAIL_BAT_ROUTING", ""] + [f"- {x['cd']}: {'; '.join(x.get('motivos_bat') or [])}" for x in malos]
+    ow = [x for x in fixed if _ow(x)]
+    if ow:
+        L += ["", "## OVERWEIGHT_LOWER_BOUND (pallet ya sobre 1430 kg con pesos faltantes contados como 0: el peso real es >=; NO esta fisicamente validado)", ""]
+        L += [f"- {x['cd']}: peso maximo calculado {fmt(x.get('peso_max'))} kg" + (f"; pallets: {', '.join(p['id'] + ' ' + str(p['peso']) + ' kg' for p in x['pallets_sobre_peso_hard'])}" if x.get("pallets_sobre_peso_hard") else "") for x in sorted(ow, key=lambda x: x['cd'])]
     pw = [x for x in fixed if (x.get("reconciliacion") or {}).get("peso_no_validable_cajas_en_solver")]
     if pw:
         L += ["", "## WEIGHT_VALIDATION_INCOMPLETE", ""] + [f"- {x['cd']}: {x['reconciliacion']['peso_no_validable_skus_en_solver']} SKU / {x['reconciliacion']['peso_no_validable_cajas_en_solver']} cajas con peso no validable (computadas como 0 kg)" for x in sorted(pw, key=lambda x: x['cd'])]
@@ -141,10 +184,11 @@ def main() -> int:
     ap.add_argument("--all-runs", action="store_true")
     a = ap.parse_args()
     filas, fallidas = cargar(Path(a.runs_dir), a.all_runs)
+    diag = cargar_diagnosticos(Path(a.runs_dir))
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     with open(out / "pilot_table.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLS, extrasaction="ignore"); w.writeheader(); w.writerows(filas)
-    md = reporte(filas, fallidas)
+    md = reporte(filas, fallidas, diag)
     (out / "pilot_report.md").write_text(md)
     print(md)
     print(f"-> {out / 'pilot_report.md'}  |  {out / 'pilot_table.csv'}")
