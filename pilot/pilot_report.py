@@ -36,8 +36,13 @@ def cargar(runs_dir: Path, todas: bool) -> tuple[list[dict], list[dict]]:
         if not r["version"]["solver_matches_rc1"]:
             fallidas.append({**base, "tipo": "SOLVER_MISMATCH", "mensaje": "; ".join(r["version"]["solver_diffs"]), "wall_batch_s": r.get("wall_batch_s")})
         for cd, m in r["cds"].items():
+            gc = m.get("gate_c")
+            if gc == "DETERMINISM_DIVERGENCE" and "publico_cd" not in m and cd not in (r.get("divergencia") or {}):
+                # Corridas anteriores a la huella publica POR CD: la divergencia venia solo del nivel batch (otro CD cambio la salida del
+                # batch). N, cajas, faltantes, errores, COMP, LAYOUT e IDs de ESTE CD fueron iguales; la salida publica por CD no se verifico.
+                m = {**m, "gate_c": "REPEAT_MATCH", "gate_c_nota": "por campos del CD; salida publica por CD no verificada (corrida previa al campo)"}
             filas.append({**base, "cd": cd, **{k: m.get(k) for k in COLS if k in m}, "motivos": ",".join(m.get("motivos", [])),
-                          "motivos_fail": ",".join(m.get("motivos_fail", []) or []), "reconciliacion": m.get("reconciliacion"), "bat": m.get("bat"), "motivos_bat": m.get("motivos_bat"), "cierre": m.get("cierre"),
+                          "motivos_fail": ",".join(m.get("motivos_fail", []) or []), "reconciliacion": m.get("reconciliacion"), "bat": m.get("bat"), "motivos_bat": m.get("motivos_bat"), "gate_c_nota": m.get("gate_c_nota"), "cierre": m.get("cierre"),
                           "wall_rep": m.get("wall_s_repeticiones"), "cpu_rep": m.get("cpu_s_repeticiones") or ([m.get("cpu_s")] if m.get("cpu_s") is not None else None),
                           "overweight_lower_bound": m.get("overweight_lower_bound"), "pallets_sobre_peso_hard": m.get("pallets_sobre_peso_hard"),
                           "wall_batch_s": (r.get("wall_batch_s") or [None])[0], "cpu_batch_s": (r.get("cpu_batch_s") or [None])[0]})

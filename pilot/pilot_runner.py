@@ -107,6 +107,15 @@ def _una_corrida(envios, maestro, uma, timing_log: Path, pobj: dict | None = Non
                "resumen_cd_sha": pc.sha16(resultado.resumen_cd_df.to_csv(index=True)),
                "cigarros_vapes_sha": pc.sha16(cig.to_csv(index=True))}
     skus_pallets = {cd: sorted({t.sku for p in pals for t in p.torres}) for cd, pals in por_cd.items()}
+
+    def _sha_cd(df, cd):  # huella de las filas de ESE CD (la salida publica del batch mezcla CDs: un CD distinto no debe contaminar a los demas)
+        if df is None or len(df) == 0 or "CD" not in df.columns:
+            return pc.sha16("")
+        return pc.sha16(df[df["CD"] == cd].to_csv(index=True))
+
+    for cd in cds:
+        cds[cd]["publico_cd"] = {"plan_picking": _sha_cd(resultado.plan_picking_df, cd), "resumen_cd": _sha_cd(resultado.resumen_cd_df, cd),
+                                 "cigarros_vapes": _sha_cd(cig, cd)}
     return {"wall_batch_s": round(wall, 1), "cpu_batch_s": round(cpu, 1), "cds": cds, "publico": publico,
             "cigarros_filas": cig.to_dict("records"), "skus_en_pallets": skus_pallets}
 
@@ -191,10 +200,10 @@ def main() -> int:
         for k, c in enumerate(corridas[1:], start=2):
             for cd in base["cds"]:
                 x, y = base["cds"][cd], c["cds"].get(cd)
-                if y is None or any(x[f] != y[f] for f in ("n_pallets", "cajas_colocadas", "faltantes", "errores", "comp", "layout", "ids")):
+                if y is None or any(x[f] != y[f] for f in ("n_pallets", "cajas_colocadas", "faltantes", "errores", "comp", "layout", "ids", "publico_cd")):
                     divergencia.setdefault(cd, []).append(k)
-            if (c["publico"] != base["publico"]):
-                divergencia.setdefault("_PUBLICO", []).append(k)
+            if c["publico"] != base["publico"]:  # nivel batch: INFORMATIVO (basta que UN CD cambie para que difiera); el gate C usa solo el nivel CD
+                divergencia.setdefault("_PUBLICO_BATCH", []).append(k)
 
     bat_conc: dict = {}
     if corridas and bat_esp is not None:
@@ -220,7 +229,7 @@ def main() -> int:
         extra: dict = {}
         if a.mode == "FIXED_N":
             n_obj = (registro.get("pallets_objetivo") or {}).get(cd)
-            rep_ok = None if len(corridas) < 2 else (cd not in divergencia and "_PUBLICO" not in divergencia)
+            rep_ok = None if len(corridas) < 2 else (cd not in divergencia)
             g = pc.gates_fixed_n(m, rec, n_obj, rep_ok)
             clase, dif = g["resultado"], (None if n_obj is None else m["n_pallets"] - n_obj)
             gb = (bconc or {}).get("gate_bat", "FAIL_BAT_ROUTING")
