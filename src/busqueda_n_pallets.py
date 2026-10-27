@@ -2,7 +2,7 @@
 binary search "no encontrado => infactible" de `_empacar_optimizado`
 (`packing_bloques.py`) por un modelo explícito de 4 estados por N
 (`FEASIBLE`/`UNKNOWN`/`INFEASIBLE_PROVEN`/`UNTESTED`) más un hard lower
-bound matemático (peso + volumen + Cajas por PH), y Policy A (descenso
+bound matemático (volumen + Cajas por PH -el peso NO participa, ver `hard_lower_bound`), y Policy A (descenso
 lineal persistente, tope de 5 solves) como única política de propuesta
 implementada -Policy B/C quedaron diseñadas (ver historial del chat de la
 sesión V6.12-R2-B0/R2-B) pero SIN implementar: los 6 CDs reales medidos
@@ -80,13 +80,11 @@ def hard_lower_bound(
     tope_pallet_por_sku: dict[str, int],
 ) -> int:
     """[V6.12-R2-B0, corregido tras auditoría] Piso matemático SEGURO de
-    pallets -nunca puede sobreestimar (ver `ceil_safe`). Combina 3 bounds
+    pallets -nunca puede sobreestimar (ver `ceil_safe`). Combina 2 bounds
     independientes, cada uno una relajación válida del problema real
-    (ningún N por debajo del máximo de los 3 puede colocar el 100% de la
+    (ningún N por debajo del máximo de los 2 puede colocar el 100% de la
     demanda, sin importar el algoritmo/arreglo real):
 
-    - peso: ningún pallet excede `PESO_TOPE_ELASTICO_KG` (cap YA duro en
-      producción, ver `validacion_peso.py`).
     - volumen: ningún pallet excede su volumen físico máximo admisible
       -footprint CON overhang (`PALLET_LARGO_EFECTIVO x PALLET_ANCHO_
       EFECTIVO`, el MISMO que usa el propio solver como su canvas
@@ -100,6 +98,16 @@ def hard_lower_bound(
       SKU dentro del propio solver -ningún SKU puede repartirse en menos
       pallets que `ceil(demanda_sku / tope_pallet_por_sku[sku])`.
 
+    [PATCH V6.12-RC2-A -"Weight informational only"] El bound de PESO
+    (`ceil(peso_total / PESO_TOPE_ELASTICO_KG)`) se ELIMINÓ: la semántica
+    contractual de `Peso bruto por unidad` no está validada, así que el peso
+    puede calcularse y reportarse pero NO puede participar en ninguna decisión
+    del solver. Con el término de peso, un pallet real de BK35 (4 SKU, 188
+    cajas, ocupación volumétrica mínima 0,79) fue declarado `INFEASIBLE_PROVEN`
+    solo porque su peso calculado (1604 kg, con cajas de peso 0 contadas como
+    0) superaba el tope elástico -una "prueba" falsa. Ver
+    `tests/test_peso_informativo.py`.
+
     Deliberadamente NO incluye ningún bound de footprint/huella 2D-3D
     combinada -calcularlo bien es el mismo problema NP-hard que resuelve
     el solver; cualquier heurística barata para estimarlo podría
@@ -107,22 +115,19 @@ def hard_lower_bound(
     de ser una prueba matemática."""
     from src.packing_columnar import _altura_presupuesto
 
-    peso_total = 0.0
     volumen_total = 0.0
     for sku, cantidad in pendientes.items():
         if cantidad <= 0 or not por_sku.get(sku):
             continue
-        # Cualquier candidata sirve: el volumen y el peso de UNA caja no
-        # cambian con la orientación, solo se re-permutan sus 3 lados.
+        # Cualquier candidata sirve: el volumen de UNA caja no cambia con la
+        # orientación, solo se re-permutan sus 3 lados.
         candidata = por_sku[sku][0]
-        peso_total += candidata.peso_unitario * cantidad
         volumen_total += candidata.largo * candidata.ancho * candidata.alto_caja * cantidad
 
     volumen_util_pallet = (
         config.PALLET_LARGO_EFECTIVO * config.PALLET_ANCHO_EFECTIVO * _altura_presupuesto()
     )
 
-    n_peso = ceil_safe(peso_total, config.PESO_TOPE_ELASTICO_KG) if peso_total > 0 else 1
     n_volumen = ceil_safe(volumen_total, volumen_util_pallet) if volumen_total > 0 else 1
 
     n_ph = 0
@@ -133,7 +138,7 @@ def hard_lower_bound(
         if tope and tope > 0:
             n_ph = max(n_ph, ceil_exacto_enteros(cantidad, tope))
 
-    return max(n_peso, n_volumen, n_ph, 1)
+    return max(n_volumen, n_ph, 1)
 
 
 # --- Tri-state probe + estado de búsqueda por N -----------------------------

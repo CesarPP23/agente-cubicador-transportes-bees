@@ -2364,7 +2364,7 @@ def _empacar_optimizado(
     encontrado dentro del presupuesto" nunca prueba nada, solo es
     `UNKNOWN`. El reemplazo:
 
-    1. Calcula un `hard_lower_bound` matemático (peso + volumen + Cajas
+    1. Calcula un `hard_lower_bound` matemático (volumen + Cajas
        por PH, `busqueda_n_pallets.hard_lower_bound`) -ningún N por debajo
        puede colocar el 100%, sin importar el algoritmo; se descarta
        GRATIS, sin gastar un solo sondeo.

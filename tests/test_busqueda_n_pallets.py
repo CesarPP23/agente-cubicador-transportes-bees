@@ -1,5 +1,5 @@
 """[V6.12-R2-B] Tests de `src.busqueda_n_pallets` -ceil_safe (nunca
-sobreestima por ruido flotante), hard_lower_bound (peso/volumen/PH,
+sobreestima por ruido flotante), hard_lower_bound (volumen/PH -el peso no participa,
 volumen con overhang corregido), BusquedaState (4 estados por N,
 UNTESTED nunca se confunde con una prueba, optimality_status exacto), y
 Policy A (descenso persistente: UNKNOWN no corta, respeta hard_lb y
@@ -74,13 +74,12 @@ def test_ceil_exacto_enteros_denominador_no_positivo_explota():
 # --- hard_lower_bound -----------------------------------------------------
 
 
-def test_hard_lower_bound_domina_peso():
+def test_hard_lower_bound_ignora_el_peso():
+    """[RC2-A] El peso es INFORMATIONAL_ONLY: una demanda muy pesada pero de volumen trivial ya NO sube el bound
+    (antes: ceil(10000 kg / 1430) = 7)."""
     pendientes = {"A": 100}
     por_sku = {"A": [_cand("A", largo=10, ancho=10, alto=10, peso_unitario=100.0)]}
-    # peso_total = 100*100 = 10000kg; PESO_TOPE_ELASTICO_KG=1430 -> ceil(6.99)=7
-    bound = hard_lower_bound(pendientes, por_sku, {})
-    assert bound == ceil_safe(100 * 100.0, config.PESO_TOPE_ELASTICO_KG)
-    assert bound > 1
+    assert hard_lower_bound(pendientes, por_sku, {}) == 1
 
 
 def test_hard_lower_bound_domina_ph():
