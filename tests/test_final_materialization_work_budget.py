@@ -153,6 +153,9 @@ def test_final_usa_6500_2650_40_y_el_probe_conserva_8000_sin_kwargs_de_lns(monke
 
 def test_pallets_objetivo_no_hereda_el_budget_final(monkeypatch):
     llamadas = _espiar_empacar_n(monkeypatch)
+    # [RC2-B] El incumbent exact-N (`_exact_n_incumbent`) hace que este caso sintetico no llegue al camino profundo con los kwargs que se espían; aca se valida lo que el
+    # solver de N fijo RECIBE cuando sí se lo invoca -se desactiva el incumbent (cubierto en tests/test_fixed_n_exact_n_incumbent.py).
+    monkeypatch.setattr(pb, "_exact_n_incumbent", lambda *a, **k: (None, {"incumbent": False, "motivo": "test"}))
     df = pd.DataFrame([{
         "SKU": "A", "Cajas_Remanente": 3, "Largo_Efectivo": 30.0, "Ancho_Efectivo": 20.0, "Alto_Efectivo": 20.0,
         "Cajas_Cama_Efectivo": 20, "Categoria_Normalizada": "Comestibles", "Nivel_Categoria": 6,

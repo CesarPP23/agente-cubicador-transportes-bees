@@ -1813,6 +1813,7 @@ def _empacar_n_pallets(
     lns_sin_mejora_max: int | None = None,
     omitir_repair: bool = False,
     presupuesto_global_expansiones: int | None = None,
+    solo_frente: bool = False,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1918,7 +1919,12 @@ def _empacar_n_pallets(
     Rescue(presupuesto_rescue_nodos) -> [sin Repair] -> Exact
     (presupuesto_exact_intentos) -> Global(presupuesto_global_expansiones) ->
     fallback al witness. El sondeo conserva Repair y Global por tiempo;
-    `Pallets_Objetivo` fijo conserva la cascada completa."""
+    `Pallets_Objetivo` fijo conserva la cascada completa.
+
+    [PATCH V6.12-RC2-B] `solo_frente` (default `False` = comportamiento de siempre): devuelve el resultado
+    del FRONT-END determinista (greedy de N fijo + reserva de grandes + DFS + LNS, todos acotados por
+    trabajo) ANTES de Rescue/Repair/Exact/Global. Es un modo interno explícito -no un timeout corto-;
+    lo usa `armar_pallets_bloques` con el `exact_n_incumbent` (ver `_exact_n_incumbent`)."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -2077,6 +2083,9 @@ def _empacar_n_pallets(
         pallets_final, sin_colocar_final = pallets_bt, sin_colocar_bt
     else:
         pallets_final, sin_colocar_final = pallets_greedy, sin_colocar_greedy
+
+    if solo_frente:  # [RC2-B] front-end determinista solamente: sin Rescue/Repair/Exact/Global
+        return pallets_final, sin_colocar_final
 
     # [PATCH V6.02, sección 3] Rescue mode -SOLO cuando quedó demanda sin
     # colocar. Nunca reemplaza el camino normal: intenta mejorarlo, y el
@@ -2563,6 +2572,57 @@ UMBRAL_CONSOLIDACION_FRACCION = 0.6
 MAX_INTENTOS_CONSOLIDACION = 3
 
 
+def _exact_n_incumbent(
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
+    cd: str,
+    contador: list[int],
+    n_objetivo: int,
+) -> tuple[list[PalletV5] | None, dict]:
+    """[PATCH V6.12-RC2-B -"EXACT_N_GREEDY_INCUMBENT"] Corre el constructor normal `_empacar` (el MISMO
+    que usa el camino abierto como incumbente; ~3 s de CPU en CDs de ~1000-1900 cajas).
+
+    Si cubre el 100% de la demanda con EXACTAMENTE `n_objetivo` pallets y 0 errores geométricos
+    (`validar_pallet_v5`), devuelve esa solución como `exact_n_incumbent` -pero NO la devuelve como
+    resultado final: `armar_pallets_bloques` la usa solo como red de seguridad si el front-end determinista
+    de N fijo (greedy fijo + reserva + DFS + LNS) no completa (ver la política allí). Un greedy puede dejar
+    pallets casi vacíos, así que no debe reemplazar a un reparto parejo que el front-end sí logra.
+
+    * `n_greedy > n_objetivo` o `n_greedy < n_objetivo`: no hay incumbent de N exacto -camino profundo
+      (sin política nueva para `n_greedy < N`; el caso queda registrado).
+
+    Devuelve `(incumbent | None, info)`; `info` siempre describe el caso."""
+    from src.validacion_v5 import validar_pallet_v5
+
+    demanda = sum(v for v in pendientes.values() if v > 0)
+    info: dict = {"n_objetivo": n_objetivo, "demanda": demanda, "incumbent": False}
+    if demanda <= 0:
+        info["motivo"] = "sin_demanda"
+        return None, info
+    pallets = _empacar(
+        dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, cd, contador,
+    )
+    colocadas = sum(t.cantidad for p in pallets for t in p.torres)
+    info.update(n_greedy=len(pallets), colocadas=colocadas)
+    if colocadas != demanda:
+        info["motivo"] = "greedy_no_cubre_el_100%"
+        return None, info
+    if len(pallets) != n_objetivo:
+        info["motivo"] = "n_greedy>N" if len(pallets) > n_objetivo else "n_greedy<N"
+        return None, info
+    errores = sum(len(validar_pallet_v5(p)) for p in pallets)
+    info["errores_geometricos"] = errores
+    if errores:
+        info["motivo"] = "validacion_geometrica_fallida"
+        return None, info
+    info.update(incumbent=True, motivo="n_greedy==N")
+    return pallets, info
+
+
 def armar_pallets_bloques(
     df_cd: pd.DataFrame, cd: str, contador: list[int] | None = None, pallets_objetivo: int | None = None,
     paralelo_lns: bool = True,
@@ -2691,10 +2751,46 @@ def armar_pallets_bloques(
         # respondida desde afuera. Tampoco se corre `_redistribuir_
         # dispersos`: mover contenido de un pallet a otro podría dejar
         # alguno vacío y reducir el conteo por debajo de lo pedido.
-        pallets, sin_colocar_barrido = _empacar_n_pallets(
-            pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
-            cd, contador, pallets_objetivo, paralelo_lns=paralelo_lns, priorizar_grandes=True,
+        # [PATCH V6.12-RC2-B -"EXACT_N_GREEDY_INCUMBENT"] Política:
+        #   1. `_empacar` -si cubre el 100% con EXACTAMENTE N pallets y 0 errores, es el `exact_n_incumbent`
+        #      (NO se retorna todavía).
+        #   2. Con incumbent: se corre SOLO el front-end determinista de N fijo (`solo_frente=True`: greedy
+        #      fijo + reserva + DFS + LNS, todos acotados por trabajo, sin Rescue/Repair/Exact/Global).
+        #      Si el front-end completa (N exacto, 100%, 0 errores) se usa su solución; si no, gana el
+        #      incumbent y se corta -la cascada profunda NO corre.
+        #   3. Sin incumbent (n_greedy>N, n_greedy<N, no cubre, no valida): camino profundo de siempre.
+        incumbent, info_inc = (
+            _exact_n_incumbent(
+                pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto,
+                cd, contador, pallets_objetivo,
+            )
+            if not sin_colocar else (None, {"n_objetivo": pallets_objetivo, "incumbent": False, "motivo": "demanda_inalcanzable_previa"})
         )
+        if incumbent is not None:
+            from src.validacion_v5 import validar_pallet_v5
+
+            pallets_fe, sin_fe = _empacar_n_pallets(
+                dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+                cd, contador, pallets_objetivo, paralelo_lns=paralelo_lns, priorizar_grandes=True, solo_frente=True,
+            )
+            frente_completa = (
+                not sin_fe and len(pallets_fe) == pallets_objetivo and all(validar_pallet_v5(p) == [] for p in pallets_fe)
+            )
+            if frente_completa:
+                pallets, sin_colocar_barrido = pallets_fe, {}
+                info_inc["resultado"] = "FRENTE_COMPLETO"
+            else:
+                pallets, sin_colocar_barrido = incumbent, {}
+                info_inc["resultado"] = "INCUMBENT_USADO"
+                info_inc["frente_colocadas"] = sum(t.cantidad for p in pallets_fe for t in p.torres)
+        else:
+            pallets, sin_colocar_barrido = _empacar_n_pallets(
+                pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
+                cd, contador, pallets_objetivo, paralelo_lns=paralelo_lns, priorizar_grandes=True,
+            )
+            info_inc["resultado"] = "CAMINO_PROFUNDO"
+        if pallets:
+            pallets[-1].metadata["fixed_n_exact_n_incumbent"] = info_inc
         for sku, cant in sin_colocar_barrido.items():
             sin_colocar[sku] = sin_colocar.get(sku, 0) + cant
     else:
