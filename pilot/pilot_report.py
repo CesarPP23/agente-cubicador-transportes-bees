@@ -16,7 +16,7 @@ import pilot_common as pc  # noqa: E402
 COLS = ["run_id", "fecha", "case_id", "input_hash", "cd", "demanda_cajas", "skus", "n_pallets", "cajas_colocadas", "faltantes", "errores",
         "peso_max", "altura_max", "pallets_parciales", "altura_media", "ocupacion_media", "origen", "optimality_status", "wall_s", "cpu_s",
         "comp", "layout", "version", "n_pallets_operacion", "diferencia_vs_operacion", "resultado_fisico", "observaciones",
-        "clasificacion", "pilot_exception", "motivos", "n_objetivo", "n_producido", "gate_a", "gate_b", "gate_c", "motivos_fail", "bat_handling", "gate_bat", "cobertura_operacional"]
+        "clasificacion", "pilot_exception", "motivos", "n_objetivo", "n_producido", "gate_a", "gate_c", "motivos_fail", "bat_handling", "gate_bat", "cobertura_operacional"]
 
 
 def cargar_diagnosticos(runs_dir: Path) -> dict:
@@ -44,7 +44,7 @@ def cargar(runs_dir: Path, todas: bool) -> tuple[list[dict], list[dict]]:
             filas.append({**base, "cd": cd, **{k: m.get(k) for k in COLS if k in m}, "motivos": ",".join(m.get("motivos", [])),
                           "motivos_fail": ",".join(m.get("motivos_fail", []) or []), "reconciliacion": m.get("reconciliacion"), "bat": m.get("bat"), "motivos_bat": m.get("motivos_bat"), "gate_c_nota": m.get("gate_c_nota"), "cierre": m.get("cierre"),
                           "wall_rep": m.get("wall_s_repeticiones"), "cpu_rep": m.get("cpu_s_repeticiones") or ([m.get("cpu_s")] if m.get("cpu_s") is not None else None),
-                          "overweight_lower_bound": m.get("overweight_lower_bound"), "pallets_sobre_peso_hard": m.get("pallets_sobre_peso_hard"),
+                          "weight_data_status": "WEIGHT_DATA_UNVALIDATED",
                           "wall_batch_s": (r.get("wall_batch_s") or [None])[0], "cpu_batch_s": (r.get("cpu_batch_s") or [None])[0]})
     if not todas:
         ult: dict = {}
@@ -106,12 +106,6 @@ def reporte(filas: list[dict], fallidas: list[dict], diag: dict | None = None) -
     return "\n".join(l for l in L if l is not None) + "\n"
 
 
-def _ow(x: dict) -> bool:
-    """OVERWEIGHT_LOWER_BOUND: algun pallet YA supera PESO_HARD_KG (1430) con cajas de peso 0 contadas como 0 kg => peso real >= calculado."""
-    v = x.get("overweight_lower_bound")
-    return bool(v) if v is not None else (x.get("peso_max") or 0) > 1430  # corridas previas al campo: se deriva del peso maximo
-
-
 def _rep(lst, i):
     return fmt(lst[i]) if lst and len(lst) > i and lst[i] is not None else "n/d"
 
@@ -119,7 +113,7 @@ def _rep(lst, i):
 def reporte_fixed_n(fixed: list[dict], diag: dict) -> list[str]:
     """Seccion FIXED_N: Pallets_Objetivo = posiciones reales y obligatorias del cubicador. Cigarros/Vapes (BAT) NO consumen N, no
     participan en geometria ni ocupacion y no son faltantes: es demanda ATENDIDA por otro flujo (hoja `Cigarros_Vapes`).
-    Gates: A cubicaje, B peso, C determinismo, BAT ruteo; cobertura operacional = A y BAT."""
+    Gates: A cubicaje (N fijo), BAT ruteo, C determinismo; cobertura operacional = A y BAT. El PESO es INFORMATIONAL_ONLY: no participa en ningun gate."""
     cnt = lambda k, v: sum(1 for x in fixed if x.get(k) == v)  # noqa: E731
     for x in fixed:
         d = diag.get(x["cd"], {})
@@ -129,33 +123,31 @@ def reporte_fixed_n(fixed: list[dict], diag: dict) -> list[str]:
          f"- PASS_FIXED_N **{cnt('gate_a', 'PASS_FIXED_N_GEOMETRY')}** | FAIL_FIXED_N **{cnt('gate_a', 'FAIL_FIXED_N')}**",
          f"- REPEAT_MATCH **{cnt('gate_c', 'REPEAT_MATCH')}** | DETERMINISM_DIVERGENCE **{cnt('gate_c', 'DETERMINISM_DIVERGENCE')}**",
          f"- PASS_BAT_ROUTING **{cnt('gate_bat', 'PASS_BAT_ROUTING')}** | FAIL_BAT_ROUTING **{cnt('gate_bat', 'FAIL_BAT_ROUTING')}**",
-         f"- WEIGHT_VALIDATION_INCOMPLETE **{cnt('gate_b', 'WEIGHT_VALIDATION_INCOMPLETE')}** | OVERWEIGHT_LOWER_BOUND **{sum(1 for x in fixed if _ow(x))}**",
          f"- PASS_OPERATIONAL_COVERAGE **{cnt('cobertura_operacional', 'PASS_OPERATIONAL_COVERAGE')}** | FAIL_OPERATIONAL_COVERAGE **{cnt('cobertura_operacional', 'FAIL_OPERATIONAL_COVERAGE')}**", "",
-         "| CD | N obj. | demanda cubicable | colocadas | faltantes | Gate A | Gate BAT | Gate C | Gate peso | Overweight LB | Cobertura | COMP | LAYOUT | wall R1 | wall R2 | CPU R1 | CPU R2 | cierre | OPERATIONAL_RESULT | TECHNICAL_DIAGNOSIS |",
-         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+         "| CD | N obj. | demanda cubicable | colocadas | faltantes | Gate A | Gate BAT | Gate C | Cobertura | COMP | LAYOUT | wall R1 | wall R2 | CPU R1 | CPU R2 | cierre | OPERATIONAL_RESULT | TECHNICAL_DIAGNOSIS |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for x in sorted(fixed, key=lambda x: x["cd"]):
         r = x.get("reconciliacion") or {}
         cl = (x.get("cierre") or {}).get("closure_stage", "n/d")
         L.append(f"| {x['cd']} | {x.get('n_objetivo')} | {fmt(r.get('demanda_cubicable'), 0)} | {x['cajas_colocadas']} | {x['faltantes']} | {x.get('gate_a')} | {x.get('gate_bat')} | {x.get('gate_c')} | "
-                 f"{x.get('gate_b')} | {'OVERWEIGHT_LOWER_BOUND' if _ow(x) else 'no'} | {x.get('cobertura_operacional')} | `{x['comp']}` | `{x['layout']}` | {_rep(x.get('wall_rep'), 0)} | {_rep(x.get('wall_rep'), 1)} | "
+                 f"{x.get('cobertura_operacional')} | `{x['comp']}` | `{x['layout']}` | {_rep(x.get('wall_rep'), 0)} | {_rep(x.get('wall_rep'), 1)} | "
                  f"{_rep(x.get('cpu_rep'), 0)} | {_rep(x.get('cpu_rep'), 1)} | {cl} | **{x.get('gate_a')}** | {x['_diag']} |")
     L += ["", "CPU = `process_time` del proceso que ejecuta el CD (en modo multi-CD no incluye hijos). `n/d` = no registrado (corridas anteriores a este campo). "
           "`cierre` sale solo de la metadata que RC1 deja en los pallets finales; `NOT_EXPOSED_BY_RC1` cuando RC1 no permite distinguirla.", "",
           "## FIXED_N: resultados por CD (detalle)", "",
-         f"- RESULT (A/B/C): PASS_FULL_PHYSICAL_VALIDATION {cnt('clasificacion', 'PASS_FULL_PHYSICAL_VALIDATION')} | PASS_FIXED_N_GEOMETRY {cnt('clasificacion', 'PASS_FIXED_N_GEOMETRY')} | FAIL_FIXED_N {cnt('clasificacion', 'FAIL_FIXED_N')}",
-         f"- Gate A (cubicaje): PASS {cnt('gate_a', 'PASS_FIXED_N_GEOMETRY')}/{len(fixed)} | Gate B (peso): WEIGHT_VALIDATED {cnt('gate_b', 'WEIGHT_VALIDATED')}, "
-         f"WEIGHT_VALIDATION_INCOMPLETE {cnt('gate_b', 'WEIGHT_VALIDATION_INCOMPLETE')} | Gate C (determinismo): REPEAT_MATCH {cnt('gate_c', 'REPEAT_MATCH')}, "
+         f"- RESULT (Gate A): PASS_FIXED_N_GEOMETRY {cnt('clasificacion', 'PASS_FIXED_N_GEOMETRY')} | FAIL_FIXED_N {cnt('clasificacion', 'FAIL_FIXED_N')}",
+         f"- Gate A (cubicaje): PASS {cnt('gate_a', 'PASS_FIXED_N_GEOMETRY')}/{len(fixed)} | Gate C (determinismo): REPEAT_MATCH {cnt('gate_c', 'REPEAT_MATCH')}, "
          f"DETERMINISM_DIVERGENCE {cnt('gate_c', 'DETERMINISM_DIVERGENCE')}, NOT_CHECKED {cnt('gate_c', 'NOT_CHECKED')}",
          f"- Gate BAT (ruteo): PASS_BAT_ROUTING {cnt('gate_bat', 'PASS_BAT_ROUTING')}/{len(fixed)} | Cobertura operacional (A y BAT): PASS_OPERATIONAL_COVERAGE {cnt('cobertura_operacional', 'PASS_OPERATIONAL_COVERAGE')}/{len(fixed)}", "",
-         "| CD | N obj. | N prod. | demanda original (cajas teor.) | demanda cubicable | efectiva solver | colocada | otras exclusiones (motivo) | faltantes | errores | peso max* | altura max | altura media | parciales | ocupacion | COMP | LAYOUT | wall s | CPU s | A | B | C | BAT | RESULT | cobertura operacional |",
-         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+         "| CD | N obj. | N prod. | demanda original (cajas teor.) | demanda cubicable | efectiva solver | colocada | otras exclusiones (motivo) | faltantes | errores | peso calculado max (informativo) | altura max | altura media | parciales | ocupacion | COMP | LAYOUT | wall s | CPU s | A | C | BAT | RESULT | cobertura operacional |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for x in sorted(fixed, key=lambda x: x["cd"]):
         r = x.get("reconciliacion") or {}
         mot = "; ".join(f"{k}: {v['skus']} SKU/{v['cajas_teoricas']} cj" for k, v in (r.get("otras_exclusiones_por_motivo") or {}).items()) or "ninguna"
         L.append(f"| {x['cd']} | {x.get('n_objetivo')} | {x.get('n_producido')} | {fmt(r.get('cajas_originales'), 3)} ({r.get('skus_originales', '-')} SKU) | {fmt(r.get('demanda_cubicable'), 3)} | {r.get('demanda_efectiva_solver', '-')} ({r.get('skus_solver', '-')} SKU) | "
                  f"{x['cajas_colocadas']} | {mot} | {x['faltantes']} | {x['errores']} | {fmt(x.get('peso_max'))} | {fmt(x.get('altura_max'))} | {fmt(x.get('altura_media'))} | {x.get('pallets_parciales')} | "
-                 f"{fmt(x.get('ocupacion_media'), 3)} | `{x['comp']}` | `{x['layout']}` | {fmt(x.get('wall_s'))} | {fmt(x.get('cpu_s'))} | {x.get('gate_a')} | {x.get('gate_b')} | {x.get('gate_c')} | {x.get('gate_bat')} | **{x['clasificacion']}** | **{x.get('cobertura_operacional')}** |")
-    L += ["", "\\* El peso maximo computa como 0 kg las cajas con peso no validable (WEIGHT_VALIDATION_INCOMPLETE): es un limite inferior, no un peso validado.", "",
+                 f"{fmt(x.get('ocupacion_media'), 3)} | `{x['comp']}` | `{x['layout']}` | {fmt(x.get('wall_s'))} | {fmt(x.get('cpu_s'))} | {x.get('gate_a')} | {x.get('gate_c')} | {x.get('gate_bat')} | **{x['clasificacion']}** | **{x.get('cobertura_operacional')}** |")
+    L += ["", "El peso calculado es solo informativo (ver `WEIGHT_DATA_STATUS` abajo); no participa en ningun gate.", "",
           "## Cigarros / Vapes: demanda separada hacia la hoja `Cigarros_Vapes` (no es demanda excluida)", "",
           "Flujo: demanda total -> (demanda no BAT -> cubicador, consume N) + (Cigarros/Vapes -> hoja `Cigarros_Vapes` para el HUB). BAT no consume N, no modifica `Pallets_Objetivo`, "
           "no participa en geometria ni ocupacion y no cuenta como faltante. Artefacto por corrida: `pilot/runs/<run_id>/Cigarros_Vapes.xlsx` (hojas `Cigarros_Vapes` con detalle SKU y `Resumen_CD`).", "",
@@ -168,13 +160,15 @@ def reporte_fixed_n(fixed: list[dict], diag: dict) -> list[str]:
     malos = [x for x in fixed if x.get("gate_bat") != "PASS_BAT_ROUTING"]
     if malos:
         L += ["", "### FAIL_BAT_ROUTING", ""] + [f"- {x['cd']}: {'; '.join(x.get('motivos_bat') or [])}" for x in malos]
-    ow = [x for x in fixed if _ow(x)]
-    if ow:
-        L += ["", "## OVERWEIGHT_LOWER_BOUND (pallet ya sobre 1430 kg con pesos faltantes contados como 0: el peso real es >=; NO esta fisicamente validado)", ""]
-        L += [f"- {x['cd']}: peso maximo calculado {fmt(x.get('peso_max'))} kg" + (f"; pallets: {', '.join(p['id'] + ' ' + str(p['peso']) + ' kg' for p in x['pallets_sobre_peso_hard'])}" if x.get("pallets_sobre_peso_hard") else "") for x in sorted(ow, key=lambda x: x['cd'])]
-    pw = [x for x in fixed if (x.get("reconciliacion") or {}).get("peso_no_validable_cajas_en_solver")]
-    if pw:
-        L += ["", "## WEIGHT_VALIDATION_INCOMPLETE", ""] + [f"- {x['cd']}: {x['reconciliacion']['peso_no_validable_skus_en_solver']} SKU / {x['reconciliacion']['peso_no_validable_cajas_en_solver']} cajas con peso no validable (computadas como 0 kg)" for x in sorted(pw, key=lambda x: x['cd'])]
+    L += ["", "## WEIGHT_DATA_STATUS = WEIGHT_DATA_UNVALIDATED (informativo; no participa en ningun gate)", "",
+          "La semantica contractual de `Peso bruto por unidad` no esta validada por negocio/datos. Los valores se muestran tal cual se calcularon, sin interpretarlos como validos, invalidos, sobrepeso ni bajo peso. "
+          "Estado: DEFERRED_BUSINESS_DATA_VALIDATION.", "",
+          "| CD | peso_calculado max (kg) | cajas_con_peso_0 | skus_sin_peso_validable | WEIGHT_DATA_STATUS |", "|---|---|---|---|---|"]
+    for x in sorted(fixed, key=lambda x: x["cd"]):
+        r = x.get("reconciliacion") or {}
+        c0 = r.get("cajas_con_peso_0", r.get("peso_no_validable_cajas_en_solver"))  # corridas previas: el campo equivalente (en este input todas eran valor 0)
+        sk = r.get("skus_sin_peso_validable", r.get("peso_no_validable_skus_en_solver"))
+        L.append(f"| {x['cd']} | {fmt(x.get('peso_max'))} | {c0 if c0 is not None else 'n/d'} | {sk if sk is not None else 'n/d'} | WEIGHT_DATA_UNVALIDATED |")
     L += ["", "## Requerimientos de producto detectados (NO se modifican durante el piloto)", "",
           "El exportador productivo hoy emite la hoja `Cigarros` (`exportar.construir_demanda_cigarros_df`) con columnas `CD, Nombre_CD, SKU, Descripcion, Unidades_Demanda, Unidades_Por_Caja, Cajas_Teoricas, Total_Unidades_CD, Cajas_Consolidacion_Necesarias_CD`. Frente al contrato operacional:",
           "- la hoja se llama `Cigarros`, no `Cigarros_Vapes`;", "- faltan `Categoría` y `Subcategoría` en el detalle, y la columna se llama `Cajas_Consolidacion_Necesarias_CD` (contrato: `Cajas_Consolidacion_CD`);",

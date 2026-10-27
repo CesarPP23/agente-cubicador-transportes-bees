@@ -50,7 +50,6 @@ def _cronometrar_cds(timing_log: Path, ckpt_log: Path | None = None):
                 from src.validacion_v5 import validar_pallet_v5
 
                 m = pc.metricas_cd(r, original_firma, validar_pallet_v5, config, _area_union_xy)
-                m.pop("pallets_sobre_peso_hard", None)
                 m.update(cd=cd, rep=os.environ.get("PILOT_REP"), cpu_s=cpu, wall_s=wall, cierre=pc.etapa_cierre(r, m["faltantes"]), fecha=datetime.now().isoformat(timespec="seconds"),
                          nota="parcial: IDs no canonicos; el registro final es run.json")
                 with open(ckpt_log, "a") as f:
@@ -233,7 +232,7 @@ def main() -> int:
             g = pc.gates_fixed_n(m, rec, n_obj, rep_ok)
             clase, dif = g["resultado"], (None if n_obj is None else m["n_pallets"] - n_obj)
             gb = (bconc or {}).get("gate_bat", "FAIL_BAT_ROUTING")
-            extra = {"n_objetivo": n_obj, "n_producido": m["n_pallets"], **{k: g[k] for k in ("gate_a", "gate_b", "gate_c", "motivos_fail")},
+            extra = {"n_objetivo": n_obj, "n_producido": m["n_pallets"], **{k: g[k] for k in ("gate_a", "gate_c", "motivos_fail")}, "weight_data_status": "WEIGHT_DATA_UNVALIDATED",
                      "gate_bat": gb, "motivos_bat": (bconc or {}).get("motivos_bat", ["SIN_CONCILIACION_BAT"]),
                      "cobertura_operacional": pc.cobertura_operacional(g["gate_a"], gb), "reconciliacion": rec, "bat": bconc, "bat_handling": a.bat_handling}
             if gb != "PASS_BAT_ROUTING":
@@ -281,7 +280,7 @@ def main() -> int:
     (out / "run.json").write_text(json.dumps(registro, indent=2, default=str))
     print(f"[{run_id}] {ver['version']}  wall_batch={registro['wall_batch_s']}  PILOT_EXCEPTION={registro['pilot_exception']}")
     for cd, r in registro["cds"].items():
-        gates = f" [closure={r['cierre']['closure_stage']} OVERWEIGHT_LB={r['overweight_lower_bound']} A={r['gate_a']} B={r['gate_b']} C={r['gate_c']} BAT={r['gate_bat']} -> {r['cobertura_operacional']}] N_obj={r['n_objetivo']}" if "gate_a" in r else ""
+        gates = f" [closure={r['cierre']['closure_stage']} A={r['gate_a']} C={r['gate_c']} BAT={r['gate_bat']} -> {r['cobertura_operacional']}] N_obj={r['n_objetivo']}" if "gate_a" in r else ""
         print(f"  {cd}: N={r['n_pallets']} cajas={r['cajas_colocadas']}/{r['demanda_cajas']} falt={r['faltantes']} err={r['errores']} "
               f"{r['origen']} COMP={r['comp']} LAYOUT={r['layout']} wall={r['wall_s']}s -> {r['clasificacion']}{gates}{' PILOT_EXCEPTION' if r['pilot_exception'] else ''}")
     if registro["excepcion"]:

@@ -13,11 +13,13 @@ RC_TAG = "v6.12-rc1"
 SOLVER_PATHS = ["src", "config.py", "models.py"]  # lo que define el comportamiento del solver
 CLASES = ("BETTER", "EQUIVALENT", "WORSE", "INVALID")
 SIN_OPERACION = "NO_OPERATION_DATA"
-# Modo FIXED_N (Pallets_Objetivo = posiciones reales y obligatorias de operacion). Tres gates independientes:
-#   A cubicaje:   PASS_FIXED_N_GEOMETRY / FAIL_FIXED_N
-#   B peso:       WEIGHT_VALIDATED / WEIGHT_VALIDATION_INCOMPLETE (cajas con peso 0/no validable se computan como 0 kg)
+# Modo FIXED_N (Pallets_Objetivo = posiciones reales y obligatorias de operacion). Gates:
+#   A cubicaje:     PASS_FIXED_N_GEOMETRY / FAIL_FIXED_N
+#   BAT:            PASS_BAT_ROUTING / FAIL_BAT_ROUTING
 #   C determinismo: REPEAT_MATCH / DETERMINISM_DIVERGENCE / NOT_CHECKED (--repeat 1)
-# RESULT final: FAIL_FIXED_N | PASS_FIXED_N_GEOMETRY | PASS_FULL_PHYSICAL_VALIDATION (solo si A, B y C pasan).
+#   Cobertura operacional = A y BAT.
+# PESO = INFORMATIONAL_ONLY: la semantica contractual de `Peso bruto por unidad` no esta validada, asi que el peso NO participa en ningun
+# PASS/FAIL, factibilidad, cobertura ni clasificacion. Solo se muestra como observacion (WEIGHT_DATA_UNVALIDATED), sin interpretarlo.
 BAT_MANEJO = ("A", "B", "C", "UNCONFIRMED")  # A: dentro de los N pallets; B: viaja fuera; C: posicion adicional
 
 
@@ -70,7 +72,6 @@ def metricas_cd(pallets, firma, validar, config, area_union_xy) -> dict:
     pesos = [p.peso_estimado for p in pallets] or [0.0]
     area_pallet = config.PALLET_LARGO * config.PALLET_ANCHO
     ocup = [area_union_xy(p.torres) / area_pallet for p in pallets] or [0.0]
-    sobrepeso = [{"id": p.id, "peso": round(p.peso_estimado, 2)} for p in pallets if p.peso_estimado > config.PESO_HARD_KG]
     opt = next((p.metadata["optimality_status"] for p in pallets if "optimality_status" in p.metadata), None)
     if opt is None:
         origen = "GREEDY_O_PALLETS_OBJETIVO"  # un solo pallet greedy, o CD con Pallets_Objetivo fijo
@@ -84,8 +85,7 @@ def metricas_cd(pallets, firma, validar, config, area_union_xy) -> dict:
         "peso_max": max(pesos), "altura_max": max(alturas), "altura_media": sum(alturas) / len(alturas),
         "pallets_parciales": sum(1 for a in alturas if a < config.ALTURA_TOLERADO_MIN),
         "ocupacion_media": sum(ocup) / len(ocup),
-        # Pallets que YA superan PESO_HARD_KG con las cajas de peso 0/no validable contadas como 0 kg: el peso real solo puede ser >=.
-        "pallets_sobre_peso_hard": sobrepeso, "overweight_lower_bound": bool(sobrepeso),
+        "weight_data_status": "WEIGHT_DATA_UNVALIDATED",  # informativo: peso_max es el valor calculado, sin interpretar
         "origen": origen, "optimality_status": (opt or {}).get("status"), "hard_lower_bound": (opt or {}).get("hard_lower_bound"),
         "n_greedy": (opt or {}).get("n_greedy"),
         "comp": hash_comp(pallets), "layout": hash_layout(pallets, firma),
@@ -255,6 +255,9 @@ def reconciliar_demanda(envios, maestro, uma, pobj: dict | None) -> dict:
             "otras_exclusiones_cajas": round(float(ex["Cajas Teóricas"].sum()), 3), "otras_exclusiones_skus": int(len(ex)), "otras_exclusiones_por_motivo": motivos,
             "bat_skus": int(b["SKU"].nunique()), "bat_cajas_teoricas": round(float(b["Cajas Teóricas"].sum()), 3), "bat_unidades": int(b["Unidades"].sum()),
             "bat_cajas_consolidacion": len(cajas_bat.get(cd, [])),
+            # Informativo (WEIGHT_DATA_UNVALIDATED): no participa en ningun gate.
+            "cajas_con_peso_0": int(c.loc[c["Peso bruto por unidad"] == 0, "Cajas_Remanente"].sum()),
+            "skus_sin_peso_validable": int(c["Peso_No_Validable"].sum()),
             "peso_no_validable_skus_en_solver": int(c["Peso_No_Validable"].sum()),
             "peso_no_validable_cajas_en_solver": int(c.loc[c["Peso_No_Validable"], "Cajas_Remanente"].sum()),
             "geom_degradada_skus_en_solver": int((c["Fuente_Geometria"] == "MAESTRO_IMPOSIBLE_DEGRADADO").sum()),
@@ -264,11 +267,10 @@ def reconciliar_demanda(envios, maestro, uma, pobj: dict | None) -> dict:
 
 
 def gates_fixed_n(m: dict | None, rec: dict | None, n_objetivo: int | None, repeticion_ok: bool | None, excepcion: bool = False) -> dict:
-    """Gate A (cubicaje), B (peso), C (determinismo) y RESULT. Los Cigarros/BAT excluidos por diseno NO son faltantes
-    del solver, y los pesos 0 NO son fallo de cubicaje -pero impiden afirmar PASS_FULL_PHYSICAL_VALIDATION."""
+    """Gate A (cubicaje N fijo), Gate C (determinismo) y RESULT (= Gate A). Los Cigarros/BAT separados NO son faltantes del solver. El peso es
+    INFORMATIONAL_ONLY y no interviene en ningun gate."""
     if excepcion or m is None:
-        return {"gate_a": "FAIL_FIXED_N", "gate_b": "WEIGHT_VALIDATION_INCOMPLETE", "gate_c": "NOT_CHECKED", "resultado": "FAIL_FIXED_N",
-                "motivos_fail": ["EXCEPTION_O_SIN_RESULTADO"]}
+        return {"gate_a": "FAIL_FIXED_N", "gate_c": "NOT_CHECKED", "resultado": "FAIL_FIXED_N", "motivos_fail": ["EXCEPTION_O_SIN_RESULTADO"]}
     motivos = []
     if n_objetivo is None:
         motivos.append("SIN_N_OBJETIVO")
@@ -283,16 +285,8 @@ def gates_fixed_n(m: dict | None, rec: dict | None, n_objetivo: int | None, repe
     if rec is not None and not rec.get("identidad_ok", False):
         motivos.append("RECONCILIACION_DEMANDA_NO_CIERRA")
     a = "FAIL_FIXED_N" if motivos else "PASS_FIXED_N_GEOMETRY"
-    sin_peso = (rec or {}).get("peso_no_validable_cajas_en_solver", 0)
-    b = "WEIGHT_VALIDATED" if rec is not None and sin_peso == 0 else "WEIGHT_VALIDATION_INCOMPLETE"
     c = "NOT_CHECKED" if repeticion_ok is None else ("REPEAT_MATCH" if repeticion_ok else "DETERMINISM_DIVERGENCE")
-    if a == "FAIL_FIXED_N":
-        res = "FAIL_FIXED_N"
-    elif b == "WEIGHT_VALIDATED" and c == "REPEAT_MATCH":
-        res = "PASS_FULL_PHYSICAL_VALIDATION"
-    else:
-        res = "PASS_FIXED_N_GEOMETRY"
-    return {"gate_a": a, "gate_b": b, "gate_c": c, "resultado": res, "motivos_fail": motivos}
+    return {"gate_a": a, "gate_c": c, "resultado": a, "motivos_fail": motivos}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -396,7 +390,7 @@ def conciliar_bat(cd: str, esperado, hoja_det, skus_en_pallets: set, consol_espe
 
 
 def cobertura_operacional(gate_a: str, gate_bat: str) -> str:
-    """PASS_OPERATIONAL_COVERAGE solo si pasan el cubicaje (N fijo) Y el ruteo BAT. El peso (gate B) sigue separado."""
+    """PASS_OPERATIONAL_COVERAGE solo si pasan el cubicaje (N fijo) Y el ruteo BAT. El peso es informativo (no participa)."""
     return "PASS_OPERATIONAL_COVERAGE" if gate_a == "PASS_FIXED_N_GEOMETRY" and gate_bat == "PASS_BAT_ROUTING" else "FAIL_OPERATIONAL_COVERAGE"
 
 

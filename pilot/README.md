@@ -29,15 +29,17 @@ Harness de **medición y reporte**. No es una versión del solver y **no recalib
 
 ## Modo FIXED_N (`--mode FIXED_N`)
 
-`Pallets_Objetivo` = posiciones reales y obligatorias de operación. El runner carga la hoja con el cargador oficial (`src/validacion.py::cargar_pallets_objetivo`), se la pasa al pipeline (`pallets_objetivo_por_cd`) y evalúa **tres gates independientes** por CD:
+`Pallets_Objetivo` = posiciones reales y obligatorias de operación. El runner carga la hoja con el cargador oficial (`src/validacion.py::cargar_pallets_objetivo`), se la pasa al pipeline (`pallets_objetivo_por_cd`) y evalúa gates independientes por CD (el **peso es solo informativo**, ver abajo):
 
 | gate | valores | criterio |
 |---|---|---|
 | A cubicaje | `PASS_FIXED_N_GEOMETRY` / `FAIL_FIXED_N` | exactamente N objetivo, 100 % de la demanda elegible colocada, 0 faltantes, 0 errores geométricos |
-| B peso | `WEIGHT_VALIDATED` / `WEIGHT_VALIDATION_INCOMPLETE` | incompleto si hay cajas con peso 0/no validable en el solver (RC1 las computa como 0 kg) |
+| BAT | `PASS_BAT_ROUTING` / `FAIL_BAT_ROUTING` | ver sección Cigarros/Vapes |
 | C determinismo | `REPEAT_MATCH` / `DETERMINISM_DIVERGENCE` / `NOT_CHECKED` | requiere `--repeat >= 2`: N, cajas, COMP, LAYOUT, IDs y salida pública idénticos |
 
-`RESULT` = `FAIL_FIXED_N` | `PASS_FIXED_N_GEOMETRY` | `PASS_FULL_PHYSICAL_VALIDATION` (solo con A, B y C en verde). Cigarros/BAT excluidos por diseño **no** cuentan como faltantes, y los pesos 0 **no** son fallo de cubicaje: solo impiden afirmar más de lo que los datos permiten. Por cada CD se registra la reconciliación de demanda (originales, efectiva del solver, excluida y motivo, BAT, pesos no validables) y `N_OBJETIVO`/`N_PRODUCIDO`. El reporte separa *cajas cubicadas* de *consolidaciones BAT* (`--bat-handling A|B|C` solo se registra; por defecto `UNCONFIRMED`).
+`RESULT` = gate A: `FAIL_FIXED_N` | `PASS_FIXED_N_GEOMETRY`. Cobertura operacional = gate A y gate BAT. Cigarros/BAT separados **no** cuentan como faltantes.
+
+**Peso = `INFORMATIONAL_ONLY`.** La semántica contractual de `Peso bruto por unidad` no está validada, así que el peso no participa en PASS/FAIL, factibilidad, cobertura ni clasificación. El reporte lo muestra solo como `WEIGHT_DATA_STATUS = WEIGHT_DATA_UNVALIDATED` (`peso_calculado`, `cajas_con_peso_0`, `skus_sin_peso_validable`), sin interpretarlo como válido, inválido, sobrepeso ni bajo peso.
 
 ### Cigarros / Vapes (BAT): demanda separada, no excluida
 
@@ -46,7 +48,7 @@ Contrato operacional: demanda total → **demanda no BAT → cubicador** (única
 Por corrida se genera `pilot/runs/<run_id>/Cigarros_Vapes.xlsx` (hoja `Cigarros_Vapes`: `CD, SKU, Descripción, Categoría, Subcategoría, Unidades, Cajas_Teoricas, Cajas_Consolidacion_CD` por SKU; hoja `Resumen_CD`: subtotales por CD) a partir de lo que el pipeline emite hoy (`demanda_cigarros_df`). Se concilia contra una definición de negocio calculada **directo del input** (Categoría Cigarros o Subcategoría `vape`/`vapes`): por CD, SKUs, unidades y cajas teóricas deben coincidir (pérdida cero), las cajas de consolidación deben ser las de `bat.consolidar_bat_por_cd`, y ningún SKU BAT puede estar en un pallet cubicado.
 
 - Gate BAT: `PASS_BAT_ROUTING` / `FAIL_BAT_ROUTING`.
-- `PASS_OPERATIONAL_COVERAGE` solo si pasan el gate A (`PASS_FIXED_N_GEOMETRY`) y el gate BAT. El peso (gate B) sigue separado.
+- `PASS_OPERATIONAL_COVERAGE` solo si pasan el gate A (`PASS_FIXED_N_GEOMETRY`) y el gate BAT. El peso es informativo y no interviene.
 - Identidad por CD: `demanda_original = demanda_cubicable + demanda_cigarros_vapes` (en cajas teóricas).
 - El exportador productivo no se toca en el piloto; las diferencias con el contrato (nombre de hoja, columnas, `SUBCATEGORIAS_BAT`) se listan en el reporte como requerimientos de producto.
 
