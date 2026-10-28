@@ -1043,6 +1043,13 @@ def _recalcular_metricas_pallet(pallet: PalletV5) -> None:
 # queda con el que coloque MÁS cajas -nunca puede ser peor que hoy.
 COMBINACION_PALLETS_SHORTLIST_K = 8
 COMBINACION_PALLETS_MAX_NODOS = 30_000
+# [PATCH V6.12-RC2-C1 -"Front-end DFS work cap"] Tope de nodos del DFS del front-end de `Pallets_Objetivo` fijo CUANDO existe
+# `exact_n_incumbent` (ver `_exact_n_incumbent`) -y SOLO ahí: lo recibe `_empacar_n_pallets(solo_frente=True)` por parámetro
+# (`max_nodos_dfs`); el default general (`COMBINACION_PALLETS_MAX_NODOS`) y el camino profundo (sin incumbent) no cambian. Es un
+# presupuesto de TRABAJO determinista (conteo de nodos, no reloj) con red de seguridad: si el front-end completa dentro del tope gana el
+# front-end; si no, gana el incumbent. Censo C1 (42 casos con incumbent): el front-end completó en el nodo <=59 (termina <=456) y los
+# 12 que no completaron mejoraron por última vez (cajas) en el nodo <=160 -1000 deja >=2x de margen sobre el mayor nodo de terminación.
+FIXED_N_INCUMBENT_FRONTEND_DFS_MAX_NODES = 1000
 # [medido con datos reales, Pallet 1] Subir esto a 2 o 3 (más de una
 # columna candidata por SKU en cada nodo) se probó explícitamente y dio
 # PEOR resultado (71/93 en vez de 78/93) con el mismo o más presupuesto de
@@ -1400,6 +1407,7 @@ def _resolver_pallets_backtracking(
     max_nodos: int = COMBINACION_PALLETS_MAX_NODOS,
     limite_tiempo: float | None = None,
     reloj: Callable[[], float] = time.process_time,
+    info_salida: dict | None = None,
 ) -> int:
     """[backtracking real, DFS con poda] A diferencia del greedy (1 caja,
     sin vuelta atrás), acá cada nodo coloca un LOTE completo -toda una
@@ -1524,6 +1532,12 @@ def _resolver_pallets_backtracking(
     registrar_nodos = getattr(reloj, "registrar_nodos", None)
     if registrar_nodos is not None:
         registrar_nodos(estado["nodos"])
+    if info_salida is not None:  # [RC2-C1] observabilidad pura: no altera la búsqueda ni el resultado
+        info_salida["nodos"] = estado["nodos"]
+        info_salida["motivo_parada"] = (
+            "max_nodos" if estado["nodos"] > max_nodos
+            else "solucion_completa" if estado["mejor_total"] >= demanda_inicial else "agotado"
+        )
     return estado["mejor_total"]
 
 
@@ -1814,6 +1828,7 @@ def _empacar_n_pallets(
     omitir_repair: bool = False,
     presupuesto_global_expansiones: int | None = None,
     solo_frente: bool = False,
+    info_frente: dict | None = None,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1924,7 +1939,11 @@ def _empacar_n_pallets(
     [PATCH V6.12-RC2-B] `solo_frente` (default `False` = comportamiento de siempre): devuelve el resultado
     del FRONT-END determinista (greedy de N fijo + reserva de grandes + DFS + LNS, todos acotados por
     trabajo) ANTES de Rescue/Repair/Exact/Global. Es un modo interno explícito -no un timeout corto-;
-    lo usa `armar_pallets_bloques` con el `exact_n_incumbent` (ver `_exact_n_incumbent`)."""
+    lo usa `armar_pallets_bloques` con el `exact_n_incumbent` (ver `_exact_n_incumbent`).
+
+    [PATCH V6.12-RC2-C1] `info_frente` (opcional, solo observabilidad): si se pasa, recibe `nodos` y `motivo_parada` del DFS inicial.
+    El tope de nodos del front-end con incumbent NO se decide acá: el llamador pasa `max_nodos_dfs=
+    FIXED_N_INCUMBENT_FRONTEND_DFS_MAX_NODES`; el default de esta función sigue siendo `COMBINACION_PALLETS_MAX_NODOS`."""
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -1976,6 +1995,7 @@ def _empacar_n_pallets(
         max_nodos=max_nodos_dfs,
         limite_tiempo=_search_budget_now(incluye_trabajo_hijos=False) + _tiempo_max_dfs(demanda_total),
         reloj=lambda: _search_budget_now(incluye_trabajo_hijos=False),
+        **({"info_salida": info_frente} if info_frente is not None else {}),
     )
     total_bt = sum(sum(d.values()) for d in colocados_bt)
 
@@ -2769,9 +2789,12 @@ def armar_pallets_bloques(
         if incumbent is not None:
             from src.validacion_v5 import validar_pallet_v5
 
+            # [RC2-C1] el front-end con incumbent corre con presupuesto de trabajo determinista propio (1000 nodos).
+            info_dfs_fe: dict = {}
             pallets_fe, sin_fe = _empacar_n_pallets(
                 dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
                 cd, contador, pallets_objetivo, paralelo_lns=paralelo_lns, priorizar_grandes=True, solo_frente=True,
+                max_nodos_dfs=FIXED_N_INCUMBENT_FRONTEND_DFS_MAX_NODES, info_frente=info_dfs_fe,
             )
             frente_completa = (
                 not sin_fe and len(pallets_fe) == pallets_objetivo and all(validar_pallet_v5(p) == [] for p in pallets_fe)
@@ -2791,6 +2814,13 @@ def armar_pallets_bloques(
             info_inc["resultado"] = "CAMINO_PROFUNDO"
         if pallets:
             pallets[-1].metadata["fixed_n_exact_n_incumbent"] = info_inc
+            if incumbent is not None:  # [RC2-C1] trazabilidad del front-end acotado (solo cuando existe incumbent)
+                pallets[-1].metadata["fixed_n_frontend_dfs_budget"] = FIXED_N_INCUMBENT_FRONTEND_DFS_MAX_NODES
+                pallets[-1].metadata["fixed_n_frontend_stop_reason"] = info_dfs_fe.get("motivo_parada")
+                pallets[-1].metadata["fixed_n_frontend_dfs_nodes"] = info_dfs_fe.get("nodos")
+                pallets[-1].metadata["fixed_n_solution_source"] = (
+                    "FRONTEND_COMPLETE" if info_inc["resultado"] == "FRENTE_COMPLETO" else "EXACT_N_GREEDY_INCUMBENT"
+                )
         for sku, cant in sin_colocar_barrido.items():
             sin_colocar[sku] = sin_colocar.get(sku, 0) + cant
     else:
