@@ -77,7 +77,9 @@ def test_sin_incumbent_el_camino_profundo_sigue_con_30000(monkeypatch):
     monkeypatch.setattr(pb, "_empacar_n_pallets", _espia)
     caps = _espiar_dfs(monkeypatch)
     pallets = pb.armar_pallets_bloques(_df(60), "T", pallets_objetivo=3, paralelo_lns=False)   # n_greedy (2) < N (3): sin incumbent
-    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True}]    # ni solo_frente ni max_nodos_dfs: default de siempre
+    # ni solo_frente ni max_nodos_dfs: default de siempre (más el fallback sin reserva de RC2-D1)
+    info_nr = kws[0].pop("info_no_reserve")
+    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True, "no_reserve_fallback": True}] and info_nr["resultado"] == "NOT_ATTEMPTED"
     assert caps[0] == 30_000
     assert "fixed_n_frontend_dfs_budget" not in _md(pallets)
     assert _md(pallets)["fixed_n_exact_n_incumbent"]["resultado"] == "CAMINO_PROFUNDO"
@@ -113,7 +115,7 @@ def test_el_dfs_real_mejora_antes_del_cap_pero_no_completa_y_se_corta_por_max_no
     (p_cap, sin_cap), i_cap = _frente_real_inalcanzable(1000)
     colocadas = lambda ps: sum(t.cantidad for p in ps for t in p.torres)
     assert colocadas(p_cap) > colocadas(p_chico) > 0                      # sigue mejorando antes de llegar a 1000...
-    assert sin_cap and i_cap == {"nodos": 1001, "motivo_parada": "max_nodos"}   # ...pero no completa: se corta exactamente por el tope
+    assert sin_cap and (i_cap["nodos"], i_cap["motivo_parada"]) == (1001, "max_nodos")   # ...pero no completa: se corta exactamente por el tope
 
 
 def test_contrato_mejora_antes_del_cap_sin_completar_gana_el_incumbent(monkeypatch):

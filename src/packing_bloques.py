@@ -1071,6 +1071,10 @@ COMBINACION_PALLETS_OPCIONES_POR_SKU = 1
 # puesta y se reconstruye, escapando del óptimo local sin tocar el criterio
 # de prioridad de cada nodo individual.
 COMBINACION_PALLETS_LNS_ITERACIONES = 200
+# [RC2-D1.1] Tope de trabajo (iteraciones LNS, semilla 0) del front-end del FIXED_N_NO_RESERVE_FALLBACK. Censo local (52 casos, 42 con
+# fallback activo: 18 éxitos, 24 fallos): los éxitos por LNS completan en <= 63 iteraciones (<= 184 187 nodos de reconstrucción); ningún
+# fallo completa entre 64 y 200. 100 = 1,6x el máximo observado.
+FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS = 100
 COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX = 40
 COMBINACION_PALLETS_LNS_SKUS_A_ROMPER = 2
 COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION = 3_000
@@ -1615,6 +1619,8 @@ def _lns_mejorar_pallets(
     reloj: Callable[[], float] = time.process_time,
     max_nodos_reconstruccion: int | None = None,
     sin_mejora_max: int | None = None,
+    info_salida: dict | None = None,
+    max_iteraciones: int | None = None,
 ) -> int:
     """[LNS -ruina y reconstrucción, ver comentario junto a las
     constantes `COMBINACION_PALLETS_LNS_*`] Complementa el DFS de
@@ -1692,7 +1698,8 @@ def _lns_mejorar_pallets(
     # colocada vs pendiente en cada iteración).
     demanda_total_lns = mejor_total + sum(pendientes.values())
 
-    for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES):
+    iteraciones_lns = 0  # [RC2-D1] solo observabilidad: iteraciones realmente ejecutadas (ver `info_salida`)
+    for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES if max_iteraciones is None else max_iteraciones):
         if mejor_total >= demanda_total_lns:
             break  # [PATCH V6.12-D5] ya se colocó el 100% -nada más que optimizar
         if sin_mejora >= sin_mejora_max:
@@ -1705,6 +1712,7 @@ def _lns_mejorar_pallets(
             break
         k = min(COMBINACION_PALLETS_LNS_SKUS_A_ROMPER, len(skus_colocados))
         elegidos = set(rng.sample(skus_colocados, k))
+        iteraciones_lns += 1
 
         _romper_skus_con_cascada(construcciones, colocados_por_pallet, pendientes, elegidos, n_pallets)
 
@@ -1731,6 +1739,8 @@ def _lns_mejorar_pallets(
             sin_mejora += 1
 
     _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
+    if info_salida is not None:
+        info_salida["iteraciones"] = info_salida.get("iteraciones", 0) + iteraciones_lns
     return mejor_total
 
 
@@ -1829,6 +1839,9 @@ def _empacar_n_pallets(
     presupuesto_global_expansiones: int | None = None,
     solo_frente: bool = False,
     info_frente: dict | None = None,
+    no_reserve_fallback: bool = False,
+    info_no_reserve: dict | None = None,
+    lns_max_iteraciones: int | None = None,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1943,7 +1956,21 @@ def _empacar_n_pallets(
 
     [PATCH V6.12-RC2-C1] `info_frente` (opcional, solo observabilidad): si se pasa, recibe `nodos` y `motivo_parada` del DFS inicial.
     El tope de nodos del front-end con incumbent NO se decide acá: el llamador pasa `max_nodos_dfs=
-    FIXED_N_INCUMBENT_FRONTEND_DFS_MAX_NODES`; el default de esta función sigue siendo `COMBINACION_PALLETS_MAX_NODOS`."""
+    FIXED_N_INCUMBENT_FRONTEND_DFS_MAX_NODES`; el default de esta función sigue siendo `COMBINACION_PALLETS_MAX_NODOS`.
+
+    [PATCH V6.12-RC2-D1 -"FIXED_N_NO_RESERVE_FALLBACK"] `no_reserve_fallback` (default `False`): con `priorizar_grandes=True`, si el
+    front-end CON reserva no completa Y el LNS quedó sin candidatos (todos los SKUs protegidos por `_reservar_skus_grandes`: `sin_skus`),
+    se corre un SEGUNDO front-end con `priorizar_grandes=False` (`solo_frente=True`: sin Rescue/Repair/Exact/Global). Si ese completa (N
+    exacto, 100 %, 0 errores) se devuelve y la cascada profunda NO corre; si no, la cascada profunda sigue como siempre. No usa reloj como
+    criterio. El segundo front-end corre SIEMPRE en secuencial con la semilla 0 del LNS (`paralelo_lns=False` interno), así que su
+    resultado no depende del `paralelo_lns` exterior. Nunca se activa con `solo_frente=True` (modo incumbent). `info_no_reserve` (opcional) recibe `attempted`/`resultado`/
+    `dfs_nodes`/`lns_iteraciones`/`colocadas`. Los ids de pallet del fallback reutilizan el contador de entrada (mismos ids que un camino normal).
+
+    [PATCH V6.12-RC2-D1.1] `lns_max_iteraciones` (default `None` => `COMBINACION_PALLETS_LNS_ITERACIONES`): tope de iteraciones del LNS
+    SECUENCIAL; el fallback lo fija en `FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS`. Solo corta trabajo (nunca cambia una solución completa)."""
+    contador_ini = contador[0]
+    if info_no_reserve is not None:
+        info_no_reserve.update(attempted=False, resultado="NOT_ATTEMPTED")
     pallets_greedy, sin_colocar_greedy = _empacar_n_pallets_greedy(
         dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
         cd, contador, n_pallets,
@@ -1998,6 +2025,13 @@ def _empacar_n_pallets(
         **({"info_salida": info_frente} if info_frente is not None else {}),
     )
     total_bt = sum(sum(d.values()) for d in colocados_bt)
+
+    # [RC2-D1] El LNS no tiene candidatos (`sin_skus`) si ningún SKU colocado queda fuera de `skus_protegidos` -misma condición que
+    # corta la primera iteración de `_lns_mejorar_pallets`. Se evalúa ANTES de correr el LNS (estado post-DFS).
+    lns_sin_skus = (
+        total_bt < demanda_total and con_lns
+        and not any(cant > 0 and sku not in skus_protegidos for d in colocados_bt for sku, cant in d.items())
+    )
 
     if total_bt < demanda_total and con_lns:
         # [multi-reinicio -medido con datos reales, Pallet 1; pedido
@@ -2076,6 +2110,8 @@ def _empacar_n_pallets(
                     semilla=f"{cd}-{n_pallets}-{intento}", limite_tiempo=deadline_lns,
                     skus_protegidos=skus_protegidos, reloj=reloj_lns,
                     max_nodos_reconstruccion=lns_recon_max_nodos, sin_mejora_max=lns_sin_mejora_max,
+                    **({"info_salida": info_frente} if info_frente is not None else {}),
+                    **({"max_iteraciones": lns_max_iteraciones} if lns_max_iteraciones is not None else {}),
                 )
                 if total_intento > mejor_total_lns:
                     mejor_total_lns = total_intento
@@ -2106,6 +2142,31 @@ def _empacar_n_pallets(
 
     if solo_frente:  # [RC2-B] front-end determinista solamente: sin Rescue/Repair/Exact/Global
         return pallets_final, sin_colocar_final
+
+    # [PATCH V6.12-RC2-D1 -"FIXED_N_NO_RESERVE_FALLBACK"] Ver docstring. Solo cuando el front-end con reserva no completó y el LNS no tuvo
+    # candidatos; el segundo front-end es determinista (presupuestos por trabajo), sin cascada profunda y sin reloj como criterio.
+    if no_reserve_fallback and priorizar_grandes and con_lns and sin_colocar_final and lns_sin_skus:
+        from src.validacion_v5 import validar_pallet_v5
+
+        contador_fb = [contador_ini]
+        info_fb: dict = {}
+        pallets_fb, sin_fb = _empacar_n_pallets(
+            dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, cd, contador_fb, n_pallets,
+            # [RC2-D1.1] SIEMPRE secuencial (semilla 0): el resultado del fallback no depende del `paralelo_lns` exterior.
+            paralelo_lns=False, con_lns=con_lns, priorizar_grandes=False, max_nodos_dfs=max_nodos_dfs,
+            lns_recon_max_nodos=lns_recon_max_nodos, lns_sin_mejora_max=lns_sin_mejora_max, solo_frente=True, info_frente=info_fb,
+            lns_max_iteraciones=FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS,
+        )
+        fb_completa = not sin_fb and len(pallets_fb) == n_pallets and all(validar_pallet_v5(p) == [] for p in pallets_fb)
+        if info_no_reserve is not None:
+            info_no_reserve.update(
+                attempted=True, resultado="COMPLETED" if fb_completa else "INCOMPLETE", dfs_nodes=info_fb.get("nodos"),
+                lns_iteraciones=info_fb.get("iteraciones", 0),
+                colocadas=sum(t.cantidad for p in pallets_fb for t in p.torres),
+            )
+        if fb_completa:
+            contador[0] = contador_fb[0]
+            return pallets_fb, {}
 
     # [PATCH V6.02, sección 3] Rescue mode -SOLO cuando quedó demanda sin
     # colocar. Nunca reemplaza el camino normal: intenta mejorarlo, y el
@@ -2807,13 +2868,24 @@ def armar_pallets_bloques(
                 info_inc["resultado"] = "INCUMBENT_USADO"
                 info_inc["frente_colocadas"] = sum(t.cantidad for p in pallets_fe for t in p.torres)
         else:
+            # [RC2-D1] camino profundo con FIXED_N_NO_RESERVE_FALLBACK (solo aquí: sin incumbent, front-end con reserva incompleto y LNS sin_skus)
+            info_nr: dict = {}
             pallets, sin_colocar_barrido = _empacar_n_pallets(
                 pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
                 cd, contador, pallets_objetivo, paralelo_lns=paralelo_lns, priorizar_grandes=True,
+                no_reserve_fallback=True, info_no_reserve=info_nr,
             )
             info_inc["resultado"] = "CAMINO_PROFUNDO"
         if pallets:
             pallets[-1].metadata["fixed_n_exact_n_incumbent"] = info_inc
+            if incumbent is None:  # [RC2-D1] trazabilidad del fallback sin reserva (camino profundo)
+                md = pallets[-1].metadata
+                md["fixed_n_no_reserve_fallback_attempted"] = bool(info_nr.get("attempted"))
+                md["fixed_n_no_reserve_fallback_result"] = info_nr.get("resultado", "NOT_ATTEMPTED")
+                md["fixed_n_no_reserve_dfs_nodes"] = info_nr.get("dfs_nodes")
+                md["fixed_n_no_reserve_lns_iterations"] = info_nr.get("lns_iteraciones")
+                if info_nr.get("resultado") == "COMPLETED":
+                    md["fixed_n_solution_source"] = "FIXED_N_NO_RESERVE_FALLBACK"
             if incumbent is not None:  # [RC2-C1] trazabilidad del front-end acotado (solo cuando existe incumbent)
                 pallets[-1].metadata["fixed_n_frontend_dfs_budget"] = FIXED_N_INCUMBENT_FRONTEND_DFS_MAX_NODES
                 pallets[-1].metadata["fixed_n_frontend_stop_reason"] = info_dfs_fe.get("motivo_parada")

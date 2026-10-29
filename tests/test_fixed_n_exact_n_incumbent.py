@@ -196,7 +196,8 @@ def test_el_camino_profundo_recibe_los_mismos_kwargs_de_siempre(monkeypatch):
 
     monkeypatch.setattr(pb, "_empacar_n_pallets", _espia)
     pb.armar_pallets_bloques(_df(60), "T", pallets_objetivo=3, paralelo_lns=False)
-    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True}]        # idéntico al comportamiento anterior
+    # idéntico al comportamiento anterior, más el fallback sin reserva de RC2-D1 (sin max_nodos_dfs, sin solo_frente)
+    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True, "no_reserve_fallback": True, "info_no_reserve": {}}]
 
 
 def test_el_camino_abierto_no_cambia(monkeypatch):
