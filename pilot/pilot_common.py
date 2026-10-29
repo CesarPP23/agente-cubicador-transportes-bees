@@ -5,11 +5,17 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+# Raiz del solver validado. Por defecto, este mismo checkout. `PILOT_SOLVER_ROOT` apunta el harness a OTRO checkout/worktree del solver
+# (p.ej. el de v6.12-rc2) sin copiar archivos dentro de el. Solo cambia DONDE se lee el solver; el harness no lo modifica.
+REPO = Path(os.environ.get("PILOT_SOLVER_ROOT") or Path(__file__).resolve().parents[1]).resolve()
 RC_TAG = "v6.12-rc1"
+# Commit funcional esperado del solver. Por defecto RC1 (tag). Con `PILOT_EXPECTED_SOLVER_COMMIT=<commit>` el solver esperado es ese commit
+# (p.ej. d22691c = RC2): la corrida queda clasificada SOLVER_VERSION_EXPECTED_RC2 y NO es PILOT_EXCEPTION por version.
+EXPECTED_SOLVER_COMMIT = os.environ.get("PILOT_EXPECTED_SOLVER_COMMIT") or None
 SOLVER_PATHS = ["src", "config.py", "models.py"]  # lo que define el comportamiento del solver
 CLASES = ("BETTER", "EQUIVALENT", "WORSE", "INVALID")
 SIN_OPERACION = "NO_OPERATION_DATA"
@@ -28,18 +34,28 @@ def _git(*args: str) -> str:
 
 
 def verificar_version() -> dict:
-    """Congelamiento: el codigo del solver (src/, config.py, models.py) debe ser BIT A BIT el del tag RC1 y el
-    arbol de trabajo no puede tener cambios sobre ellos."""
-    rc_commit = _git("rev-parse", f"{RC_TAG}^{{commit}}")
+    """Congelamiento: el codigo del solver (src/, config.py, models.py) debe ser BIT A BIT el del solver ESPERADO (por defecto el tag RC1;
+    con `PILOT_EXPECTED_SOLVER_COMMIT`, ese commit) y el arbol de trabajo no puede tener cambios sobre ellos.
+    `solver_matches_rc1` conserva su nombre por compatibilidad: significa 'coincide con el solver esperado'."""
+    ref = EXPECTED_SOLVER_COMMIT or RC_TAG
+    ref_commit = _git("rev-parse", f"{ref}^{{commit}}")
     head = _git("rev-parse", "HEAD")
     diffs = []
     for p in SOLVER_PATHS:
-        if _git("rev-parse", f"{RC_TAG}:{p}") != _git("rev-parse", f"HEAD:{p}"):
-            diffs.append(f"{p} (HEAD != {RC_TAG})")
+        if _git("rev-parse", f"{ref}:{p}") != _git("rev-parse", f"HEAD:{p}"):
+            diffs.append(f"{p} (HEAD != {ref})")
         if _git("status", "--porcelain", "--", p):
             diffs.append(f"{p} (cambios sin commitear)")
-    return {"version": f"{RC_TAG} / {rc_commit[:7]}", "rc_commit": rc_commit, "head_commit": head,
-            "head_branch": _git("rev-parse", "--abbrev-ref", "HEAD"), "solver_matches_rc1": not diffs, "solver_diffs": diffs}
+    if diffs:
+        estado = "SOLVER_MISMATCH"
+    elif EXPECTED_SOLVER_COMMIT:
+        estado = "SOLVER_VERSION_EXPECTED_RC2"
+    else:
+        estado = "SOLVER_VERSION_EXPECTED_RC1"
+    etiqueta = f"expected solver commit {ref_commit[:7]}" if EXPECTED_SOLVER_COMMIT else RC_TAG
+    return {"version": f"{etiqueta} / {ref_commit[:7]}", "rc_commit": ref_commit, "head_commit": head,
+            "head_branch": _git("rev-parse", "--abbrev-ref", "HEAD"), "solver_matches_rc1": not diffs, "solver_diffs": diffs,
+            "solver_version_status": estado, "expected_solver_commit": ref_commit, "solver_root": str(REPO)}
 
 
 def sha16(obj) -> str:

@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, os.environ.get("PILOT_SOLVER_ROOT") or str(HERE.parent))  # solver validado (ver pilot_common.REPO)
 sys.path.insert(0, str(HERE))
 
 import pandas as pd  # noqa: E402
@@ -278,7 +278,7 @@ def main() -> int:
         registro["input_guardado_en"] = str(d)
 
     (out / "run.json").write_text(json.dumps(registro, indent=2, default=str))
-    print(f"[{run_id}] {ver['version']}  wall_batch={registro['wall_batch_s']}  PILOT_EXCEPTION={registro['pilot_exception']}")
+    print(f"[{run_id}] {ver['version']} {ver['solver_version_status']}  wall_batch={registro['wall_batch_s']}  PILOT_EXCEPTION={registro['pilot_exception']}")
     for cd, r in registro["cds"].items():
         gates = f" [closure={r['cierre']['closure_stage']} A={r['gate_a']} C={r['gate_c']} BAT={r['gate_bat']} -> {r['cobertura_operacional']}] N_obj={r['n_objetivo']}" if "gate_a" in r else ""
         print(f"  {cd}: N={r['n_pallets']} cajas={r['cajas_colocadas']}/{r['demanda_cajas']} falt={r['faltantes']} err={r['errores']} "
