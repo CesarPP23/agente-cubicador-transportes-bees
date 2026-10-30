@@ -143,9 +143,14 @@ def main() -> int:
     inp = Path(a.input).resolve()
     case_id = a.case_id or inp.stem
     h_full = pc.hash_archivo(inp)
-    run_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}_{case_id}_{h_full[:8]}"
+    # run_id inequívocamente único: timestamp con microsegundos + case_id + CD(s) + hash de input + pid. Dos CDs lanzados en paralelo nunca
+    # comparten directorio ni run.json; `exist_ok=False` hace que una colisión residual falle en vez de sobrescribir.
+    cds_etiqueta = "ALL" if not a.cds else "-".join(sorted(c.strip() for c in a.cds.split(",") if c.strip()))
+    if len(cds_etiqueta) > 40:
+        cds_etiqueta = f"{cds_etiqueta[:30]}-{pc.sha16(cds_etiqueta)[:8]}"
+    run_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S%f')}_{case_id}_{cds_etiqueta}_{h_full[:8]}_p{os.getpid()}"
     out = Path(a.out_dir) / run_id
-    out.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=False)
 
     reconciliacion: dict = {}
     bat_esp, consol_esp, maestro = None, {}, None
