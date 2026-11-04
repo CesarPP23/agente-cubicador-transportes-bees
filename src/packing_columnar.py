@@ -19,6 +19,7 @@ BAT global (P9) a 61. El packing 3D es el intento de cerrar la brecha que
 quedaba contra el objetivo (42-45), atacando la causa medida (aire
 desperdiciado sobre torres cortas), no ajustando parámetros a ciegas.
 """
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -142,6 +143,10 @@ class _PalletEnConstruccion:
             _cuboide_inicial()
         ]
     )
+    # [V6.13-P1A] `True` solo mientras un restore diferido (`_restaurar_estado_pallets(diferir_metricas=True)`, usado únicamente
+    # dentro del DFS) dejó `pallet.torres` cambiado SIN refrescar las cuatro métricas del pallet; `colocar` lo respeta (ver abajo) y
+    # `_resolver_pallets_backtracking` lo vuelve a `False` en su restore final. Fuera de eso siempre es `False`.
+    metricas_pendientes: bool = field(default=False, repr=False, compare=False)
 
     def cabe_altura(self, candidata: TorreCandidate, cantidad: int) -> bool:
         """Chequeo rápido: ¿hay AL MENOS un cuboide libre que pueda recibir
@@ -209,6 +214,11 @@ class _PalletEnConstruccion:
         # COMPLETA contra el cuboide colocado, no solo partir el que se usó
         # para elegir la posición.
         self.libres = _actualizar_libres_maxrects(self.libres, c.x, c.y, c.z, torre.largo, torre.ancho, torre.altura)
+        if self.metricas_pendientes:
+            # [V6.13-P1A] La base de `peso_estimado` que dejaba el restore ansioso (`_recalcular_metricas_pallet`): `sum()` fresco de las
+            # torres ANTES de agregar ésta (0.0 si no había). El resto de las métricas se recalcula completo más abajo, igual que siempre.
+            self.pallet.peso_estimado = sum(t.peso for t in self.pallet.torres) if self.pallet.torres else 0.0
+            self.metricas_pendientes = False
         self.pallet.torres.append(torre)
         self.pallet.altura_final = config.ALTURA_PALLET_VACIO + max(t.z + t.altura for t in self.pallet.torres)
         self.pallet.peso_estimado += torre.peso
@@ -218,7 +228,44 @@ class _PalletEnConstruccion:
         return torre
 
 
+# [V6.13-P1A] Memo EXACTO de `_area_union_xy`, activo SOLO dentro de `_area_union_memoizada()` (`None` = desactivado, el camino de siempre).
+# `_area_union_xy_calcular` es una función pura de la colección de (x, largo, y, ancho) de las torres -no lee ningún otro campo y su
+# resultado no depende del orden ni de duplicados (sus ejes comprimidos salen de conjuntos ordenados y la cobertura es un `any`)-, así que
+# devolver el valor ya calculado para la misma colección es idéntico bit a bit. Solo lo activan los DFS acotados por trabajo
+# (`_resolver_pallets_backtracking` con restore diferido, `_lns_mejorar_pallets`); los gobernados por deadline de CPU (Rescue/Repair/
+# Exact/Global del camino profundo) no lo usan: acelerarlos cambiaría cuánto trabajo hacen antes de su deadline.
+_AREA_UNION_MEMO: dict | None = None
+_AREA_UNION_MEMO_MAX = 50_000  # tope de entradas (memoria acotada); lleno => se deja de insertar, nunca cambia un resultado
+
+
+@contextmanager
+def _area_union_memoizada():
+    """Re-entrante: si ya hay un memo activo lo reutiliza; el memo creado se descarta al salir del `with` más externo."""
+    global _AREA_UNION_MEMO
+    if _AREA_UNION_MEMO is not None:
+        yield
+        return
+    _AREA_UNION_MEMO = {}
+    try:
+        yield
+    finally:
+        _AREA_UNION_MEMO = None
+
+
 def _area_union_xy(torres: list[Torre]) -> float:
+    memo = _AREA_UNION_MEMO
+    if memo is None or not torres:
+        return _area_union_xy_calcular(torres)
+    clave = frozenset((t.x, t.largo, t.y, t.ancho) for t in torres)
+    area = memo.get(clave)
+    if area is None:
+        area = _area_union_xy_calcular(torres)
+        if len(memo) < _AREA_UNION_MEMO_MAX:
+            memo[clave] = area
+    return area
+
+
+def _area_union_xy_calcular(torres: list[Torre]) -> float:
     """[packing3d] Área de huella REALMENTE ocupada, proyectada sobre XY
     -no la suma de `area_base` de cada torre, que ahora puede contar el
     mismo piso más de una vez cuando varias torres comparten (x, y) apiladas

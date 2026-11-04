@@ -154,6 +154,7 @@ import random
 import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 
 import pandas as pd
 
@@ -162,6 +163,7 @@ from models import PalletV5
 from src.packing_columnar import (
     _actualizar_libres_maxrects,
     _altura_presupuesto,
+    _area_union_memoizada,
     _area_union_xy,
     _CuboidLibre,
     _PalletEnConstruccion,
@@ -1202,12 +1204,22 @@ def _snapshot_estado_pallets(
 def _restaurar_estado_pallets(
     construcciones: list[_PalletEnConstruccion], colocados_por_pallet: list[dict[str, int]], pendientes: dict[str, int],
     snapshot: tuple[list[tuple[list, list]], list[dict[str, int]], dict[str, int]],
+    diferir_metricas: bool = False,
 ) -> None:
+    """[V6.13-P1A] `diferir_metricas=False` (default, comportamiento de siempre): recalcula `altura_final`/`peso_estimado`/`ocupacion_xy`/
+    `volumen_utilizado` de cada pallet restaurado. `diferir_metricas=True` SOLO lo usa el restore intermedio del DFS
+    (`_resolver_pallets_backtracking(metricas_perezosas=True)`): ahí nada lee esas cuatro métricas (el DFS y `_candidatos_lote` usan
+    `torres`/`libres`), así que se marca `metricas_pendientes` en vez de pagar un `_area_union_xy` por pallet y por nodo; el restore final
+    de esa función es ansioso, de modo que el estado que sale de ella es idéntico al de siempre."""
     snap_pallets, snap_colocados, snap_pendientes = snapshot
     for pc, (torres, libres) in zip(construcciones, snap_pallets):
         pc.pallet.torres = list(torres)
         pc.libres = libres
-        _recalcular_metricas_pallet(pc.pallet)
+        if diferir_metricas:
+            pc.metricas_pendientes = True
+        else:
+            _recalcular_metricas_pallet(pc.pallet)
+            pc.metricas_pendientes = False
     for d, snap_d in zip(colocados_por_pallet, snap_colocados):
         d.clear()
         d.update(snap_d)
@@ -1412,6 +1424,7 @@ def _resolver_pallets_backtracking(
     limite_tiempo: float | None = None,
     reloj: Callable[[], float] = time.process_time,
     info_salida: dict | None = None,
+    metricas_perezosas: bool = False,
 ) -> int:
     """[backtracking real, DFS con poda] A diferencia del greedy (1 caja,
     sin vuelta atrás), acá cada nodo coloca un LOTE completo -toda una
@@ -1451,7 +1464,15 @@ def _resolver_pallets_backtracking(
     parámetro, que sigue existiendo en la firma; no implica que se use acá
     para cortar, ver arriba). Modifica `construcciones`/`colocados_
     por_pallet`/`pendientes` IN-PLACE, dejándolos en el MEJOR estado
-    encontrado al terminar -no devuelve una copia."""
+    encontrado al terminar -no devuelve una copia.
+
+    [V6.13-P1A] `metricas_perezosas` (default `False` = comportamiento de siempre): con `True`, los restore INTERMEDIOS del DFS no recalculan
+    las métricas del pallet (`_restaurar_estado_pallets(diferir_metricas=True)`); el restore FINAL de esta función sí, así que al salir
+    todos los pallets tienen exactamente las mismas métricas que antes. Solo lo activan los callers acotados por nodos (front-end y LNS de
+    `_empacar_n_pallets`). Además se activa solo si `reloj` es un `MedidorTrabajo` (Rescue/Repair en contexto probe/final: budget de
+    NODOS, no de CPU): ahí acelerar el DFS no cambia cuánto trabajo hace la etapa. Con `reloj=time.process_time` (Rescue/Repair/Exact/
+    Global gobernados por deadline de CPU) queda ansioso: acelerarlos haría que procesen más trabajo antes de su deadline."""
+    diferir_metricas = metricas_perezosas or getattr(reloj, "registrar_nodos", None) is not None
     demanda_inicial = sum(pendientes.values())
     # [densidad como criterio de desempate -bug real de esta sesión,
     # reportado por el usuario con fotos de un pallet real todavía con
@@ -1523,13 +1544,16 @@ def _resolver_pallets_backtracking(
             pendientes[sku] -= cantidad
             colocados_por_pallet[pidx][sku] = colocados_por_pallet[pidx].get(sku, 0) + cantidad
             _dfs(colocado_actual + cantidad, area_actual + delta_area)
-            _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap)
+            _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap, diferir_metricas=diferir_metricas)
             if estado["nodos"] > max_nodos:
                 break
 
-    _dfs(demanda_inicial - sum(pendientes.values()), area_inicial)
-    if estado["mejor_snapshot"] is not None:
-        _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, estado["mejor_snapshot"])
+    # [V6.13-P1A] Con búsqueda acotada por trabajo (`diferir_metricas`) también se memoiza el área de huella (resultado idéntico, ver
+    # `_area_union_xy`); si el caller ya abrió el contexto (LNS) se reutiliza el mismo memo.
+    with _area_union_memoizada() if diferir_metricas else nullcontext():
+        _dfs(demanda_inicial - sum(pendientes.values()), area_inicial)
+        if estado["mejor_snapshot"] is not None:
+            _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, estado["mejor_snapshot"])
     # [PATCH V6.12-D7B-P2] Si el `reloj` recibido es un `MedidorTrabajo` (budget
     # de trabajo determinista, ver src/medidor_trabajo.py) se le suman las
     # visitas de este DFS. Con un `reloj` normal (función) no hace nada.
@@ -1621,6 +1645,7 @@ def _lns_mejorar_pallets(
     sin_mejora_max: int | None = None,
     info_salida: dict | None = None,
     max_iteraciones: int | None = None,
+    metricas_perezosas: bool = False,
 ) -> int:
     """[LNS -ruina y reconstrucción, ver comentario junto a las
     constantes `COMBINACION_PALLETS_LNS_*`] Complementa el DFS de
@@ -1699,46 +1724,49 @@ def _lns_mejorar_pallets(
     demanda_total_lns = mejor_total + sum(pendientes.values())
 
     iteraciones_lns = 0  # [RC2-D1] solo observabilidad: iteraciones realmente ejecutadas (ver `info_salida`)
-    for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES if max_iteraciones is None else max_iteraciones):
-        if mejor_total >= demanda_total_lns:
-            break  # [PATCH V6.12-D5] ya se colocó el 100% -nada más que optimizar
-        if sin_mejora >= sin_mejora_max:
-            break
-        skus_colocados = sorted({
-            sku for d in colocados_por_pallet for sku, cant in d.items()
-            if cant > 0 and sku not in skus_protegidos
-        })
-        if not skus_colocados:
-            break
-        k = min(COMBINACION_PALLETS_LNS_SKUS_A_ROMPER, len(skus_colocados))
-        elegidos = set(rng.sample(skus_colocados, k))
-        iteraciones_lns += 1
+    # [V6.13-P1A] Un solo memo del área de huella para TODO el LNS (las reconstrucciones revisitan los mismos estados); solo con
+    # `metricas_perezosas` (LNS acotado por iteraciones/nodos).
+    with _area_union_memoizada() if metricas_perezosas else nullcontext():
+        for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES if max_iteraciones is None else max_iteraciones):
+            if mejor_total >= demanda_total_lns:
+                break  # [PATCH V6.12-D5] ya se colocó el 100% -nada más que optimizar
+            if sin_mejora >= sin_mejora_max:
+                break
+            skus_colocados = sorted({
+                sku for d in colocados_por_pallet for sku, cant in d.items()
+                if cant > 0 and sku not in skus_protegidos
+            })
+            if not skus_colocados:
+                break
+            k = min(COMBINACION_PALLETS_LNS_SKUS_A_ROMPER, len(skus_colocados))
+            elegidos = set(rng.sample(skus_colocados, k))
+            iteraciones_lns += 1
 
-        _romper_skus_con_cascada(construcciones, colocados_por_pallet, pendientes, elegidos, n_pallets)
+            _romper_skus_con_cascada(construcciones, colocados_por_pallet, pendientes, elegidos, n_pallets)
 
-        # [reconstrucción] Mismo backtracking, presupuesto de nodos más
-        # chico -acá se corre muchas veces, no una sola. [PATCH V6.12-D5]
-        # `limite_tiempo=`/`reloj=` se siguen reenviando tal cual (mismos
-        # nombres de parámetro que antes) pero ya son inertes para decidir
-        # ningún corte -ver docstring de ambas funciones; el único corte
-        # real de esta reconstrucción es su propio `max_nodos` de acá abajo.
-        _resolver_pallets_backtracking(
-            construcciones, colocados_por_pallet, pendientes, por_sku,
-            capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
-            max_nodos=max_nodos_reconstruccion,
-            limite_tiempo=limite_tiempo, reloj=reloj,
-        )
+            # [reconstrucción] Mismo backtracking, presupuesto de nodos más
+            # chico -acá se corre muchas veces, no una sola. [PATCH V6.12-D5]
+            # `limite_tiempo=`/`reloj=` se siguen reenviando tal cual (mismos
+            # nombres de parámetro que antes) pero ya son inertes para decidir
+            # ningún corte -ver docstring de ambas funciones; el único corte
+            # real de esta reconstrucción es su propio `max_nodos` de acá abajo.
+            _resolver_pallets_backtracking(
+                construcciones, colocados_por_pallet, pendientes, por_sku,
+                capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+                max_nodos=max_nodos_reconstruccion,
+                limite_tiempo=limite_tiempo, reloj=reloj, metricas_perezosas=metricas_perezosas,
+            )
 
-        total_actual = _total_colocado()
-        if total_actual > mejor_total:
-            mejor_total = total_actual
-            mejor_snapshot = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
-            sin_mejora = 0
-        else:
-            _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
-            sin_mejora += 1
+            total_actual = _total_colocado()
+            if total_actual > mejor_total:
+                mejor_total = total_actual
+                mejor_snapshot = _snapshot_estado_pallets(construcciones, colocados_por_pallet, pendientes)
+                sin_mejora = 0
+            else:
+                _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
+                sin_mejora += 1
 
-    _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
+        _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
     if info_salida is not None:
         info_salida["iteraciones"] = info_salida.get("iteraciones", 0) + iteraciones_lns
     return mejor_total
@@ -2022,6 +2050,7 @@ def _empacar_n_pallets(
         max_nodos=max_nodos_dfs,
         limite_tiempo=_search_budget_now(incluye_trabajo_hijos=False) + _tiempo_max_dfs(demanda_total),
         reloj=lambda: _search_budget_now(incluye_trabajo_hijos=False),
+        metricas_perezosas=True,  # [V6.13-P1A] DFS acotado por `max_nodos_dfs`: no lee las métricas del pallet
         **({"info_salida": info_frente} if info_frente is not None else {}),
     )
     total_bt = sum(sum(d.values()) for d in colocados_bt)
@@ -2110,6 +2139,7 @@ def _empacar_n_pallets(
                     semilla=f"{cd}-{n_pallets}-{intento}", limite_tiempo=deadline_lns,
                     skus_protegidos=skus_protegidos, reloj=reloj_lns,
                     max_nodos_reconstruccion=lns_recon_max_nodos, sin_mejora_max=lns_sin_mejora_max,
+                    metricas_perezosas=True,  # [V6.13-P1A] LNS acotado por iteraciones/nodos: su DFS no lee las métricas del pallet
                     **({"info_salida": info_frente} if info_frente is not None else {}),
                     **({"max_iteraciones": lns_max_iteraciones} if lns_max_iteraciones is not None else {}),
                 )
