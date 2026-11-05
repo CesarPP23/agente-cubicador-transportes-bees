@@ -1483,8 +1483,8 @@ def _resolver_pallets_backtracking(
     `_empacar_n_pallets`). Además se activa solo si `reloj` es un `MedidorTrabajo` (Rescue/Repair en contexto probe/final: budget de
     NODOS, no de CPU): ahí acelerar el DFS no cambia cuánto trabajo hace la etapa. Con `reloj=time.process_time` (Rescue/Repair/Exact/
     Global gobernados por deadline de CPU) queda ansioso: acelerarlos haría que procesen más trabajo antes de su deadline."""
-    # [V6.13-P1B2-R1] un reloj de trabajo puede declarar `permite_p1a = False` (Rescue del camino profundo de N fijo: cambia el gobernador pero
-    # la implementación costosa queda igual que en RC2 hasta B4).
+    # [V6.13-P1B2-R1/R2] un reloj de trabajo puede declarar `permite_p1a = False` para apagar P1-A (ninguno lo hace hoy: el Rescue del camino
+    # profundo de N fijo lo tuvo apagado en R1 y lo enciende en R2, ya que su trabajo no depende del CPU).
     diferir_metricas = metricas_perezosas or (
         getattr(reloj, "registrar_nodos", None) is not None and getattr(reloj, "permite_p1a", True)
     )
@@ -2015,7 +2015,7 @@ def _empacar_n_pallets(
 
     [PATCH V6.13-P1B2-R1 -"Rescue natural exhaustion"] `gobernador_profundo` (default `False` = cascada por CPU-time de siempre): lo pasa SOLO el
     camino profundo de `armar_pallets_bloques` (N fijo sin `exact_n_incumbent`). Rescue deja de tener deadline de CPU: termina por agotamiento
-    natural y solo lo vigila un watchdog de CPU (`FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS`), sin P1-A dentro de la etapa. Repair, Exact y Global NO
+    natural y solo lo vigila un watchdog de CPU (`FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS`); desde R2 sus DFS usan P1-A. Repair, Exact y Global NO
     cambian. No se combina con los presupuestos de sondeo/final (`presupuesto_*`): esos tienen prioridad. El resumen queda en
     `metadata["fixed_n_deep_governor"]` del último pallet."""
     contador_ini = contador[0]

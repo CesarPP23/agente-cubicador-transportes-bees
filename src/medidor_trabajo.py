@@ -63,11 +63,13 @@ class RelojTrabajoConWatchdog(MedidorTrabajo):
     * Watchdog: si el CPU del proceso supera `watchdog_deadline` (instante absoluto de `time.process_time()`), `watchdog_disparado` queda
       en `True` y el reloj devuelve `inf` desde ese momento (mayor que `SIN_TOPE`), así que TODOS los chequeos de la etapa cortan en el
       siguiente borde. Nunca decide el resultado normal; el caller debe registrar y avisar si dispara.
-    * `permite_p1a = False`: pasar a un reloj de trabajo NO activa métricas diferidas ni memo del área en los DFS de la etapa (R1 cambia
-      solo el gobernador, no la implementación costosa; B4 lo habilitará aparte)."""
+    * `permite_p1a = True` [V6.13-P1B2-R2]: como todo reloj de trabajo, activa las optimizaciones de P1-A (métricas diferidas + memo del área de
+      huella) en los DFS de la etapa. Es seguro porque Rescue ya no depende del CPU para decidir cuánto trabajo hace: acelerar cada nodo no le
+      permite explorar más, solo terminar antes (mismo conteo de trabajo, mismo motivo de parada, mismo resultado). En R1 estaba en `False`
+      (se cambiaba solo el gobernador, no la implementación)."""
 
     __slots__ = ("watchdog_deadline", "watchdog_disparado")
-    permite_p1a = False
+    permite_p1a = True
     SIN_TOPE = 1e30
 
     def __init__(self, watchdog_deadline: float) -> None:

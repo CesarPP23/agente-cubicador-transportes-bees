@@ -550,7 +550,7 @@ def rescue_solver(
     críticos = `solucion`, o una ronda completa sin mejorar = `sin_progreso`); el CPU ya no decide el resultado normal: `deadline` se IGNORA y
     `watchdog_cpu_segundos` (CPU desde la entrada) actúa solo como watchdog de seguridad, que si dispara corta la etapa y queda en
     `stats["presupuesto"]["watchdog_disparado"]`. El reloj es un `RelojTrabajoConWatchdog` (solo para contar trabajo y vigilar el watchdog;
-    los DFS de la etapa NO activan las optimizaciones de P1-A). Excluyente con `presupuesto_nodos`."""
+    los DFS de la etapa SÍ usan las optimizaciones de P1-A desde R2: el trabajo no depende del CPU). Excluyente con `presupuesto_nodos`."""
     from src.medidor_trabajo import MedidorTrabajo, RelojTrabajoConWatchdog
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 

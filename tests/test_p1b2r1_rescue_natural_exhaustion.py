@@ -1,5 +1,6 @@
 """[V6.13-P1B2-R1 -"Rescue natural exhaustion"] Rescue del camino profundo de N fijo deja de estar gobernado por su deadline de CPU de 90 s: termina
-por sus condiciones naturales (solución / ronda sin progreso) y solo lo vigila un watchdog de CPU de seguridad, sin P1-A dentro de la etapa. Repair,
+por sus condiciones naturales (solución / ronda sin progreso) y solo lo vigila un watchdog de CPU de seguridad. [R2] Sus DFS usan P1-A (su trabajo
+no depende del CPU: mismo conteo de trabajo, mismo motivo de parada, mismo resultado). Repair,
 Exact y Global conservan su gobernador de siempre; sondeo / materialización final no se tocan; no hay ningún presupuesto fijo de visitas."""
 import inspect
 import math
@@ -111,13 +112,13 @@ def test_reloj_con_watchdog_vencido_devuelve_inf_y_queda_marcado():
     assert r() > limite and not (r() < limite)  # ambos chequeos de las etapas cortan
 
 
-def test_p1a_solo_se_apaga_en_el_reloj_nuevo():
+def test_el_reloj_con_watchdog_hereda_p1a_del_medidor_de_trabajo():
     assert MedidorTrabajo.permite_p1a is True
-    assert RelojTrabajoConWatchdog.permite_p1a is False
+    assert RelojTrabajoConWatchdog.permite_p1a is True
     assert isinstance(RelojTrabajoConWatchdog(0.0), MedidorTrabajo)  # mismo contrato de registro de nodos
 
 
-# ------------------------------------------------------------------------------------------------ P1-A queda apagado en R1
+# ------------------------------------------------------------------------------------------------ P1-A queda ENCENDIDO en el Rescue (R2)
 
 
 def _dfs_escenario(reloj, espia):
@@ -134,8 +135,8 @@ def _dfs_escenario(reloj, espia):
                   for p in construcciones for t in p.pallet.torres)
 
 
-@pytest.mark.parametrize("clase,difiere", [("trabajo", True), ("trabajo_b2", False), ("cpu", False)])
-def test_p1a_se_activa_con_medidor_de_trabajo_pero_no_con_el_reloj_de_b2(monkeypatch, clase, difiere):
+@pytest.mark.parametrize("clase,difiere", [("trabajo", True), ("trabajo_b2", True), ("cpu", False)])
+def test_p1a_se_activa_con_medidor_de_trabajo_y_con_el_reloj_del_rescue_pero_no_con_cpu(monkeypatch, clase, difiere):
     original = pb._restaurar_estado_pallets
     llamadas = []
     monkeypatch.setattr(pb, "_restaurar_estado_pallets", lambda *a, **k: (llamadas.append(k.get("diferir_metricas", False)), original(*a, **k))[1])
@@ -147,7 +148,7 @@ def test_p1a_se_activa_con_medidor_de_trabajo_pero_no_con_el_reloj_de_b2(monkeyp
              "cpu": lambda: time.process_time}[clase]()
     foto = _dfs_escenario(reloj, None)
     assert any(llamadas) is difiere
-    assert bool(memos) is difiere  # el memo del área también queda apagado
+    assert bool(memos) is difiere  # el memo del área sigue al mismo interruptor
     assert foto == _dfs_escenario(time.process_time, None)  # mismo estado de salida
 
 
@@ -187,6 +188,38 @@ def test_el_trabajo_natural_es_repetible_y_no_depende_del_reloj_del_proceso(monk
         got = _rescue(watchdog_cpu_segundos=1e15)
         assert (got[0], got[2]) == (ref[0], ref[2])
         assert got[1]["presupuesto"]["nodos_trabajo"] == ref[1]["presupuesto"]["nodos_trabajo"]
+
+
+@pytest.mark.parametrize("escenario", ["con_solucion", "sin_solucion"])
+def test_p1a_en_el_rescue_no_cambia_trabajo_motivo_ni_resultado(monkeypatch, escenario):
+    """R2: encender P1-A dentro de Rescue conserva exactamente el conteo de trabajo, el motivo de parada y la solución (solo cambia el CPU)."""
+    def _correr():
+        if escenario == "con_solucion":
+            sin, stats, firma = _rescue(watchdog_cpu_segundos=3600.0)
+        else:
+            pallets, sin_colocar, por_sku, nivel, presupuesto, n = _escenario_sin_solucion()
+            final, sin, stats = rescue_solver(pallets, sin_colocar, por_sku, {}, nivel, {}, n, presupuesto, watchdog_cpu_segundos=3600.0)
+            firma = sorted((t.sku, t.cantidad, round(t.x, 2), round(t.y, 2), round(t.z, 2)) for t in final[0].torres)
+        p = stats["presupuesto"]
+        return sin, firma, p["nodos_trabajo"], p["motivo_stop"], p["watchdog_disparado"], stats["iteraciones"], stats["conflictos_evaluados"]
+
+    con_p1a = _correr()
+    monkeypatch.setattr(RelojTrabajoConWatchdog, "permite_p1a", False)  # el comportamiento de R1
+    sin_p1a = _correr()
+    assert con_p1a == sin_p1a
+    assert con_p1a[2] > 0 and con_p1a[4] is False
+
+
+def test_el_rescue_usa_realmente_las_metricas_diferidas(monkeypatch):
+    original = pb._restaurar_estado_pallets
+    llamadas = []
+    monkeypatch.setattr(pb, "_restaurar_estado_pallets", lambda *a, **k: (llamadas.append(k.get("diferir_metricas", False)), original(*a, **k))[1])
+    _rescue(watchdog_cpu_segundos=3600.0)
+    assert any(llamadas)  # R2: P1-A activo dentro del Rescue profundo
+    llamadas.clear()
+    monkeypatch.setattr(RelojTrabajoConWatchdog, "permite_p1a", False)
+    _rescue(watchdog_cpu_segundos=3600.0)
+    assert not any(llamadas)
 
 
 def test_watchdog_vencido_corta_y_queda_registrado():
