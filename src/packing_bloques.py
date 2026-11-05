@@ -148,6 +148,7 @@ que PH_FRACCION perseguía sin sacrificar la garantía exacta, se le agregan
    real de los demás pallets del CD antes de aceptarlo como pallet
    aparte.
 """
+import logging
 import multiprocessing
 import os
 import random
@@ -1077,6 +1078,16 @@ COMBINACION_PALLETS_LNS_ITERACIONES = 200
 # fallback activo: 18 éxitos, 24 fallos): los éxitos por LNS completan en <= 63 iteraciones (<= 184 187 nodos de reconstrucción); ningún
 # fallo completa entre 64 y 200. 100 = 1,6x el máximo observado.
 FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS = 100
+# [PATCH V6.13-P1B2-R1 -"Rescue natural exhaustion"] Rescue del camino profundo de N fijo (`_empacar_n_pallets(gobernador_profundo=True)`, hoy solo
+# desde `armar_pallets_bloques` sin `exact_n_incumbent`) deja de estar gobernado por su deadline de CPU de 90 s. Termina por sus condiciones
+# naturales (solución / una ronda sin progreso); el censo V6.13-P1B1.1 midió ese final natural en BK53 = 535, BK31 = 55 677 (solución) y BK52 =
+# 69 366 visitas (sin progreso), mientras que el costo por visita cambia ~3x entre casos (1,2 - 4,5 ms), por lo que ningún tope fijo de visitas
+# sirve para todos (el de BK52, 23 298, dejaba a BK31 en 94/98). Solo queda un WATCHDOG de CPU de seguridad (NO gobernador): 1800 s = 5,4x el CPU
+# natural de BK52 (~335 s medidos sin P1-A). Una primera versión con 600 s (1,8x) disparó bajo throttling de CPU (laptop en batería) y volvió a actuar como
+# gobernador funcional; 1800 s es solo una barrera extrema, NO un presupuesto. Si dispara: `metadata["fixed_n_deep_governor"]["watchdog_triggered"] = True` + WARNING; los gates lo tratan como
+# FALLO. Repair, Exact y Global conservan sus deadlines de siempre (R1 solo migra Rescue).
+FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS = 1800.0
+_LOG = logging.getLogger(__name__)
 COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX = 40
 COMBINACION_PALLETS_LNS_SKUS_A_ROMPER = 2
 COMBINACION_PALLETS_LNS_MAX_NODOS_RECONSTRUCCION = 3_000
@@ -1472,7 +1483,11 @@ def _resolver_pallets_backtracking(
     `_empacar_n_pallets`). Además se activa solo si `reloj` es un `MedidorTrabajo` (Rescue/Repair en contexto probe/final: budget de
     NODOS, no de CPU): ahí acelerar el DFS no cambia cuánto trabajo hace la etapa. Con `reloj=time.process_time` (Rescue/Repair/Exact/
     Global gobernados por deadline de CPU) queda ansioso: acelerarlos haría que procesen más trabajo antes de su deadline."""
-    diferir_metricas = metricas_perezosas or getattr(reloj, "registrar_nodos", None) is not None
+    # [V6.13-P1B2-R1] un reloj de trabajo puede declarar `permite_p1a = False` (Rescue del camino profundo de N fijo: cambia el gobernador pero
+    # la implementación costosa queda igual que en RC2 hasta B4).
+    diferir_metricas = metricas_perezosas or (
+        getattr(reloj, "registrar_nodos", None) is not None and getattr(reloj, "permite_p1a", True)
+    )
     demanda_inicial = sum(pendientes.values())
     # [densidad como criterio de desempate -bug real de esta sesión,
     # reportado por el usuario con fotos de un pallet real todavía con
@@ -1870,6 +1885,7 @@ def _empacar_n_pallets(
     no_reserve_fallback: bool = False,
     info_no_reserve: dict | None = None,
     lns_max_iteraciones: int | None = None,
+    gobernador_profundo: bool = False,
 ) -> tuple[list[PalletV5], dict[str, int]]:
     """[wrapper -ver comentario de sección arriba] Corre el greedy de
     siempre (`_empacar_n_pallets_greedy`) para tener un incumbente de
@@ -1995,7 +2011,13 @@ def _empacar_n_pallets(
     `dfs_nodes`/`lns_iteraciones`/`colocadas`. Los ids de pallet del fallback reutilizan el contador de entrada (mismos ids que un camino normal).
 
     [PATCH V6.12-RC2-D1.1] `lns_max_iteraciones` (default `None` => `COMBINACION_PALLETS_LNS_ITERACIONES`): tope de iteraciones del LNS
-    SECUENCIAL; el fallback lo fija en `FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS`. Solo corta trabajo (nunca cambia una solución completa)."""
+    SECUENCIAL; el fallback lo fija en `FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS`. Solo corta trabajo (nunca cambia una solución completa).
+
+    [PATCH V6.13-P1B2-R1 -"Rescue natural exhaustion"] `gobernador_profundo` (default `False` = cascada por CPU-time de siempre): lo pasa SOLO el
+    camino profundo de `armar_pallets_bloques` (N fijo sin `exact_n_incumbent`). Rescue deja de tener deadline de CPU: termina por agotamiento
+    natural y solo lo vigila un watchdog de CPU (`FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS`), sin P1-A dentro de la etapa. Repair, Exact y Global NO
+    cambian. No se combina con los presupuestos de sondeo/final (`presupuesto_*`): esos tienen prioridad. El resumen queda en
+    `metadata["fixed_n_deep_governor"]` del último pallet."""
     contador_ini = contador[0]
     if info_no_reserve is not None:
         info_no_reserve.update(attempted=False, resultado="NOT_ATTEMPTED")
@@ -2232,10 +2254,32 @@ def _empacar_n_pallets(
         # [PATCH V6.12-D7B-P2] El kwarg SOLO se envía en contexto probe: fuera
         # de él la llamada es idéntica a la de siempre.
         kwargs_rescue = {} if presupuesto_rescue_nodos is None else {"presupuesto_nodos": presupuesto_rescue_nodos}
+        # [V6.13-P1B2-R1] camino profundo de N fijo: Rescue por agotamiento natural + watchdog de CPU (el `deadline` de arriba se ignora en ese modo).
+        gobernador_profundo = gobernador_profundo and presupuesto_rescue_nodos is None and presupuesto_repair_nodos is None \
+            and presupuesto_exact_intentos is None and presupuesto_global_expansiones is None
+        if gobernador_profundo:
+            kwargs_rescue = {"watchdog_cpu_segundos": FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS}
         pallets_rescue, sin_colocar_rescue, stats_rescue = rescue_solver(
             pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
             tope_pallet_por_sku, n_pallets, presupuesto, deadline=deadline_rescue, **kwargs_rescue,
         )
+        gobernador_info = None
+        if gobernador_profundo:
+            _pr = stats_rescue.get("presupuesto", {})
+            _disparo = bool(_pr.get("watchdog_disparado"))
+            gobernador_info = {
+                "activo": True, "modo": "rescue_agotamiento_natural", "watchdog_cpu_segundos": FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS,
+                "watchdog_triggered": _disparo, "watchdog_stages": ["rescue"] if _disparo else [],
+                "etapas": {"rescue": {
+                    "trabajo": _pr.get("nodos_trabajo"), "unidad": "visitas", "stop_reason": _pr.get("motivo_stop"),
+                    "watchdog_triggered": _disparo,
+                }},
+            }
+            if _disparo:
+                _LOG.warning(
+                    "FIXED_N deep governor: WATCHDOG de CPU disparó en rescue (%.0f s). La etapa fue cortada por tiempo: el resultado ya NO es "
+                    "el de agotamiento natural.", FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS,
+                )
         total_rescue = demanda_total - sum(sin_colocar_rescue.values())
         pendientes_rescue = {**{sku: 0 for sku in por_sku}, **sin_colocar_rescue}
         score_rescue = _score_solucion(total_rescue, pendientes_rescue, por_sku, pallets_rescue, skus_protegidos_cd)
@@ -2416,6 +2460,8 @@ def _empacar_n_pallets(
                 "rescue_blockers_retirados": stats_rescue.get("blockers_retirados"),
                 "rescue_skus_faltantes_antes": sorted(sku for sku, cant in pendientes_actual.items() if cant > 0),
             }
+            if gobernador_info is not None:  # [V6.13-P1B2-R1] resumen del gobernador del camino profundo + estado del watchdog
+                pallets_final[-1].metadata["fixed_n_deep_governor"] = gobernador_info
 
     return pallets_final, sin_colocar_final
 
@@ -2904,6 +2950,7 @@ def armar_pallets_bloques(
                 pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku,
                 cd, contador, pallets_objetivo, paralelo_lns=paralelo_lns, priorizar_grandes=True,
                 no_reserve_fallback=True, info_no_reserve=info_nr,
+                gobernador_profundo=True,  # [V6.13-P1B2-R1] Rescue por agotamiento natural; CPU solo como watchdog
             )
             info_inc["resultado"] = "CAMINO_PROFUNDO"
         if pallets:

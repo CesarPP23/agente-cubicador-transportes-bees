@@ -33,8 +33,15 @@ CONVENCIÓN DE CONTEO (la misma para todos los budgets de trabajo):
     velocidad de la máquina participan."""
 
 
+import math
+import time
+
+
 class MedidorTrabajo:
     __slots__ = ("nodos",)
+    # [V6.13-P1B2-R1] Los DFS que reciben este reloj activan solos las optimizaciones de V6.13-P1-A (métricas diferidas + memo del área de
+    # huella) porque su trabajo está acotado por nodos. Un reloj hijo puede apagarlas poniendo `permite_p1a = False` (ver abajo).
+    permite_p1a = True
 
     def __init__(self) -> None:
         self.nodos = 0
@@ -44,3 +51,31 @@ class MedidorTrabajo:
 
     def registrar_nodos(self, nodos: int) -> None:
         self.nodos += nodos
+
+
+class RelojTrabajoConWatchdog(MedidorTrabajo):
+    """[V6.13-P1B2-R1 -"Rescue natural exhaustion"] Reloj de TRABAJO (nodos) con un watchdog de CPU, para el Rescue del camino profundo de N fijo.
+
+    * NO gobierna: la etapa no tiene presupuesto de trabajo ni de tiempo; termina por sus condiciones naturales (solución / una ronda
+      completa sin progreso). El caller usa `SIN_TOPE` como `limite_tiempo`, de modo que mientras el watchdog no dispare `reloj() < limite`
+      y `reloj() > limite` nunca cortan. Lo único que este reloj aporta es el CONTEO de trabajo (`nodos`, misma convención que el resto de
+      los medidores) y el watchdog.
+    * Watchdog: si el CPU del proceso supera `watchdog_deadline` (instante absoluto de `time.process_time()`), `watchdog_disparado` queda
+      en `True` y el reloj devuelve `inf` desde ese momento (mayor que `SIN_TOPE`), así que TODOS los chequeos de la etapa cortan en el
+      siguiente borde. Nunca decide el resultado normal; el caller debe registrar y avisar si dispara.
+    * `permite_p1a = False`: pasar a un reloj de trabajo NO activa métricas diferidas ni memo del área en los DFS de la etapa (R1 cambia
+      solo el gobernador, no la implementación costosa; B4 lo habilitará aparte)."""
+
+    __slots__ = ("watchdog_deadline", "watchdog_disparado")
+    permite_p1a = False
+    SIN_TOPE = 1e30
+
+    def __init__(self, watchdog_deadline: float) -> None:
+        super().__init__()
+        self.watchdog_deadline = watchdog_deadline
+        self.watchdog_disparado = False
+
+    def __call__(self) -> float:
+        if not self.watchdog_disparado and time.process_time() > self.watchdog_deadline:
+            self.watchdog_disparado = True
+        return math.inf if self.watchdog_disparado else float(self.nodos)

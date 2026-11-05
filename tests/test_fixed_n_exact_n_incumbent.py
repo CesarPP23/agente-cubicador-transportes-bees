@@ -196,8 +196,10 @@ def test_el_camino_profundo_recibe_los_mismos_kwargs_de_siempre(monkeypatch):
 
     monkeypatch.setattr(pb, "_empacar_n_pallets", _espia)
     pb.armar_pallets_bloques(_df(60), "T", pallets_objetivo=3, paralelo_lns=False)
-    # idéntico al comportamiento anterior, más el fallback sin reserva de RC2-D1 (sin max_nodos_dfs, sin solo_frente)
-    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True, "no_reserve_fallback": True, "info_no_reserve": {}}]
+    # idéntico al comportamiento anterior, más el fallback sin reserva de RC2-D1 (sin max_nodos_dfs, sin solo_frente) y, desde V6.13-P1B2-R1,
+    # el gobernador del camino profundo (`gobernador_profundo=True`: Rescue por agotamiento natural, CPU solo como watchdog)
+    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True, "no_reserve_fallback": True, "info_no_reserve": {},
+                    "gobernador_profundo": True}]
 
 
 def test_el_camino_abierto_no_cambia(monkeypatch):

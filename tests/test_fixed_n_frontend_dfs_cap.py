@@ -77,9 +77,10 @@ def test_sin_incumbent_el_camino_profundo_sigue_con_30000(monkeypatch):
     monkeypatch.setattr(pb, "_empacar_n_pallets", _espia)
     caps = _espiar_dfs(monkeypatch)
     pallets = pb.armar_pallets_bloques(_df(60), "T", pallets_objetivo=3, paralelo_lns=False)   # n_greedy (2) < N (3): sin incumbent
-    # ni solo_frente ni max_nodos_dfs: default de siempre (más el fallback sin reserva de RC2-D1)
+    # ni solo_frente ni max_nodos_dfs: default de siempre (más el fallback sin reserva de RC2-D1 y el gobernador del camino profundo de V6.13-P1B2-R1)
     info_nr = kws[0].pop("info_no_reserve")
-    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True, "no_reserve_fallback": True}] and info_nr["resultado"] == "NOT_ATTEMPTED"
+    assert kws == [{"paralelo_lns": False, "priorizar_grandes": True, "no_reserve_fallback": True,
+                    "gobernador_profundo": True}] and info_nr["resultado"] == "NOT_ATTEMPTED"
     assert caps[0] == 30_000
     assert "fixed_n_frontend_dfs_budget" not in _md(pallets)
     assert _md(pallets)["fixed_n_exact_n_incumbent"]["resultado"] == "CAMINO_PROFUNDO"

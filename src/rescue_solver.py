@@ -509,6 +509,7 @@ def rescue_solver(
     presupuesto: float,
     deadline: float | None = None,
     presupuesto_nodos: int | None = None,
+    watchdog_cpu_segundos: float | None = None,
 ) -> tuple[list[PalletV5], dict[str, int], dict]:
     """[sección 3] Punto de entrada. Recibe el MEJOR resultado ya obtenido
     por el camino normal (`pallets` + `sin_colocar`) y trata de mejorarlo
@@ -542,13 +543,25 @@ def rescue_solver(
     `limite_tiempo = reloj() + presupuesto_nodos`; `deadline` (que es un
     instante de CPU-time) se IGNORA en ese modo. Los puntos de control son los
     mismos de siempre; solo cambia la unidad del reloj. Lo pasa únicamente
-    `busqueda_n_pallets.probe()`."""
-    from src.medidor_trabajo import MedidorTrabajo
+    `busqueda_n_pallets.probe()`.
+
+    [PATCH V6.13-P1B2-R1 -"Rescue natural exhaustion"] `watchdog_cpu_segundos` (default `None` = comportamiento de siempre): Rescue del
+    camino profundo de N fijo SIN presupuesto de trabajo ni de tiempo. La etapa termina por sus condiciones naturales (no quedan SKUs
+    críticos = `solucion`, o una ronda completa sin mejorar = `sin_progreso`); el CPU ya no decide el resultado normal: `deadline` se IGNORA y
+    `watchdog_cpu_segundos` (CPU desde la entrada) actúa solo como watchdog de seguridad, que si dispara corta la etapa y queda en
+    `stats["presupuesto"]["watchdog_disparado"]`. El reloj es un `RelojTrabajoConWatchdog` (solo para contar trabajo y vigilar el watchdog;
+    los DFS de la etapa NO activan las optimizaciones de P1-A). Excluyente con `presupuesto_nodos`."""
+    from src.medidor_trabajo import MedidorTrabajo, RelojTrabajoConWatchdog
     from src.packing_bloques import _restaurar_estado_pallets, _snapshot_estado_pallets
 
     reloj: Callable[[], float]
     t0_wall = time.time()  # solo para stats["tiempo_segundos"] (diagnóstico humano, no budget)
-    if presupuesto_nodos is not None:
+    if watchdog_cpu_segundos is not None:
+        if presupuesto_nodos is not None:
+            raise ValueError("watchdog_cpu_segundos (agotamiento natural) excluye presupuesto_nodos")
+        reloj = RelojTrabajoConWatchdog(time.process_time() + watchdog_cpu_segundos)
+        limite_tiempo = RelojTrabajoConWatchdog.SIN_TOPE
+    elif presupuesto_nodos is not None:
         reloj = MedidorTrabajo()
         limite_tiempo = reloj() + presupuesto_nodos
     else:
@@ -594,9 +607,11 @@ def rescue_solver(
             nivel_por_sku, tope_pallet_por_sku,
         ), "candidatos_despues_ruina": 0, "colocadas": 0}
 
+    motivo_stop = None  # [R1] por qué terminó el bucle (solo se publica en el modo de agotamiento natural)
     while reloj() < limite_tiempo:
         criticos = _identificar_skus_criticos(pendientes)
         if not criticos:
+            motivo_stop = "solucion"
             break  # [sección 12] 100% de demanda -detenerse ya, sin seguir "optimizando"
         stats["skus_criticos"] |= criticos
 
@@ -672,6 +687,7 @@ def rescue_solver(
                     _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, snap)
 
         if not progreso_en_ronda:
+            motivo_stop = "sin_progreso"
             break  # una ronda completa sin mejorar nada -no hay más que el rescue pueda hacer ahora
 
     _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, mejor_snapshot)
@@ -682,10 +698,17 @@ def rescue_solver(
     stats["mejor_mejora"] = mejor_total - total_inicial
     stats["colocadas"] = mejor_total
     stats["tiempo_segundos"] = round(time.time() - t0_wall, 3)
-    stats["presupuesto"] = (
-        {"modo": "tiempo"} if presupuesto_nodos is None
-        else {"modo": "nodos", "tope": presupuesto_nodos, "nodos_trabajo": reloj.nodos}
-    )
+    if watchdog_cpu_segundos is not None:
+        stats["presupuesto"] = {
+            "modo": "agotamiento_natural", "nodos_trabajo": reloj.nodos, "watchdog_cpu_segundos": watchdog_cpu_segundos,
+            "watchdog_disparado": reloj.watchdog_disparado,
+            "motivo_stop": "watchdog" if reloj.watchdog_disparado else motivo_stop,
+        }
+    else:
+        stats["presupuesto"] = (
+            {"modo": "tiempo"} if presupuesto_nodos is None
+            else {"modo": "nodos", "tope": presupuesto_nodos, "nodos_trabajo": reloj.nodos}
+        )
     for sku, d in stats["por_sku_critico"].items():
         pendiente_final = sin_colocar_final.get(sku, 0)
         d["pendiente_final"] = pendiente_final
