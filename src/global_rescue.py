@@ -1481,6 +1481,7 @@ def global_rescue(
     contador: list[int] | None = None,
     oracle_sampler=None,
     presupuesto_expansiones: int | None = None,
+    watchdog_cpu_segundos: float | None = None,
 ) -> tuple[list[PalletV5], dict[str, int], dict]:
     """[sección 4] Punto de entrada. A diferencia de Rescue V6.02/Repair
     V6.04/Exact Local Repair (que reciben el MEJOR resultado ya obtenido y
@@ -1529,10 +1530,28 @@ def global_rescue(
     que es un SOFT CAP AT DEPTH BOUNDARY: la profundidad en curso termina y el
     total consumido puede superar el tope por, como máximo, esa profundidad.
     Lo pasa únicamente la materialización FINAL
-    (`busqueda_n_pallets.FINAL_GLOBAL_MAX_EXPANSIONS`)."""
+    (`busqueda_n_pallets.FINAL_GLOBAL_MAX_EXPANSIONS`).
+
+    [PATCH V6.13-P1B2-R4 -"Global FIXED_N natural termination"] `watchdog_cpu_segundos` (default `None` = comportamiento de siempre): Global
+    del camino profundo de N fijo deja de estar gobernado por su deadline de CPU (`GLOBAL_RESCUE_TIME_SECONDS`/`deadline`, ambos se IGNORAN
+    en este modo). Termina SOLO por sus condiciones naturales de siempre (`completo` / `estancado`, por reinicio; el multi-start sigue igual).
+    El `reloj` es un `RelojTrabajoConWatchdog` (cuenta EXPANSIONES, misma convención que `presupuesto_expansiones`) con
+    `limite_tiempo = SIN_TOPE`, de modo que los puntos de control no cortan nunca salvo que dispare el watchdog de CPU (barrera de seguridad,
+    NO gobernador): entonces corta en el siguiente borde de profundidad/reinicio, `stats["motivo_stop"] = "watchdog"` y
+    `stats["presupuesto"]["watchdog_disparado"] = True` (el caller lo trata como FALLO). No cambia el orden de búsqueda, el beam, el MRV, los
+    candidatos, el score ni la poda. Excluyente con `presupuesto_expansiones`. `stats["presupuesto"]["cota_estructural_observada"]` es solo
+    TELEMETRÍA (suma de beams del multi-start x cajas de la demanda; NO corta nada)."""
     reloj: Callable[[], float]
     t0_wall = time.time()  # solo para stats["tiempo_s"] (diagnóstico humano, no budget)
-    if presupuesto_expansiones is not None:
+    if watchdog_cpu_segundos is not None:
+        # [PATCH V6.13-P1B2-R4] ver el docstring (terminación natural + watchdog de CPU).
+        if presupuesto_expansiones is not None:
+            raise ValueError("watchdog_cpu_segundos (terminación natural) excluye presupuesto_expansiones")
+        from src.medidor_trabajo import RelojTrabajoConWatchdog
+
+        reloj = RelojTrabajoConWatchdog(time.process_time() + watchdog_cpu_segundos)
+        limite_tiempo = RelojTrabajoConWatchdog.SIN_TOPE
+    elif presupuesto_expansiones is not None:
         # [PATCH V6.12-D8B-7.2] ver el docstring (presupuesto de TRABAJO).
         from src.medidor_trabajo import MedidorTrabajo
 
@@ -1633,6 +1652,16 @@ def global_rescue(
     stats["mejor_colocado"] = mejor_global.cajas_colocadas
     stats["faltantes"] = dict(sin_colocar_final)
     stats["motivo_stop"] = motivo_stop_global
+    if watchdog_cpu_segundos is not None:  # [PATCH V6.13-P1B2-R4]
+        if reloj.watchdog_disparado:
+            stats["motivo_stop"] = "watchdog"
+        cota = sum(_beam_width_para_estrategia(e) for e in GLOBAL_MULTI_START_ESTRATEGIAS[:GLOBAL_MULTI_START_MAX]) \
+            * sum(c for c in demanda_total.values() if c > 0)
+        stats["presupuesto"] = {
+            "modo": "terminacion_natural", "expansiones_trabajo": reloj.nodos, "watchdog_cpu_segundos": watchdog_cpu_segundos,
+            "watchdog_disparado": reloj.watchdog_disparado, "motivo_stop": stats["motivo_stop"],
+            "cota_estructural_observada": cota,  # solo telemetría: NO corta la búsqueda
+        }
     stats["errores_geometricos"] = len(errores_geometricos)
     if errores_geometricos:
         stats["errores_geometricos_detalle"] = errores_geometricos

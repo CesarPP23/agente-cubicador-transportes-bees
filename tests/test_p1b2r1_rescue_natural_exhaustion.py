@@ -286,12 +286,14 @@ def test_gobernador_profundo_solo_cambia_rescue_y_deja_repair_exact_global_como_
     # Repair / Exact / Global: exactamente lo de siempre (deadlines de CPU, nada de trabajo)
     assert _sin_deadline(rec["repair"]) == {} and 80 < rec["repair"]["deadline"] - time.process_time() < 91
     assert all(set(k) == {"deadline"} and 80 < k["deadline"] - time.process_time() < 91 for k in rec["exact"])
-    assert "presupuesto_expansiones" not in rec["global"] and rec["global"]["deadline"] - time.process_time() < 181
+    # Global: desde V6.13-P1B2-R4 también por terminación natural + watchdog (tests/test_p1b2r4_global_natural_termination.py); acá solo se fija
+    # que NO recibe presupuesto de expansiones
+    assert "presupuesto_expansiones" not in rec["global"] and rec["global"]["watchdog_cpu_segundos"] == 1800.0
 
     gob = pallets[-1].metadata["fixed_n_deep_governor"]
-    assert gob["activo"] is True and gob["modo"] == "rescue_agotamiento_natural"
+    assert gob["activo"] is True and gob["modo"] == "rescue_global_terminacion_natural"
     assert gob["watchdog_triggered"] is False and gob["watchdog_stages"] == [] and gob["watchdog_cpu_segundos"] == 1800.0
-    assert gob["etapas"] == {"rescue": {"trabajo": 55677, "unidad": "visitas", "stop_reason": "sin_progreso", "watchdog_triggered": False}}
+    assert gob["etapas"]["rescue"] == {"trabajo": 55677, "unidad": "visitas", "stop_reason": "sin_progreso", "watchdog_triggered": False}
 
 
 def test_sin_la_bandera_la_cascada_sigue_por_cpu_como_siempre(monkeypatch):

@@ -1085,8 +1085,16 @@ FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS = 100
 # sirve para todos (el de BK52, 23 298, dejaba a BK31 en 94/98). Solo queda un WATCHDOG de CPU de seguridad (NO gobernador): 1800 s = 5,4x el CPU
 # natural de BK52 (~335 s medidos sin P1-A). Una primera versión con 600 s (1,8x) disparó bajo throttling de CPU (laptop en batería) y volvió a actuar como
 # gobernador funcional; 1800 s es solo una barrera extrema, NO un presupuesto. Si dispara: `metadata["fixed_n_deep_governor"]["watchdog_triggered"] = True` + WARNING; los gates lo tratan como
-# FALLO. Repair, Exact y Global conservan sus deadlines de siempre (R1 solo migra Rescue).
+# FALLO. Repair y Exact conservan sus deadlines de siempre (R1 migra solo Rescue; Global migra en R4, ver abajo).
 FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS = 1800.0
+# [PATCH V6.13-P1B2-R4 -"Global FIXED_N natural termination"] Global del camino profundo de N fijo (mismo `gobernador_profundo`) deja de estar gobernado por su
+# deadline de CPU de 180 s. La auditoría V6.13-P1B2-R3 midió que en BK52 (4 388 expansiones / 32 364 estados) y BK53 (6 434 / 59 640) termina solo
+# (`completo`) usando 84-100 s de CPU, es decir 1,8x-2,0x de margen contra el deadline: bajo throttling (corridas accidentales en batería) el deadline
+# cortó a Global al 90-98 % del trabajo y BK53 salió 207/208 (`CPU_DEADLINE_CAN_CHANGE_FINAL_RESULT`). Un tope de expansiones no sirve (1 expansión por
+# debajo del mínimo ya cambia el CD) y la cota estructural (224 x cajas) no está demostrada, así que NO hay segunda frontera funcional: solo un WATCHDOG
+# de CPU de seguridad (no gobernador), 1800 s ~ 18x el CPU natural medido. Si dispara: `metadata["fixed_n_deep_governor"]["watchdog_triggered"] = True` + WARNING
+# y los gates lo tratan como FALLO.
+FIXED_N_DEEP_GLOBAL_WATCHDOG_SECONDS = 1800.0
 _LOG = logging.getLogger(__name__)
 COMBINACION_PALLETS_LNS_SIN_MEJORA_MAX = 40
 COMBINACION_PALLETS_LNS_SKUS_A_ROMPER = 2
@@ -2015,7 +2023,8 @@ def _empacar_n_pallets(
 
     [PATCH V6.13-P1B2-R1 -"Rescue natural exhaustion"] `gobernador_profundo` (default `False` = cascada por CPU-time de siempre): lo pasa SOLO el
     camino profundo de `armar_pallets_bloques` (N fijo sin `exact_n_incumbent`). Rescue deja de tener deadline de CPU: termina por agotamiento
-    natural y solo lo vigila un watchdog de CPU (`FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS`); desde R2 sus DFS usan P1-A. Repair, Exact y Global NO
+    natural y solo lo vigila un watchdog de CPU (`FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS`); desde R2 sus DFS usan P1-A. [R4] Global también termina por
+    sus condiciones naturales (`completo`/`estancado`) y solo lo vigila un watchdog de CPU (`FIXED_N_DEEP_GLOBAL_WATCHDOG_SECONDS`). Repair y Exact NO
     cambian. No se combina con los presupuestos de sondeo/final (`presupuesto_*`): esos tienen prioridad. El resumen queda en
     `metadata["fixed_n_deep_governor"]` del último pallet."""
     contador_ini = contador[0]
@@ -2412,11 +2421,32 @@ def _empacar_n_pallets(
                 {} if presupuesto_global_expansiones is None
                 else {"presupuesto_expansiones": presupuesto_global_expansiones}
             )
+            # [V6.13-P1B2-R4] camino profundo de N fijo: Global por terminación natural + watchdog de CPU (el `deadline` de arriba se ignora en ese
+            # modo). `gobernador_profundo` ya excluye cualquier `presupuesto_*` (sondeos de OPEN / materialización final), que conservan su política.
+            if gobernador_profundo:
+                kwargs_global = {"watchdog_cpu_segundos": FIXED_N_DEEP_GLOBAL_WATCHDOG_SECONDS}
             pallets_global, sin_colocar_global, stats_global = global_rescue(
                 pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
                 tope_pallet_por_sku, n_pallets, cd, presupuesto, deadline=deadline_global, contador=contador,
                 **kwargs_global,
             )
+            if gobernador_profundo and gobernador_info is not None:  # [V6.13-P1B2-R4] etapa Global del gobernador profundo
+                _pg = stats_global.get("presupuesto", {})
+                _disparo_g = bool(_pg.get("watchdog_disparado"))
+                gobernador_info["modo"] = "rescue_global_terminacion_natural"
+                gobernador_info["etapas"]["global"] = {
+                    "trabajo": _pg.get("expansiones_trabajo"), "unidad": "expansiones", "estados_generados": stats_global.get("estados_generados"),
+                    "stop_reason": _pg.get("motivo_stop", stats_global.get("motivo_stop")), "watchdog_triggered": _disparo_g,
+                    "watchdog_cpu_segundos": FIXED_N_DEEP_GLOBAL_WATCHDOG_SECONDS,
+                    "structural_bound_observed": _pg.get("cota_estructural_observada"),  # telemetría, NO corta
+                }
+                if _disparo_g:
+                    gobernador_info["watchdog_triggered"] = True
+                    gobernador_info["watchdog_stages"] = [*gobernador_info.get("watchdog_stages", []), "global"]
+                    _LOG.warning(
+                        "FIXED_N deep governor: WATCHDOG de CPU disparó en global (%.0f s). La etapa fue cortada por tiempo: el resultado ya NO es "
+                        "el de terminación natural.", FIXED_N_DEEP_GLOBAL_WATCHDOG_SECONDS,
+                    )
             total_global = demanda_total - sum(sin_colocar_global.values())
             pendientes_global = {**{sku: 0 for sku in por_sku}, **sin_colocar_global}
             score_global = _score_solucion(
