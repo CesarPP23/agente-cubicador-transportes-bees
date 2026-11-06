@@ -156,6 +156,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 import pandas as pd
 
@@ -1256,7 +1257,7 @@ def _restaurar_estado_pallets(
     pendientes.update(snap_pendientes)
 
 
-def _candidatos_lote(
+def _candidatos_lote_referencia(
     construcciones: list[_PalletEnConstruccion],
     colocados_por_pallet: list[dict[str, int]],
     pendientes: dict[str, int],
@@ -1428,6 +1429,369 @@ def _candidatos_lote(
     # por el corte de prioridad general -así una cama puede terminar
     # combinando tantos SKUs como cuboides libres tenga, no solo los que ya
     # ganaban por prioridad global.
+    ya_cubiertos = {(c[2], c[5]) for c in top}
+    for cand_frontera in candidatos_frontera:
+        clave_f, necesita_f, pidx_f, sku_f, cand_f, idx_libre_f, cantidad_f = cand_frontera
+        if (pidx_f, idx_libre_f) in ya_cubiertos:
+            continue
+        top.append(cand_frontera)
+        ya_cubiertos.add((pidx_f, idx_libre_f))
+
+    return top
+
+
+# [V6.13-R6B -"`_candidatos_lote` bit-identical"] Misma salida que `_candidatos_lote_referencia` (mismos candidatos, mismo orden, mismos desempates, mismos objetos
+# `TorreCandidate`), con menos CPU por llamada: (1) vista por pallet construida UNA vez por llamada con las mismas operaciones float (`c.w + TOL`,
+# `c.w + tolerancia + TOL`, `t.z + t.altura`); (2) el prefiltro barato FIT/HEIGHT/MARGEN inlineado en el bucle (en vez de ~20 M llamadas a
+# `_cuboide_admite_candidato`); (3) los recorridos O(torres) memoizados por Z dentro de la llamada (soportes, altos de cama, cajas del SKU en la capa).
+# Todos los predicados son puros y se conserva el orden de iteración (SKU -> pallet -> orientación -> cuboide) y el orden de inserción de `por_idx`
+# (que decide los empates del `sorted` estable). Solo se activa dentro de `_candidatos_rapido()`: fallback sin reserva y Rescue profundo de N fijo.
+# El resto (Repair N fijo / OPEN, Exact, Global, DFS inicial, sondeos OPEN) sigue en la referencia.
+#
+# [Aislamiento por ejecución] La activación y la caché viven en `ContextVar`s, no en globales del proceso: cada hilo (y cada tarea asyncio) parte de
+# su propio contexto vacío, así que un hilo con el camino rápido activo no lo activa en otro, ni comparten caché. Un contexto anidado REUSA la caché
+# del más externo (misma ejecución); la caché se crea al abrir el más externo y se descarta al cerrarlo, también ante una excepción.
+_CAND_PROFUNDIDAD: ContextVar[int] = ContextVar("v613_r6b_cand_profundidad", default=0)
+_CAND_ESTADO: ContextVar = ContextVar("v613_r6b_cand_cache", default=None)
+# Tope de entradas (vaciado total al superarlo). Medido en BK35 (N=6): con 20 000 entradas el pico de memoria subía de 140 a 466 MB sin ganar CPU;
+# con 200-800 entradas queda en 142-149 MB y el mismo CPU, porque los aciertos vienen del nodo inmediato anterior. El tope crece con N (8 listas por
+# pallet) para que una llamada nunca llene la caché por sí sola.
+_CAND_CACHE_MAX = 512
+
+
+class _CacheCandidatos:
+    """Caché de UNA ejecución (ver `_candidatos_rapido`): `entradas` por firma de lista `libres` y la geometría de `config` con la que se llenó."""
+
+    __slots__ = ("entradas", "geo")
+
+    def __init__(self):
+        self.entradas: dict = {}
+        self.geo = None
+
+
+@contextmanager
+def _candidatos_rapido():
+    profundidad = _CAND_PROFUNDIDAD.get()
+    tok_cache = _CAND_ESTADO.set(_CacheCandidatos()) if profundidad == 0 else None
+    tok_prof = _CAND_PROFUNDIDAD.set(profundidad + 1)
+    try:
+        yield
+    finally:
+        _CAND_PROFUNDIDAD.reset(tok_prof)
+        if tok_cache is not None:
+            _CAND_ESTADO.reset(tok_cache)
+
+
+def _candidatos_lote(
+    construcciones: list[_PalletEnConstruccion],
+    colocados_por_pallet: list[dict[str, int]],
+    pendientes: dict[str, int],
+    por_sku: dict[str, list[TorreCandidate]],
+    capacidad_cama_por_sku: dict[str, int],
+    nivel_por_sku: dict[str, int],
+    tope_pallet_por_sku: dict[str, int],
+    presupuesto: float,
+    n_pallets: int,
+) -> list[tuple[tuple, bool, int, str, TorreCandidate, int, int]]:
+    """[V6.13-R6B] Despachador: referencia por defecto; la variante rápida solo dentro de `_candidatos_rapido()`. Ver `_candidatos_lote_referencia`."""
+    if _CAND_PROFUNDIDAD.get():
+        return _candidatos_lote_rapido(
+            construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+            tope_pallet_por_sku, presupuesto, n_pallets,
+        )
+    return _candidatos_lote_referencia(
+        construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+        tope_pallet_por_sku, presupuesto, n_pallets,
+    )
+
+
+# Caché de ESTA variante (una por ejecución: se crea al abrir el contexto más externo y se descarta al cerrarlo): por cada lista `libres` -identificada por la tupla de `id()` de sus cuboides,
+# que la entrada mantiene vivos (no hay reuso de `id`)- guarda la vista de cuboides y, por cada huella (largo, ancho, alto) de candidato, los cuboides que
+# pasan el prefiltro FIT/HEIGHT/MARGEN. Es función pura de los cuboides (que nunca se mutan: `_actualizar_libres_maxrects` arma siempre listas/cuboides
+# nuevos, el mismo supuesto de `_podar_libres_rapido`) y de la geometría de `config`: entre un nodo del DFS y el siguiente solo cambia la lista del
+# pallet donde se colocó, así que el resto de los pallets reusa su prefiltro.
+class _EntradaLibres:
+    __slots__ = ("libres", "cub", "surv")
+
+    def __init__(self, libres):
+        self.libres = libres
+        self.cub = None
+        self.surv = {}
+
+
+def _cub_de(libres, tolerancia, min_borde):
+    cub = []
+    for c in libres:
+        x, y, w, h = c.x, c.y, c.w, c.h
+        cub.append((c, x, y, c.z, w + TOL, h + TOL, c.d + TOL, w + tolerancia + TOL, h + tolerancia + TOL, x < min_borde or y < min_borde))
+    return cub
+
+
+class _VistaPallet:
+    """Datos derivados de UN pallet, válidos solo durante una llamada de `_candidatos_lote_rapido` (el pallet no se muta dentro de ella)."""
+
+    __slots__ = ("pallet", "pc", "torres", "ent", "sop", "altos", "capa")
+
+    def __init__(self, pc, ent):
+        self.pc = pc
+        self.pallet = pc.pallet
+        self.torres = pc.pallet.torres
+        self.ent = ent
+        self.sop = {}
+        self.altos = {}
+        self.capa = {}
+
+    def soportes(self, z):
+        """Torres cuyo techo está en `z` (mismo predicado y mismo orden que el listcomp / el filtro de `_soporte_viola_nivel`)."""
+        r = self.sop.get(z)
+        if r is None:
+            r = tuple(t for t in self.torres if abs(t.z + t.altura - z) <= TOL)
+            self.sop[z] = r
+        return r
+
+    def altos_en(self, z):
+        r = self.altos.get(z)
+        if r is None:
+            r = tuple(t.alto_caja for t in self.torres if abs(t.z - z) <= TOL)
+            self.altos[z] = r
+        return r
+
+    def ya_en_capa(self, sku, z):
+        k = (sku, z)
+        r = self.capa.get(k)
+        if r is None:
+            r = sum(t.cantidad for t in self.torres if t.sku == sku and abs(t.z - z) <= TOL)
+            self.capa[k] = r
+        return r
+
+
+def _admite_resto_rapido(v, c, cand, directo, tope_capa, nivel_sku, nivel_por_sku, lim_altura_cama):
+    """Lo que `_cuboide_admite_candidato` evalúa DESPUÉS del prefiltro FIT/HEIGHT/MARGEN, con los recorridos de torres memoizados por Z."""
+    cz = c.z
+    if not directo:
+        if _solapa_con_torres(v.pallet, c.x, c.y, cz, cand.largo, cand.ancho, cand.alto_caja):
+            return False
+        if cz > TOL:
+            soportes = list(v.soportes(cz))
+            torre = crear_torre(cand, x=c.x, y=c.y, z=cz, cantidad=1)
+            if not _tiene_soporte_admisible(torre, soportes):
+                return False
+    if tope_capa is not None:
+        if v.ya_en_capa(cand.sku, cz) >= tope_capa:
+            return False
+    if cz > TOL:  # `_soporte_viola_nivel`: en z=0 nunca viola
+        x, y, largo, ancho = c.x, c.y, cand.largo, cand.ancho
+        for t in v.soportes(cz):
+            if t.x + t.largo <= x + TOL or x + largo <= t.x + TOL:
+                continue
+            if t.y + t.ancho <= y + TOL or y + ancho <= t.y + TOL:
+                continue
+            if nivel_por_sku.get(t.sku, 0) > nivel_sku:
+                return False
+        alto = cand.alto_caja  # `_altura_compatible_con_cama`: en z=0 siempre compatible
+        for a in v.altos_en(cz):
+            if abs(a - alto) > lim_altura_cama:
+                return False
+    return True
+
+
+def _prefiltro_rapido(cv, cand, lim_x, lim_y):
+    """Prefiltro FIT/HEIGHT/MARGEN de `_cuboide_admite_candidato` para el cuboide `cv` (tupla de `_cub_de`). Devuelve None (rechaza) o `directo`."""
+    c, cx, cy, _cz, cw_tol, ch_tol, cd_tol, cw_ov, ch_ov, fuera = cv
+    largo, ancho = cand.largo, cand.ancho
+    directo = largo <= cw_tol and ancho <= ch_tol
+    if not directo and (largo > cw_ov or ancho > ch_ov):
+        return None
+    if cand.alto_caja > cd_tol or fuera or cx + largo > lim_x or cy + ancho > lim_y:
+        return None
+    return directo
+
+
+def _admite_rapido(v, cv, cand, tope_capa, nivel_sku, nivel_por_sku, geo):
+    """Equivalente exacto de `_cuboide_admite_candidato(pallet, c, cand, ...)` para la vista `v` y el cuboide `cv` (tupla de `_cub_de`)."""
+    lim_x, lim_y, lim_altura_cama = geo
+    directo = _prefiltro_rapido(cv, cand, lim_x, lim_y)
+    if directo is None:
+        return False
+    return _admite_resto_rapido(v, cv[0], cand, directo, tope_capa, nivel_sku, nivel_por_sku, lim_altura_cama)
+
+
+def _candidatos_lote_rapido(
+    construcciones, colocados_por_pallet, pendientes, por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+):
+    """[V6.13-R6B] Ver el bloque de comentario sobre `_CAND_PROFUNDIDAD`. Misma estructura que `_candidatos_lote_referencia` (comentarios de diseño allí)."""
+    tolerancia = config.TOLERANCIA_OVERHANG_CM
+    margen = config.SOBRESALIENTE_MAX_CM
+    min_borde = -margen - TOL
+    lim_x = config.PALLET_LARGO + margen + TOL
+    lim_y = config.PALLET_ANCHO + margen + TOL
+    lim_altura_cama = TOLERANCIA_ALTURA_CAMA_CM + TOL
+    estado = _CAND_ESTADO.get()
+    usar_cache = n_pallets > 1 and estado is not None  # fuera de `_candidatos_rapido()` (llamada directa) no hay caché
+    cache = None
+    if usar_cache:
+        cache = estado.entradas
+        clave_geo = (tolerancia, margen, lim_x, lim_y)
+        if estado.geo != clave_geo or len(cache) > max(_CAND_CACHE_MAX, 8 * n_pallets):
+            cache.clear()
+            estado.geo = clave_geo
+    vistas: dict[int, _VistaPallet] = {}
+
+    def vista(pidx):
+        v = vistas.get(pidx)
+        if v is None:
+            pc = construcciones[pidx]
+            libres = pc.libres
+            if usar_cache:
+                firma = tuple(map(id, libres))
+                ent = cache.get(firma)
+                if ent is None:
+                    ent = cache[firma] = _EntradaLibres(list(libres))
+            else:  # un solo pallet: cada nodo cambia SU lista, la caché nunca acierta y solo agregaría costo
+                ent = _EntradaLibres(libres)
+            v = vistas[pidx] = _VistaPallet(pc, ent)
+        return v
+
+    candidatos = []
+    for sku in pendientes:
+        if pendientes[sku] <= 0:
+            continue
+        tope_capa = capacidad_cama_por_sku.get(sku)
+        nivel_sku = nivel_por_sku.get(sku, config.NIVEL_REMATE)
+        tope_pallet = tope_pallet_por_sku.get(sku, float("inf"))
+        for pidx in range(n_pallets):
+            ya_en_pallet = colocados_por_pallet[pidx].get(sku, 0)
+            if ya_en_pallet >= tope_pallet:
+                continue
+            v = vista(pidx)
+            pallet = v.pallet
+            pc = v.pc
+            ent = v.ent
+            libres_ent = ent.libres
+            por_idx: dict[int, tuple[tuple, TorreCandidate]] = {}
+            for cand_op in por_sku[sku]:
+                clave_huella = (cand_op.largo, cand_op.ancho, cand_op.alto_caja)
+                surv = ent.surv.get(clave_huella)
+                if surv is None:
+                    cub = ent.cub
+                    if cub is None:
+                        cub = ent.cub = _cub_de(libres_ent, tolerancia, min_borde)
+                    largo, ancho, alto = clave_huella
+                    lst = []
+                    for idx_op, cv in enumerate(cub):
+                        _c, cx, cy, _cz, cw_tol, ch_tol, cd_tol, cw_ov, ch_ov, fuera = cv
+                        if largo <= cw_tol and ancho <= ch_tol:
+                            directo = True
+                        elif largo > cw_ov or ancho > ch_ov:
+                            continue
+                        else:
+                            directo = False
+                        if alto > cd_tol or fuera or cx + largo > lim_x or cy + ancho > lim_y:
+                            continue
+                        lst.append((idx_op, directo))
+                    surv = ent.surv[clave_huella] = tuple(lst)
+                for idx_op, directo in surv:
+                    c = libres_ent[idx_op]
+                    if not _admite_resto_rapido(v, c, cand_op, directo, tope_capa, nivel_sku, nivel_por_sku, lim_altura_cama):
+                        continue
+                    clave_op = (c.z, c.volumen)
+                    actual = por_idx.get(idx_op)
+                    if actual is None or clave_op < actual[0]:
+                        por_idx[idx_op] = (clave_op, cand_op)
+            opciones = sorted(
+                ((clave_op, idx_op, cand_op) for idx_op, (clave_op, cand_op) in por_idx.items()),
+                key=lambda o: o[0],
+            )[:COMBINACION_PALLETS_OPCIONES_POR_SKU]
+            for _, idx_libre, cand in opciones:
+                libre = pc.libres[idx_libre]
+                cantidad = min(
+                    pendientes[sku],
+                    tope_pallet - ya_en_pallet,
+                    _capacidad_restante_en_capa(pallet, sku, libre.z, tope_capa),
+                    int((libre.d + TOL) // cand.alto_caja),
+                )
+                cantidad = _cantidad_sin_solape(pallet, libre, cand, cantidad)
+                if cantidad <= 0:
+                    continue
+                area = cand.largo * cand.ancho
+                necesita = _necesita_columna_nueva(
+                    pallet, sku, pendientes[sku], nivel_sku, libre.x, libre.y, libre.z, presupuesto
+                )
+                mismo_sku_continua = 0 if _hay_torre_mismo_sku_en_xy(pallet, sku, libre.x, libre.y) else 1
+                clave = (libre.z, nivel_sku, -area, mismo_sku_continua, -pendientes[sku])
+                candidatos.append((clave, necesita, pidx, sku, cand, idx_libre, int(cantidad)))
+
+    candidatos_frontera: list[tuple[tuple, bool, int, str, TorreCandidate, int, int]] = []
+    z_frontera = min((c.z for pc in construcciones for c in pc.libres), default=None)
+    if z_frontera is not None:
+        for pidx in range(n_pallets):
+            v = vista(pidx)
+            pallet = v.pallet
+            ent = v.ent
+            cub = ent.cub
+            if cub is None:
+                cub = ent.cub = _cub_de(ent.libres, tolerancia, min_borde)
+            for idx_libre, cv in enumerate(cub):
+                c, cx, cy, cz, cw_tol, ch_tol, cd_tol, cw_ov, ch_ov, fuera = cv
+                if abs(c.z - z_frontera) > TOL:
+                    continue
+                mejor_fit = None  # ((area_sobrante, mismo_sku_continua), sku, cand, cantidad)
+                for sku in pendientes:
+                    if pendientes[sku] <= 0:
+                        continue
+                    tope_capa = capacidad_cama_por_sku.get(sku)
+                    nivel_sku = nivel_por_sku.get(sku, config.NIVEL_REMATE)
+                    tope_pallet = tope_pallet_por_sku.get(sku, float("inf"))
+                    ya_en_pallet = colocados_por_pallet[pidx].get(sku, 0)
+                    if ya_en_pallet >= tope_pallet:
+                        continue
+                    for cand_op in por_sku[sku]:
+                        largo = cand_op.largo
+                        ancho = cand_op.ancho
+                        sobra = c.w * c.h - largo * ancho
+                        # `clave_fit = (sobra, m)` solo reemplaza al mejor si es estrictamente menor: con `sobra` mayor nunca gana, sea cual sea `m`.
+                        if mejor_fit is not None and sobra > mejor_fit[0][0]:
+                            continue
+                        if largo <= cw_tol and ancho <= ch_tol:
+                            directo = True
+                        elif largo > cw_ov or ancho > ch_ov:
+                            continue
+                        else:
+                            directo = False
+                        if cand_op.alto_caja > cd_tol or fuera or cx + largo > lim_x or cy + ancho > lim_y:
+                            continue
+                        if not _admite_resto_rapido(v, c, cand_op, directo, tope_capa, nivel_sku, nivel_por_sku, lim_altura_cama):
+                            continue
+                        cantidad = min(
+                            pendientes[sku], tope_pallet - ya_en_pallet,
+                            _capacidad_restante_en_capa(pallet, sku, c.z, tope_capa),
+                            int((c.d + TOL) // cand_op.alto_caja),
+                        )
+                        cantidad = _cantidad_sin_solape(pallet, c, cand_op, cantidad)
+                        if cantidad <= 0:
+                            continue
+                        mismo_sku_continua = 0 if _hay_torre_mismo_sku_en_xy(pallet, sku, c.x, c.y) else 1
+                        clave_fit = (sobra, mismo_sku_continua)
+                        if mejor_fit is None or clave_fit < mejor_fit[0]:
+                            mejor_fit = (clave_fit, sku, cand_op, cantidad)
+                if mejor_fit is not None:
+                    _, sku, cand, cantidad = mejor_fit
+                    area = cand.largo * cand.ancho
+                    nivel_sku = nivel_por_sku.get(sku, config.NIVEL_REMATE)
+                    necesita = _necesita_columna_nueva(
+                        pallet, sku, pendientes[sku], nivel_sku, c.x, c.y, c.z, presupuesto
+                    )
+                    mismo_sku_continua = 0 if _hay_torre_mismo_sku_en_xy(pallet, sku, c.x, c.y) else 1
+                    clave = (c.z, nivel_sku, -area, mismo_sku_continua, -pendientes[sku])
+                    candidatos_frontera.append((clave, necesita, pidx, sku, cand, idx_libre, int(cantidad)))
+
+    candidatos.sort(key=lambda c: c[0])
+    top = candidatos[:COMBINACION_PALLETS_SHORTLIST_K]
+    if not any(c[1] for c in top):
+        necesitado = next((c for c in candidatos if c[1]), None)
+        if necesitado is not None:
+            top.append(necesitado)
+
     ya_cubiertos = {(c[2], c[5]) for c in top}
     for cand_frontera in candidatos_frontera:
         clave_f, necesita_f, pidx_f, sku_f, cand_f, idx_libre_f, cantidad_f = cand_frontera
@@ -2221,13 +2585,15 @@ def _empacar_n_pallets(
 
         contador_fb = [contador_ini]
         info_fb: dict = {}
-        pallets_fb, sin_fb = _empacar_n_pallets(
-            dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, cd, contador_fb, n_pallets,
-            # [RC2-D1.1] SIEMPRE secuencial (semilla 0): el resultado del fallback no depende del `paralelo_lns` exterior.
-            paralelo_lns=False, con_lns=con_lns, priorizar_grandes=False, max_nodos_dfs=max_nodos_dfs,
-            lns_recon_max_nodos=lns_recon_max_nodos, lns_sin_mejora_max=lns_sin_mejora_max, solo_frente=True, info_frente=info_fb,
-            lns_max_iteraciones=FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS,
-        )
+        # [V6.13-R6B] El fallback sin reserva (DFS por nodos + LNS por iteraciones, sin reloj) usa `_candidatos_lote_rapido` (misma salida).
+        with _candidatos_rapido():
+            pallets_fb, sin_fb = _empacar_n_pallets(
+                dict(pendientes), por_sku, capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, cd, contador_fb, n_pallets,
+                # [RC2-D1.1] SIEMPRE secuencial (semilla 0): el resultado del fallback no depende del `paralelo_lns` exterior.
+                paralelo_lns=False, con_lns=con_lns, priorizar_grandes=False, max_nodos_dfs=max_nodos_dfs,
+                lns_recon_max_nodos=lns_recon_max_nodos, lns_sin_mejora_max=lns_sin_mejora_max, solo_frente=True, info_frente=info_fb,
+                lns_max_iteraciones=FIXED_N_NO_RESERVE_LNS_MAX_ITERATIONS,
+            )
         fb_completa = not sin_fb and len(pallets_fb) == n_pallets and all(validar_pallet_v5(p) == [] for p in pallets_fb)
         if info_no_reserve is not None:
             info_no_reserve.update(
@@ -2278,10 +2644,12 @@ def _empacar_n_pallets(
             and presupuesto_exact_intentos is None and presupuesto_global_expansiones is None
         if gobernador_profundo:
             kwargs_rescue = {"watchdog_cpu_segundos": FIXED_N_DEEP_RESCUE_WATCHDOG_SECONDS}
-        pallets_rescue, sin_colocar_rescue, stats_rescue = rescue_solver(
-            pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
-            tope_pallet_por_sku, n_pallets, presupuesto, deadline=deadline_rescue, **kwargs_rescue,
-        )
+        # [V6.13-R6B] SOLO el Rescue profundo de N fijo (agotamiento natural + watchdog) usa `_candidatos_lote_rapido`; el Rescue de los sondeos OPEN no.
+        with _candidatos_rapido() if gobernador_profundo else nullcontext():
+            pallets_rescue, sin_colocar_rescue, stats_rescue = rescue_solver(
+                pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+                tope_pallet_por_sku, n_pallets, presupuesto, deadline=deadline_rescue, **kwargs_rescue,
+            )
         gobernador_info = None
         if gobernador_profundo:
             _pr = stats_rescue.get("presupuesto", {})
