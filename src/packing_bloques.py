@@ -155,7 +155,7 @@ import random
 import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import pandas as pd
 
@@ -167,6 +167,7 @@ from src.packing_columnar import (
     _area_union_memoizada,
     _area_union_xy,
     _CuboidLibre,
+    _geometria_rapida,
     _PalletEnConstruccion,
     _reconstruir_en_construccion,
 )
@@ -1150,6 +1151,15 @@ COMBINACION_PALLETS_TIEMPO_MAX_DFS_SEGUNDOS = 45.0
 COMBINACION_PALLETS_TIEMPO_MAX_LNS_SEGUNDOS = 90.0
 
 
+@contextmanager
+def _busqueda_acotada_por_trabajo():
+    """[V6.13-R6A] Contexto de las búsquedas cuyo trabajo NO depende del reloj (DFS con restore diferido, LNS acotado por iteraciones/nodos):
+    memo exacto de `_area_union_xy` (V6.13-P1A) + `_podar_libres_rapido` (V6.13-R6A). Ambos devuelven exactamente lo de siempre; las etapas
+    gobernadas por deadline de CPU no lo abren. Global usa solo `_geometria_rapida()` (ver su llamada en `_empacar_n_pallets`)."""
+    with _area_union_memoizada(), _geometria_rapida():
+        yield
+
+
 def _tiempo_max_dfs(demanda_total: int) -> float:
     """[escalado por tamaño -pedido explícito del usuario: el camino
     abierto (`_empacar_optimizado`) prueba VARIOS `n_pallets` por CD
@@ -1573,7 +1583,7 @@ def _resolver_pallets_backtracking(
 
     # [V6.13-P1A] Con búsqueda acotada por trabajo (`diferir_metricas`) también se memoiza el área de huella (resultado idéntico, ver
     # `_area_union_xy`); si el caller ya abrió el contexto (LNS) se reutiliza el mismo memo.
-    with _area_union_memoizada() if diferir_metricas else nullcontext():
+    with _busqueda_acotada_por_trabajo() if diferir_metricas else nullcontext():
         _dfs(demanda_inicial - sum(pendientes.values()), area_inicial)
         if estado["mejor_snapshot"] is not None:
             _restaurar_estado_pallets(construcciones, colocados_por_pallet, pendientes, estado["mejor_snapshot"])
@@ -1749,7 +1759,7 @@ def _lns_mejorar_pallets(
     iteraciones_lns = 0  # [RC2-D1] solo observabilidad: iteraciones realmente ejecutadas (ver `info_salida`)
     # [V6.13-P1A] Un solo memo del área de huella para TODO el LNS (las reconstrucciones revisitan los mismos estados); solo con
     # `metricas_perezosas` (LNS acotado por iteraciones/nodos).
-    with _area_union_memoizada() if metricas_perezosas else nullcontext():
+    with _busqueda_acotada_por_trabajo() if metricas_perezosas else nullcontext():
         for _ in range(COMBINACION_PALLETS_LNS_ITERACIONES if max_iteraciones is None else max_iteraciones):
             if mejor_total >= demanda_total_lns:
                 break  # [PATCH V6.12-D5] ya se colocó el 100% -nada más que optimizar
@@ -2425,11 +2435,15 @@ def _empacar_n_pallets(
             # modo). `gobernador_profundo` ya excluye cualquier `presupuesto_*` (sondeos de OPEN / materialización final), que conservan su política.
             if gobernador_profundo:
                 kwargs_global = {"watchdog_cpu_segundos": FIXED_N_DEEP_GLOBAL_WATCHDOG_SECONDS}
-            pallets_global, sin_colocar_global, stats_global = global_rescue(
-                pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
-                tope_pallet_por_sku, n_pallets, cd, presupuesto, deadline=deadline_global, contador=contador,
-                **kwargs_global,
-            )
+            # [V6.13-R6A] Con presupuesto de expansiones (materialización final) o terminación natural (camino profundo) el trabajo de Global no
+            # depende del reloj: puede usar la poda rápida de cuboides libres (solo eso: el memo de `_area_union_xy` no se activa en Global). Con `kwargs_global` vacío (Global del sondeo de OPEN, deadline de CPU
+            # de 180 s) sigue en la implementación de referencia: acelerarlo lo haría procesar más estados antes del deadline.
+            with _geometria_rapida() if kwargs_global else nullcontext():
+                pallets_global, sin_colocar_global, stats_global = global_rescue(
+                    pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+                    tope_pallet_por_sku, n_pallets, cd, presupuesto, deadline=deadline_global, contador=contador,
+                    **kwargs_global,
+                )
             if gobernador_profundo and gobernador_info is not None:  # [V6.13-P1B2-R4] etapa Global del gobernador profundo
                 _pg = stats_global.get("presupuesto", {})
                 _disparo_g = bool(_pg.get("watchdog_disparado"))

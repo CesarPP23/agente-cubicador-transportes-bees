@@ -80,15 +80,117 @@ def _es_igual(a: _CuboidLibre, b: _CuboidLibre) -> bool:
     )
 
 
-def _podar_libres(cuboides: list[_CuboidLibre]) -> list[_CuboidLibre]:
+def _podar_libres_referencia(cuboides: list[_CuboidLibre]) -> list[_CuboidLibre]:
     """MaxRects solo necesita quedarse con cuboides MAXIMALES: primero saca
     duplicados exactos, después cualquiera que quede estrictamente
-    contenido en otro."""
+    contenido en otro.
+
+    [V6.13-R6A] Implementación de REFERENCIA (la de siempre, sin cambios): es el camino por defecto y el único que usan las etapas todavía
+    gobernadas por deadline de CPU (ver `_podar_libres`); `_podar_libres_rapido` debe devolver exactamente lo mismo."""
     unicos: list[_CuboidLibre] = []
     for c in cuboides:
         if not any(_es_igual(c, u) for u in unicos):
             unicos.append(c)
     return [c for c in unicos if not any(c is not otro and _contenido(c, otro) for otro in unicos)]
+
+
+# [V6.13-R6A] Optimización BIT-IDÉNTICA de `_podar_libres` (mismo algoritmo, mismas comparaciones, mismo orden de salida; solo cambia el costo de
+# cada comparación y se evitan las que ya se sabe que dan False). Se usa SOLO dentro de `_geometria_rapida()`, que abren las búsquedas
+# acotadas por trabajo (DFS/LNS con restore diferido, Global con presupuesto de expansiones o terminación natural) -las MISMAS que ya usan el
+# memo de `_area_union_xy`-; Rescue/Repair/Exact/Global gobernados por deadline de CPU siguen en `_podar_libres_referencia`: acelerarlos haría
+# que procesen más trabajo antes de su deadline. La fuente de verdad de la equivalencia son los tests de tests/test_r6a_podar_libres.py.
+_GEOM_RAPIDA = 0  # profundidad de contextos `_geometria_rapida()` abiertos (0 = camino de referencia)
+
+
+@contextmanager
+def _geometria_rapida():
+    """Re-entrante. Activa `_podar_libres_rapido` mientras dure el `with`."""
+    global _GEOM_RAPIDA
+    _GEOM_RAPIDA += 1
+    try:
+        yield
+    finally:
+        _GEOM_RAPIDA -= 1
+
+
+class _LibresPodados(list):
+    """Lista de cuboides libres que SALIÓ de `_podar_libres_rapido`: sus elementos son sin duplicados (`_es_igual`) y ninguno está contenido
+    (`_contenido`) en otro. `_ids` guarda la identidad de los elementos al crearla; si la lista cambió de cualquier forma (se copió, se mutó,
+    se pasó por pickle/deepcopy) la marca ya no coincide y la lista se trata como una cualquiera: el camino general sigue siendo exacto."""
+    __slots__ = ("_ids",)
+
+
+def _podar_libres_rapido(
+    cuboides: list[_CuboidLibre], previos: "list[_CuboidLibre] | None" = None
+) -> list[_CuboidLibre]:
+    """Mismo resultado que `_podar_libres_referencia` (lista, orden, objetos). Cambios: (1) atributos y bordes (`x + w`, `x - TOL`, ...) calculados
+    UNA vez por cuboide con las mismas operaciones de punto flotante en vez de una por comparación (y sin las llamadas a `_es_igual` /
+    `_contenido` / properties); (2) si `previos` es una lista que salió de esta misma poda y no cambió, los pares (viejo, viejo) -ya sabidos
+    distintos y no contenidos, porque ambos sobrevivieron a la poda anterior- no se vuelven a comparar. Los pares restantes se evalúan con las
+    mismas desigualdades y en el mismo orden de decisión (duplicado: contra los ya conservados; contenido: contra todos los conservados)."""
+    n_in = len(cuboides)
+    viejo_ids = None
+    if previos is not None and type(previos) is _LibresPodados and previos._ids == tuple(map(id, previos)):
+        viejo_ids = {id(c) for c in previos}
+
+    # 1) duplicados: cada cuboide contra los YA conservados (si es "viejo", solo contra los conservados que NO son viejos)
+    uni: list[_CuboidLibre] = []
+    geo: list[tuple] = []  # por conservado: (x, y, z, w, h, d)
+    es_viejo: list[bool] = []
+    idx_nuevos: list[int] = []  # posiciones (en `uni`) de los conservados que no son viejos
+    for c in cuboides:
+        x, y, z, w, h, d = c.x, c.y, c.z, c.w, c.h, c.d
+        viejo = viejo_ids is not None and id(c) in viejo_ids
+        dup = False
+        if viejo:
+            for k in idx_nuevos:
+                ux, uy, uz, uw, uh, ud = geo[k]
+                if (abs(x - ux) < TOL and abs(y - uy) < TOL and abs(z - uz) < TOL
+                        and abs(w - uw) < TOL and abs(h - uh) < TOL and abs(d - ud) < TOL):
+                    dup = True
+                    break
+        else:
+            for ux, uy, uz, uw, uh, ud in geo:
+                if (abs(x - ux) < TOL and abs(y - uy) < TOL and abs(z - uz) < TOL
+                        and abs(w - uw) < TOL and abs(h - uh) < TOL and abs(d - ud) < TOL):
+                    dup = True
+                    break
+        if not dup:
+            if not viejo:
+                idx_nuevos.append(len(uni))
+            uni.append(c)
+            geo.append((x, y, z, w, h, d))
+            es_viejo.append(viejo)
+
+    # 2) contenidos: bordes de cada conservado calculados una vez (mismas sumas/restas que las properties y `_contenido`)
+    n = len(uni)
+    lo = [(g[0] - TOL, g[1] - TOL, g[2] - TOL, g[0] + g[3] + TOL, g[1] + g[4] + TOL, g[2] + g[5] + TOL) for g in geo]  # (x-TOL, y-TOL, z-TOL, right+TOL, top+TOL, ceil+TOL)
+    own = [(g[0], g[1], g[2], g[0] + g[3], g[1] + g[4], g[2] + g[5]) for g in geo]  # (x, y, z, right, top, ceil)
+    salida: list[_CuboidLibre] = []
+    for i in range(n):
+        ax, ay, az, ar, at, ac = own[i]
+        contenido = False
+        rango = idx_nuevos if es_viejo[i] else range(n)
+        for j in rango:
+            if j == i:
+                continue
+            bx, by, bz, br, bt, bc = lo[j]
+            if ax >= bx and ay >= by and az >= bz and ar <= br and at <= bt and ac <= bc:
+                contenido = True
+                break
+        if not contenido:
+            salida.append(uni[i])
+    r = _LibresPodados(salida)
+    r._ids = tuple(map(id, r))
+    return r
+
+
+def _podar_libres(cuboides: list[_CuboidLibre], previos: "list[_CuboidLibre] | None" = None) -> list[_CuboidLibre]:
+    """[V6.13-R6A] Despachador: `_podar_libres_rapido` solo dentro de `_geometria_rapida()`; en cualquier otro caso `_podar_libres_referencia`
+    (el camino de siempre). `previos` (opcional) es la lista de libres de la que salieron los cuboides sin tocar; solo el camino rápido la usa."""
+    if _GEOM_RAPIDA:
+        return _podar_libres_rapido(cuboides, previos)
+    return _podar_libres_referencia(cuboides)
 
 
 def _actualizar_libres_maxrects(
@@ -132,7 +234,7 @@ def _actualizar_libres_maxrects(
             if ix1 - ix0 > TOL and iy1 - iy0 > TOL:
                 nuevos.append(_CuboidLibre(ix0, iy0, z + d, ix1 - ix0, iy1 - iy0, libre.ceil - (z + d)))
 
-    return _podar_libres([c for c in nuevos if c.w > TOL and c.h > TOL and c.d > TOL])
+    return _podar_libres([c for c in nuevos if c.w > TOL and c.h > TOL and c.d > TOL], libres)
 
 
 @dataclass
