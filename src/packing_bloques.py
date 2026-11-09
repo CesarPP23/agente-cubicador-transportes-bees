@@ -2449,15 +2449,22 @@ def _empacar_n_pallets(
     # LNS más abajo) -CPU-time es correcto y, a diferencia del reloj de
     # pared, no se ve afectado por la contención de CPU de otros CDs
     # corriendo en paralelo (ver CIERRE V6.11-R1/R2).
-    _resolver_pallets_backtracking(
-        construcciones_bt, colocados_bt, pendientes_bt, por_sku,
-        capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
-        max_nodos=max_nodos_dfs,
-        limite_tiempo=_search_budget_now(incluye_trabajo_hijos=False) + _tiempo_max_dfs(demanda_total),
-        reloj=lambda: _search_budget_now(incluye_trabajo_hijos=False),
-        metricas_perezosas=True,  # [V6.13-P1A] DFS acotado por `max_nodos_dfs`: no lee las métricas del pallet
-        **({"info_salida": info_frente} if info_frente is not None else {}),
+    # [V6.13-R6C] DFS inicial del camino profundo de N fijo (`gobernador_profundo`, sin presupuestos de sondeo/final de OPEN): acotado por `max_nodos_dfs`
+    # (el reloj no decide el corte, V6.12-D5), así que usa `_candidatos_lote_rapido` (misma salida). Cualquier otro llamador conserva la referencia.
+    _dfs_inicial_profundo = (
+        gobernador_profundo and presupuesto_rescue_nodos is None and presupuesto_repair_nodos is None
+        and presupuesto_exact_intentos is None and presupuesto_global_expansiones is None
     )
+    with _candidatos_rapido() if _dfs_inicial_profundo else nullcontext():
+        _resolver_pallets_backtracking(
+            construcciones_bt, colocados_bt, pendientes_bt, por_sku,
+            capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+            max_nodos=max_nodos_dfs,
+            limite_tiempo=_search_budget_now(incluye_trabajo_hijos=False) + _tiempo_max_dfs(demanda_total),
+            reloj=lambda: _search_budget_now(incluye_trabajo_hijos=False),
+            metricas_perezosas=True,  # [V6.13-P1A] DFS acotado por `max_nodos_dfs`: no lee las métricas del pallet
+            **({"info_salida": info_frente} if info_frente is not None else {}),
+        )
     total_bt = sum(sum(d.values()) for d in colocados_bt)
 
     # [RC2-D1] El LNS no tiene candidatos (`sin_skus`) si ningún SKU colocado queda fuera de `skus_protegidos` -misma condición que
