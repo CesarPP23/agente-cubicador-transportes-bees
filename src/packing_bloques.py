@@ -2704,11 +2704,15 @@ def _empacar_n_pallets(
             deadline_repair = time.process_time() + REPAIR_TIME_MAX_SECONDS
             # [PATCH V6.12-D7B-P3] El kwarg SOLO se envía en contexto probe.
             kwargs_repair = {} if presupuesto_repair_nodos is None else {"presupuesto_nodos": presupuesto_repair_nodos}
-            pallets_repair, sin_colocar_repair, stats_repair = repair_solver(
-                pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
-                tope_pallet_por_sku, n_pallets, presupuesto, skus_protegidos_cd, deadline=deadline_repair,
-                **kwargs_repair,
-            )
+            # [V6.13-R6F] Repair del SONDEO de OPEN (`presupuesto_repair_nodos`, único llamador: `busqueda_n_pallets.probe`): etapa acotada por NODOS (`MedidorTrabajo`
+            # propio; el `deadline` de CPU se ignora), así que acelerar cada llamada a `_candidatos_lote` no cambia cuánto explora ni el resultado. Usa la variante
+            # rápida (misma salida). El Repair de N fijo (`deadline` de CPU, sin este argumento) conserva la referencia.
+            with _candidatos_rapido() if presupuesto_repair_nodos is not None else nullcontext():
+                pallets_repair, sin_colocar_repair, stats_repair = repair_solver(
+                    pallets_final, sin_colocar_final, por_sku, capacidad_cama_por_sku, nivel_por_sku,
+                    tope_pallet_por_sku, n_pallets, presupuesto, skus_protegidos_cd, deadline=deadline_repair,
+                    **kwargs_repair,
+                )
             total_repair = demanda_total - sum(sin_colocar_repair.values())
             pendientes_repair = {**{sku: 0 for sku in por_sku}, **sin_colocar_repair}
             score_repair = _score_solucion(

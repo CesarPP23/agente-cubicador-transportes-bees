@@ -730,7 +730,8 @@ def test_solo_el_rescue_profundo_de_n_fijo_abre_la_rapida_el_resto_de_etapas_y_l
     assert visto["rescue"] == 0 and visto["repair"] == 0 and visto["exact"] == 0 and visto["global"] == 0
     visto.clear()
     _empacar_n(gobernador_profundo=True, presupuesto_rescue_nodos=777, presupuesto_repair_nodos=5, presupuesto_exact_intentos=3)  # sondeo OPEN
-    assert visto["rescue"] == 0 and visto["repair"] == 0 and visto["exact"] == 0 and visto["global"] == 0
+    assert visto["rescue"] == 0 and visto["exact"] == 0 and visto["global"] == 0
+    assert visto["repair"] == 1                                         # [V6.13-R6F] ÚNICA excepción: el Repair del sondeo (por nodos) abre la rápida
     visto.clear()
     _empacar_n(presupuesto_global_expansiones=9)                        # materialización final con presupuestos
     assert visto["rescue"] == 0 and visto["repair"] == 0 and visto["global"] == 0
@@ -773,8 +774,8 @@ def test_repair_real_de_n_fijo_con_reloj_de_cpu_usa_la_referencia_en_su_dfs(monk
     assert contado["dfs"] >= 1 and contado["ref"] >= 1 and contado["rapido"] == 0
 
 
-def test_repair_real_del_sondeo_open_con_presupuesto_por_nodos_conserva_la_referencia_de_candidatos_aunque_su_dfs_use_la_poda_rapida(monkeypatch):
-    """El DFS de Repair en OPEN SÍ abre `_geometria_rapida()` (R6-A) pero NO `_candidatos_rapido()` (R6-B): variantes independientes."""
+def test_repair_real_llamado_directo_con_presupuesto_por_nodos_no_abre_la_rapida_de_candidatos_por_si_mismo_aunque_su_dfs_use_la_poda_rapida(monkeypatch):
+    """`repair_solver` llamado directamente NO abre `_candidatos_rapido()`: ese contexto lo abre `_empacar_n_pallets` (R6-F, ver tests/test_r6f_repair_sondeo.py). El DFS de Repair en OPEN SÍ abre `_geometria_rapida()` (R6-A): variantes independientes."""
     visto = {"geom": 0}
     podar = pcol._podar_libres_rapido
 
