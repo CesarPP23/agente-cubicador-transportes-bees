@@ -20,6 +20,7 @@ quedaba contra el objetivo (42-45), atacando la causa medida (aire
 desperdiciado sobre torres cortas), no ajustando parámetros a ciegas.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -99,18 +100,21 @@ def _podar_libres_referencia(cuboides: list[_CuboidLibre]) -> list[_CuboidLibre]
 # acotadas por trabajo (DFS/LNS con restore diferido, Global con presupuesto de expansiones o terminación natural) -las MISMAS que ya usan el
 # memo de `_area_union_xy`-; Rescue/Repair/Exact/Global gobernados por deadline de CPU siguen en `_podar_libres_referencia`: acelerarlos haría
 # que procesen más trabajo antes de su deadline. La fuente de verdad de la equivalencia son los tests de tests/test_r6a_podar_libres.py.
-_GEOM_RAPIDA = 0  # profundidad de contextos `_geometria_rapida()` abiertos (0 = camino de referencia)
+#
+# [Aislamiento por ejecución] La profundidad vive en un `ContextVar`, no en un global del proceso: cada hilo (y cada tarea asyncio) parte de su propio contexto
+# vacío, así que un hilo con el camino rápido activo no lo activa en otro. Un contexto anidado suma 1 sobre el del mismo hilo y todo se restaura con
+# `reset(token)` en `finally`, también ante una excepción.
+_GEOM_PROFUNDIDAD: ContextVar[int] = ContextVar("v613_r6a_geom_profundidad", default=0)  # 0 = camino de referencia
 
 
 @contextmanager
 def _geometria_rapida():
-    """Re-entrante. Activa `_podar_libres_rapido` mientras dure el `with`."""
-    global _GEOM_RAPIDA
-    _GEOM_RAPIDA += 1
+    """Re-entrante. Activa `_podar_libres_rapido` mientras dure el `with` (solo en la ejecución -hilo- que lo abrió)."""
+    token = _GEOM_PROFUNDIDAD.set(_GEOM_PROFUNDIDAD.get() + 1)
     try:
         yield
     finally:
-        _GEOM_RAPIDA -= 1
+        _GEOM_PROFUNDIDAD.reset(token)
 
 
 class _LibresPodados(list):
@@ -188,7 +192,7 @@ def _podar_libres_rapido(
 def _podar_libres(cuboides: list[_CuboidLibre], previos: "list[_CuboidLibre] | None" = None) -> list[_CuboidLibre]:
     """[V6.13-R6A] Despachador: `_podar_libres_rapido` solo dentro de `_geometria_rapida()`; en cualquier otro caso `_podar_libres_referencia`
     (el camino de siempre). `previos` (opcional) es la lista de libres de la que salieron los cuboides sin tocar; solo el camino rápido la usa."""
-    if _GEOM_RAPIDA:
+    if _GEOM_PROFUNDIDAD.get():
         return _podar_libres_rapido(cuboides, previos)
     return _podar_libres_referencia(cuboides)
 
@@ -336,26 +340,27 @@ class _PalletEnConstruccion:
 # devolver el valor ya calculado para la misma colección es idéntico bit a bit. Solo lo activan los DFS acotados por trabajo
 # (`_resolver_pallets_backtracking` con restore diferido, `_lns_mejorar_pallets`); los gobernados por deadline de CPU (Rescue/Repair/
 # Exact/Global del camino profundo) no lo usan: acelerarlos cambiaría cuánto trabajo hacen antes de su deadline.
-_AREA_UNION_MEMO: dict | None = None
+#
+# [Aislamiento por ejecución] El memo vive en un `ContextVar`, no en un global del proceso: cada hilo parte sin memo y no comparte el de otro.
+_AREA_UNION_MEMO_VAR: ContextVar["dict | None"] = ContextVar("v613_p1a_area_union_memo", default=None)
 _AREA_UNION_MEMO_MAX = 50_000  # tope de entradas (memoria acotada); lleno => se deja de insertar, nunca cambia un resultado
 
 
 @contextmanager
 def _area_union_memoizada():
-    """Re-entrante: si ya hay un memo activo lo reutiliza; el memo creado se descarta al salir del `with` más externo."""
-    global _AREA_UNION_MEMO
-    if _AREA_UNION_MEMO is not None:
+    """Re-entrante: si ya hay un memo activo EN ESTA EJECUCIÓN lo reutiliza; el memo creado se descarta al salir del `with` más externo (también ante una excepción)."""
+    if _AREA_UNION_MEMO_VAR.get() is not None:
         yield
         return
-    _AREA_UNION_MEMO = {}
+    token = _AREA_UNION_MEMO_VAR.set({})
     try:
         yield
     finally:
-        _AREA_UNION_MEMO = None
+        _AREA_UNION_MEMO_VAR.reset(token)
 
 
 def _area_union_xy(torres: list[Torre]) -> float:
-    memo = _AREA_UNION_MEMO
+    memo = _AREA_UNION_MEMO_VAR.get()
     if memo is None or not torres:
         return _area_union_xy_calcular(torres)
     clave = frozenset((t.x, t.largo, t.y, t.ancho) for t in torres)

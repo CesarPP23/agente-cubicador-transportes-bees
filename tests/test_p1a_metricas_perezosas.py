@@ -240,7 +240,7 @@ def test_memo_area_union_devuelve_exactamente_el_mismo_float_y_no_depende_del_or
     import src.packing_columnar as pcol
 
     rng = random.Random(20261030)
-    assert pcol._AREA_UNION_MEMO is None  # desactivado por defecto
+    assert pcol._AREA_UNION_MEMO_VAR.get() is None  # desactivado por defecto
     for _ in range(400):
         torres = _torres_al_azar(rng, rng.randint(0, 14))
         esperado = pcol._area_union_xy_calcular(torres)
@@ -251,18 +251,18 @@ def test_memo_area_union_devuelve_exactamente_el_mismo_float_y_no_depende_del_or
             rng.shuffle(barajadas)
             assert pcol._area_union_xy(barajadas + torres[:2]) == esperado  # hit con otro orden y duplicados
             assert pcol._area_union_xy(torres) == esperado
-        assert pcol._AREA_UNION_MEMO is None  # se descarta al salir
+        assert pcol._AREA_UNION_MEMO_VAR.get() is None  # se descarta al salir
 
 
 def test_memo_area_union_reentrante_y_con_tope(monkeypatch):
     import src.packing_columnar as pcol
 
     with pcol._area_union_memoizada():
-        memo = pcol._AREA_UNION_MEMO
+        memo = pcol._AREA_UNION_MEMO_VAR.get()
         with pcol._area_union_memoizada():
-            assert pcol._AREA_UNION_MEMO is memo  # reutiliza el del contexto externo
-        assert pcol._AREA_UNION_MEMO is memo  # salir del interno no lo descarta
-    assert pcol._AREA_UNION_MEMO is None
+            assert pcol._AREA_UNION_MEMO_VAR.get() is memo  # reutiliza el del contexto externo
+        assert pcol._AREA_UNION_MEMO_VAR.get() is memo  # salir del interno no lo descarta
+    assert pcol._AREA_UNION_MEMO_VAR.get() is None
     monkeypatch.setattr(pcol, "_AREA_UNION_MEMO_MAX", 3)
     import random
 
@@ -271,7 +271,7 @@ def test_memo_area_union_reentrante_y_con_tope(monkeypatch):
         for _ in range(50):
             torres = _torres_al_azar(rng, 5)
             assert pcol._area_union_xy(torres) == pcol._area_union_xy_calcular(torres)  # lleno => sigue exacto
-        assert len(pcol._AREA_UNION_MEMO) <= 3
+        assert len(pcol._AREA_UNION_MEMO_VAR.get()) <= 3
 
 
 def test_memo_solo_se_activa_en_busquedas_acotadas_por_trabajo(monkeypatch):
@@ -282,7 +282,7 @@ def test_memo_solo_se_activa_en_busquedas_acotadas_por_trabajo(monkeypatch):
 
     vistos = []
     original = pcol._area_union_xy_calcular
-    monkeypatch.setattr(pcol, "_area_union_xy_calcular", lambda torres: (vistos.append(pcol._AREA_UNION_MEMO is not None), original(torres))[1])
+    monkeypatch.setattr(pcol, "_area_union_xy_calcular", lambda torres: (vistos.append(pcol._AREA_UNION_MEMO_VAR.get() is not None), original(torres))[1])
     por_sku, pendientes_base = _escenario(2)
 
     def _correr(**kw):

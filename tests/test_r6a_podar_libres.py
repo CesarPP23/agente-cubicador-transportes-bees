@@ -281,7 +281,7 @@ def _colocar_un_par():
 
 def test_por_defecto_se_usa_la_referencia(monkeypatch):
     esp = _Espia(monkeypatch)
-    assert pcol._GEOM_RAPIDA == 0
+    assert pcol._GEOM_PROFUNDIDAD.get() == 0
     _colocar_un_par()
     assert esp.ref >= 2 and esp.rapido == 0
 
@@ -289,19 +289,19 @@ def test_por_defecto_se_usa_la_referencia(monkeypatch):
 def test_dentro_del_contexto_se_usa_la_rapida_y_el_contexto_es_reentrante_y_seguro_ante_excepciones(monkeypatch):
     esp = _Espia(monkeypatch)
     with pcol._geometria_rapida():
-        assert pcol._GEOM_RAPIDA == 1
+        assert pcol._GEOM_PROFUNDIDAD.get() == 1
         with pcol._geometria_rapida():
-            assert pcol._GEOM_RAPIDA == 2
-        assert pcol._GEOM_RAPIDA == 1
+            assert pcol._GEOM_PROFUNDIDAD.get() == 2
+        assert pcol._GEOM_PROFUNDIDAD.get() == 1
         _colocar_un_par()
-    assert pcol._GEOM_RAPIDA == 0 and esp.rapido >= 2 and esp.ref == 0
+    assert pcol._GEOM_PROFUNDIDAD.get() == 0 and esp.rapido >= 2 and esp.ref == 0
     with pytest.raises(RuntimeError):
         with pcol._geometria_rapida():
             raise RuntimeError("x")
-    assert pcol._GEOM_RAPIDA == 0
+    assert pcol._GEOM_PROFUNDIDAD.get() == 0
     with pb._busqueda_acotada_por_trabajo():
-        assert pcol._GEOM_RAPIDA == 1 and pcol._AREA_UNION_MEMO is not None
-    assert pcol._GEOM_RAPIDA == 0 and pcol._AREA_UNION_MEMO is None
+        assert pcol._GEOM_PROFUNDIDAD.get() == 1 and pcol._AREA_UNION_MEMO_VAR.get() is not None
+    assert pcol._GEOM_PROFUNDIDAD.get() == 0 and pcol._AREA_UNION_MEMO_VAR.get() is None
 
 
 def _dfs_chico(reloj, **kw):
@@ -350,13 +350,13 @@ def test_el_resultado_del_dfs_es_el_mismo_con_la_referencia_y_con_la_rapida(monk
 def _stub_cascada(monkeypatch, visto):
     def _etapa(nombre):
         def f(pallets, sin_colocar, *a, **k):
-            visto[nombre] = pcol._GEOM_RAPIDA
+            visto[nombre] = pcol._GEOM_PROFUNDIDAD.get()
             return pallets, sin_colocar, {"presupuesto": {"modo": "terminacion_natural", "expansiones_trabajo": 1, "watchdog_disparado": False,
                                                           "motivo_stop": "completo", "cota_estructural_observada": 1}} if nombre == "global" else {}
         return f
 
     def _exact(pallet, por_sku, sin_colocar, *a, **k):
-        visto["exact"] = pcol._GEOM_RAPIDA
+        visto["exact"] = pcol._GEOM_PROFUNDIDAD.get()
         return pallet, sin_colocar, {"intentos": 0, "exitos": 0, "cajas_recuperadas": 0}
 
     monkeypatch.setattr(rs, "rescue_solver", _etapa("rescue"))
@@ -389,7 +389,7 @@ def test_global_final_con_presupuesto_de_expansiones_usa_la_rapida_y_global_del_
     visto.clear()
     _empacar_n(gobernador_profundo=True, presupuesto_rescue_nodos=777, presupuesto_repair_nodos=5, presupuesto_exact_intentos=3)
     assert visto["global"] == 0  # sondeo OPEN: conserva su política (deadline de CPU)
-    assert pcol._GEOM_RAPIDA == 0
+    assert pcol._GEOM_PROFUNDIDAD.get() == 0
 
 
 # ------------------------------------------------------------------------ Repair REAL: la variante dentro de su DFS de reconstrucción
@@ -425,7 +425,7 @@ def _repair_real_con_conteo(monkeypatch, **kw):
     monkeypatch.setattr(pcol, "_podar_libres_rapido", f)
     monkeypatch.setattr(pb, "_resolver_pallets_backtracking", d)
     sin_colocar, stats, firma = _correr_repair(_escenario_ejection, **kw)
-    assert pcol._GEOM_RAPIDA == 0  # el contexto se cierra siempre
+    assert pcol._GEOM_PROFUNDIDAD.get() == 0  # el contexto se cierra siempre
     return dentro, fuera, sin_colocar, stats, firma
 
 
