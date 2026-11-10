@@ -2543,23 +2543,27 @@ def _empacar_n_pallets(
             # no `reloj_lns() > deadline_lns`. `limite_tiempo`/`reloj` se
             # siguen reenviando solo por compatibilidad de firma: son
             # inertes para decidir cortes desde V6.12-D5.
-            for intento in range(COMBINACION_PALLETS_LNS_REINICIOS_SECUENCIAL):
-                _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, snapshot_dfs)
-                total_intento = _lns_mejorar_pallets(
-                    construcciones_bt, colocados_bt, pendientes_bt, por_sku,
-                    capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
-                    semilla=f"{cd}-{n_pallets}-{intento}", limite_tiempo=deadline_lns,
-                    skus_protegidos=skus_protegidos, reloj=reloj_lns,
-                    max_nodos_reconstruccion=lns_recon_max_nodos, sin_mejora_max=lns_sin_mejora_max,
-                    metricas_perezosas=True,  # [V6.13-P1A] LNS acotado por iteraciones/nodos: su DFS no lee las métricas del pallet
-                    **({"info_salida": info_frente} if info_frente is not None else {}),
-                    **({"max_iteraciones": lns_max_iteraciones} if lns_max_iteraciones is not None else {}),
-                )
-                if total_intento > mejor_total_lns:
-                    mejor_total_lns = total_intento
-                    mejor_snapshot_lns = _snapshot_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt)
-                if mejor_total_lns >= demanda_total:
-                    break  # ya se colocó TODO -no hace falta seguir probando semillas
+            # [V6.13-R6D] LNS de la MATERIALIZACIÓN FINAL de OPEN (el único llamador que pasa `presupuesto_global_expansiones`): su DFS usa
+            # `_candidatos_lote_rapido` (misma salida). El DFS inicial, los sondeos y sus etapas (Rescue/Repair/Exact/Global) conservan la referencia.
+            _lns_final_open = presupuesto_global_expansiones is not None
+            with _candidatos_rapido() if _lns_final_open else nullcontext():
+                for intento in range(COMBINACION_PALLETS_LNS_REINICIOS_SECUENCIAL):
+                    _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, snapshot_dfs)
+                    total_intento = _lns_mejorar_pallets(
+                        construcciones_bt, colocados_bt, pendientes_bt, por_sku,
+                        capacidad_cama_por_sku, nivel_por_sku, tope_pallet_por_sku, presupuesto, n_pallets,
+                        semilla=f"{cd}-{n_pallets}-{intento}", limite_tiempo=deadline_lns,
+                        skus_protegidos=skus_protegidos, reloj=reloj_lns,
+                        max_nodos_reconstruccion=lns_recon_max_nodos, sin_mejora_max=lns_sin_mejora_max,
+                        metricas_perezosas=True,  # [V6.13-P1A] LNS acotado por iteraciones/nodos: su DFS no lee las métricas del pallet
+                        **({"info_salida": info_frente} if info_frente is not None else {}),
+                        **({"max_iteraciones": lns_max_iteraciones} if lns_max_iteraciones is not None else {}),
+                    )
+                    if total_intento > mejor_total_lns:
+                        mejor_total_lns = total_intento
+                        mejor_snapshot_lns = _snapshot_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt)
+                    if mejor_total_lns >= demanda_total:
+                        break  # ya se colocó TODO -no hace falta seguir probando semillas
             _restaurar_estado_pallets(construcciones_bt, colocados_bt, pendientes_bt, mejor_snapshot_lns)
 
         pallets_bt = [pc.pallet for pc in construcciones_bt]
